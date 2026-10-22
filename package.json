@@ -1,0 +1,41 @@
+{
+  "name": "my-ai-ide",
+  "version": "0.1.0",
+  "description": "AI-powered code editor",
+  "main": "./out/main/index.js",
+  "author": "Abdul Basith",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "typecheck": "tsc --noEmit",
+    "dist": "electron-vite build && electron-builder --win nsis",
+    "test:e2e": "node tests/e2e.cjs",
+    "test:real": "node tests/real-e2e.cjs && node tests/real-restart.cjs",
+    "test:update-config": "node tests/update-config.cjs",
+    "test:git": "node tests/git-handlers.cjs",
+    "test:fsops": "node tests/fsops-handlers.cjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.1.0",
+    "@lydell/node-pty": "^1.2.0-beta.15",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "electron-updater": "^6.8.9",
+    "monaco-editor": "^0.52.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^2.3.0",
+    "rcedit": "^4.0.1",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.0",
+    "ws": "^8.22.0"
+  }
+}

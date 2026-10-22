@@ -1,0 +1,30 @@
+appId: com.abdulbasith.myaiide
+productName: My AI IDE
+directories:
+  output: release
+asarUnpack:
+  - node_modules/@lydell/**
+files:
+  - out/**/*
+afterPack: build/afterPack.js
+# Where the app looks for updates (GitHub Releases). Set owner to your account or
+# organisation name (and the repo if it is not called my-ai-ide); until then updates stay switched off.
+publish:
+  provider: github
+  owner: myaicodingagent
+  repo: my-ai-ide
+win:
+  icon: build/icon.ico
+  signAndEditExecutable: false
+  target:
+    - target: nsis
+      arch: [x64]
+nsis:
+  # No spaces: GitHub renames release files with spaces, which would break the update feed (latest.yml).
+  artifactName: My-AI-IDE-Setup-${version}.${ext}
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
