@@ -10,6 +10,9 @@ import './styles.css'
 window.addEventListener('unhandledrejection', (e) => {
   const reason = e.reason as { name?: string; message?: string } | undefined
   if (reason?.name === 'Canceled' || reason?.message === 'Canceled') e.preventDefault()
+  // The diff editor asks a worker to compare two texts; if a diff is closed before the answer arrives the texts are
+  // gone and it complains. Nothing is lost, the diff is no longer shown.
+  if (reason?.message === 'no diff result available') e.preventDefault()
 })
 
 // Apply saved settings and the saved theme (which may be a custom one that has to be read from disk)

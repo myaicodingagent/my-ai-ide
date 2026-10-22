@@ -13,29 +13,46 @@
     "test:real": "node tests/real-e2e.cjs && node tests/real-restart.cjs",
     "test:update-config": "node tests/update-config.cjs",
     "test:git": "node tests/git-handlers.cjs",
-    "test:fsops": "node tests/fsops-handlers.cjs"
+    "test:fsops": "node tests/fsops-handlers.cjs",
+    "test:index": "node tests/index-handlers.cjs",
+    "test:debug": "node tests/debug-handlers.cjs",
+    "test:ext": "node tests/ext-handlers.cjs",
+    "test:shells": "node tests/shellspec.cjs",
+    "test:tasks": "node tests/tasks-handlers.cjs",
+    "test:merge": "node tests/merge-parse.cjs",
+    "test:contrast": "node tests/a11y-contrast.cjs",
+    "test:nbmodel": "node tests/notebook-model.cjs",
+    "test:notebook": "node tests/notebook-handlers.cjs",
+    "test:ssh": "node tests/ssh-handlers.cjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.1.0",
+    "@huggingface/transformers": "^4.3.1",
     "@lydell/node-pty": "^1.2.0-beta.15",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
+    "adm-zip": "^0.5.18",
     "electron-updater": "^6.8.9",
+    "esbuild": "^0.21.5",
     "monaco-editor": "^0.52.2",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "ssh2": "^1.17.0",
+    "ws": "^8.22.0"
   },
   "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
     "@types/node": "^20.14.0",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
+    "@types/ssh2": "^1.15.6",
+    "@types/ws": "^8.18.2",
     "@vitejs/plugin-react": "^4.3.1",
     "electron": "^33.2.0",
     "electron-builder": "^25.1.8",
     "electron-vite": "^2.3.0",
     "rcedit": "^4.0.1",
     "typescript": "^5.5.4",
-    "vite": "^5.4.0",
-    "ws": "^8.22.0"
+    "vite": "^5.4.0"
   }
 }

@@ -45,6 +45,42 @@ const agentScript = [
   () => textReply('Applied the third change.')
 ]
 
+// Background agent script (recognised by its system prompt).
+const bgScript = [
+  () => toolReply('Looking around. ', 'bg_1', 'read_file', { path: 'hello.txt' }),
+  () => toolReply('Creating a file. ', 'bg_2', 'write_file', { path: 'bg-created.txt', content: 'made by the background agent\n' }),
+  () => toolReply('Editing. ', 'bg_3', 'edit_file', { path: 'hello.txt', old_string: 'hello', new_string: 'bg-hello' }),
+  () => toolReply('Checking. ', 'bg_4', 'run_command', { command: 'Write-Output "bg-cmd-ok"', timeout_seconds: 0 }),
+  () => textReply('Background work finished: created bg-created.txt and edited hello.txt.')
+]
+
+// ---- fake extension registry: two packages built in memory ----
+const AdmZip = require('adm-zip')
+const makeVsix = (files) => { const z = new AdmZip(); z.addFile('[Content_Types].xml', Buffer.from('<Types/>')); for (const [p, text] of Object.entries(files)) z.addFile(p, Buffer.from(text)); return z.toBuffer() }
+const REGISTRY = {
+  'acme.nightsnip': makeVsix({
+    'extension/package.json': JSON.stringify({ name: 'nightsnip', publisher: 'acme', version: '1.0.0', displayName: 'Night Snip', description: 'A dark theme and a snippet', contributes: { themes: [{ label: 'Night Test', uiTheme: 'vs-dark', path: './night.json' }], snippets: [{ language: 'javascript', path: './s.json' }] } }),
+    'extension/night.json': JSON.stringify({ name: 'Night', colors: { 'editor.background': '#011627', 'editor.foreground': '#d6deeb', 'sideBar.background': '#010e1a', 'button.background': '#7e57c2' }, tokenColors: [{ scope: 'keyword', settings: { foreground: '#c792ea' } }] }),
+    'extension/s.json': JSON.stringify({ Log: { prefix: 'log', body: 'console.log($1)', description: 'Print' } })
+  }),
+  'me.hello': makeVsix({
+    'extension/package.json': JSON.stringify({ name: 'hello', publisher: 'me', version: '1.0.0', displayName: 'Hello Ext', description: 'Commands written for this editor', engines: { 'my-ai-ide': '*' }, main: 'main.js', contributes: { commands: [{ command: 'hello.upper', title: 'Upper Case Selection' }, { command: 'hello.ask', title: 'Ask For A Name' }, { command: 'hello.fail', title: 'Always Fails' }] } }),
+    'extension/main.js': `exports.activate = (ide) => {
+  ide.commands.register('hello.upper', async () => {
+    const ed = await ide.editor.getActive()
+    await ide.editor.replaceSelection(ed.selection.toUpperCase())
+    await ide.window.showMessage('upper-cased ' + ed.selection.length + ' characters')
+  })
+  ide.commands.register('hello.ask', async () => {
+    const name = await ide.window.showInput({ prompt: 'Your name?' })
+    await ide.window.showMessage('Hello ' + name)
+  })
+  ide.commands.register('hello.fail', async () => { throw new Error('deliberate failure') })
+}
+`
+  })
+}
+
 // Update feed state: 'none' (already current), 'ok' (9.9.9 available), 'bad' (wrong checksum), 'down' (server error).
 const FAKE_INSTALLER = require('crypto').randomBytes(300 * 1024)
 const sha512 = (b) => require('crypto').createHash('sha512').update(b).digest('base64')
@@ -55,6 +91,20 @@ const server = http.createServer((req, res) => {
   req.on('data', (c) => (body += c))
   req.on('end', () => {
     if (req.url === '/log') { res.end(JSON.stringify(requests)); return }
+    // ---- fake extension registry (MY_AI_IDE_REGISTRY_URL) ----
+    if (req.url.startsWith('/registry/api/-/search')) {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ extensions: [
+        { namespace: 'acme', name: 'nightsnip', version: '1.0.0', displayName: 'Night Snip', description: 'A dark theme and a snippet', downloadCount: 4321, files: { download: `http://127.0.0.1:${API_PORT}/registry/dl/acme.nightsnip.vsix` } },
+        { namespace: 'me', name: 'hello', version: '1.0.0', displayName: 'Hello Ext', description: 'Commands written for this editor', downloadCount: 12, files: { download: `http://127.0.0.1:${API_PORT}/registry/dl/me.hello.vsix` } }
+      ] }))
+      return
+    }
+    if (req.url.startsWith('/registry/dl/')) {
+      const id = req.url.slice('/registry/dl/'.length).replace(/.vsix$/, '')
+      if (REGISTRY[id]) { res.writeHead(200, { 'content-type': 'application/octet-stream' }); res.end(REGISTRY[id]); return }
+      res.writeHead(404); res.end(); return
+    }
     // ---- fake update feed (the app is pointed here with MY_AI_IDE_UPDATE_URL) ----
     if (req.url.startsWith('/updates/')) {
       const name = req.url.slice('/updates/'.length).split('?')[0]
@@ -81,9 +131,15 @@ releaseDate: '2026-10-22T00:00:00.000Z'
     try { json = JSON.parse(body) } catch {}
     requests.push({ url: req.url, headers: { beta: req.headers['anthropic-beta'], key: req.headers['x-api-key'], auth: req.headers['authorization'], all: Object.keys(req.headers).join(',') }, body: json })
     if (!json.stream) {
+      const sys = JSON.stringify(json.system || '')
+      const reply = /predict the next edit/.test(sys) ? '{"startLine":3,"endLine":3,"newText":"const renamed = 2"}' : /expand a code search query/.test(sys) ? '["charge", "credit", "card"]' : /rerank code search results/.test(sys) ? '[0]' : 'completion-text'
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ id: 'msg_c', type: 'message', role: 'assistant', model: 'claude-haiku-5-5', content: [{ type: 'text', text: 'completion-text' }], stop_reason: 'end_turn', stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } }))
+      res.end(JSON.stringify({ id: 'msg_c', type: 'message', role: 'assistant', model: 'claude-haiku-5-5', content: [{ type: 'text', text: reply }], stop_reason: 'end_turn', stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1 } }))
       return
+    }
+    if (json.tools && JSON.stringify(json.system || '').includes('This is a background task')) {
+      const assistants = (json.messages || []).filter((m) => m.role === 'assistant').length
+      return sse(res, (bgScript[assistants] || (() => textReply('(background script exhausted)')))())
     }
     if (json.tools) {
       const assistants = (json.messages || []).filter((m) => m.role === 'assistant').length
@@ -118,8 +174,12 @@ async function cdpConnect() {
     else if (d.method === 'Runtime.exceptionThrown') errors.push(d.params.exceptionDetails.exception?.description || d.params.exceptionDetails.text)
     else if (d.method === 'Runtime.consoleAPICalled' && d.params.type === 'error') errors.push('console.error: ' + d.params.args.map((a) => a.value ?? a.description).join(' '))
   })
-  const send = (method, params) => new Promise((r) => { const i = ++id; pending.set(i, r); ws.send(JSON.stringify({ id: i, method, params })) })
+  // A command that never answers (a native dialog blocking the page, say) must not hang the whole run.
+  const send = (method, params) => new Promise((r, rej) => { const i = ++id; const timer = setTimeout(() => { pending.delete(i); rej(new Error('CDP timed out after 40s: ' + method + ' ' + JSON.stringify(params).slice(0, 160))) }, 40000); pending.set(i, (d) => { clearTimeout(timer); r(d) }); ws.send(JSON.stringify({ id: i, method, params })) })
   await send('Runtime.enable')
+  // The window should count as focused even if another program has the real focus while the test runs
+  // (otherwise "on blur" auto save fires at random). Tests that need a blur send one themselves.
+  await send('Emulation.setFocusEmulationEnabled', { enabled: true })
   const ev = async (expression) => {
     const r = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true })
     if (r.result.exceptionDetails) throw new Error('eval failed: ' + (r.result.exceptionDetails.exception?.description || r.result.exceptionDetails.text))
@@ -162,7 +222,7 @@ function removeTestHistory() {
   // download can never touch (or be mistaken for) a real one.
   const LOCAL_APP_DATA = path.join(PROFILE, 'localappdata')
   fs.mkdirSync(LOCAL_APP_DATA, { recursive: true })
-  const env = { ...process.env, ANTHROPIC_BASE_URL: `http://127.0.0.1:${API_PORT}`, ANTHROPIC_API_KEY: 'test-key-123', MY_AI_IDE_NO_TRASH: '1', MY_AI_IDE_UPDATE_URL: `http://127.0.0.1:${API_PORT}/updates/`, LOCALAPPDATA: LOCAL_APP_DATA }
+  const env = { ...process.env, ANTHROPIC_BASE_URL: `http://127.0.0.1:${API_PORT}`, ANTHROPIC_API_KEY: 'test-key-123', MY_AI_IDE_NO_TRASH: '1', MY_AI_IDE_UPDATE_URL: `http://127.0.0.1:${API_PORT}/updates/`, MY_AI_IDE_REGISTRY_URL: `http://127.0.0.1:${API_PORT}/registry`, LOCALAPPDATA: LOCAL_APP_DATA }
   delete env.ELECTRON_RUN_AS_NODE
   // The window may sit behind other windows while the test runs; without these flags Chromium throttles
   // painting for hidden windows and the editor text appears late or not at all.
@@ -284,7 +344,7 @@ function removeTestHistory() {
     // Requests the model received
     const agentReqs = requests.filter((r) => r.body.tools)
     const toolNames = agentReqs[0].body.tools.map((t) => t.name)
-    check('agent offers all 7 tools', ['list_dir', 'read_file', 'search_text', 'find_files', 'edit_file', 'write_file', 'run_command'].every((n) => toolNames.includes(n)), toolNames.join(','))
+    check('agent offers all 8 tools', ['list_dir', 'read_file', 'search_text', 'search_codebase', 'find_files', 'edit_file', 'write_file', 'run_command'].every((n) => toolNames.includes(n)), toolNames.join(','))
     const lastToolResult = (r) => JSON.stringify(r.body.messages[r.body.messages.length - 1].content)
     check('model received list_dir result', /hello\.txt/.test(lastToolResult(agentReqs[1])))
     check('model received edit result', /Updated hello\.txt/.test(lastToolResult(agentReqs[2])))
@@ -695,7 +755,7 @@ function removeTestHistory() {
     await c.ev(`location.reload()`).catch(() => {})
     await waitFor(() => c.ev(`!!document.querySelector('.sidebar') && document.querySelectorAll('.tree-row').length > 0`), 'app back after reload')
     check('after a reload the open tabs and the active one are restored', await waitFor(async () => JSON.stringify(await tabNames()) === namesBefore && (await activeTab()) === activeBefore, 'tabs restored'), `${namesBefore} -> ${JSON.stringify(await tabNames())}`)
-    const other = path.join(os.tmpdir(), 'my-ai-ide-e2e-other-folder'); fs.rmSync(other, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 }); fs.mkdirSync(other, { recursive: true })
+    const other = path.join(os.tmpdir(), 'my-ai-ide-e2e-other-' + process.pid); fs.rmSync(other, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 }); fs.mkdirSync(other, { recursive: true })
     fs.writeFileSync(path.join(other, 'other.txt'), 'in the other folder\n')
     await c.ev(`localStorage.setItem('recent-folders', JSON.stringify([${JSON.stringify(PROJ)}, ${JSON.stringify(other)}])); localStorage.setItem('session:' + ${JSON.stringify(other.replace(/\\/g, '/').toLowerCase())}, JSON.stringify({ tabs: [${JSON.stringify(path.join(other, 'other.txt'))}], active: ${JSON.stringify(path.join(other, 'other.txt'))} }))`)
     await c.ev(`location.reload()`).catch(() => {})
@@ -706,12 +766,12 @@ function removeTestHistory() {
     await waitFor(() => c.ev(`!!document.querySelector('[data-welcome-recent]')`), 'welcome with recent folders')
     check('the welcome screen lists recent folders (not the current one)', (await c.ev(`[...document.querySelectorAll('[data-recent]')].map(e => e.dataset.recent)`)).join() === other)
     await c.ev(`document.querySelector('[data-recent]').click()`)
-    check('opening a recent folder switches the project and restores its saved tabs', await waitFor(async () => (await c.ev(`document.querySelector('.tree-root')?.textContent`)) === 'my-ai-ide-e2e-other-folder' && JSON.stringify(await tabNames()) === '["other.txt"]', 'switched folder'), `${await c.ev(`document.querySelector('.tree-root')?.textContent`)} ${JSON.stringify(await tabNames())}`)
+    check('opening a recent folder switches the project and restores its saved tabs', await waitFor(async () => (await c.ev(`document.querySelector('.tree-root')?.textContent`)) === path.basename(other) && JSON.stringify(await tabNames()) === '["other.txt"]', 'switched folder'), `${await c.ev(`document.querySelector('.tree-root')?.textContent`)} ${JSON.stringify(await tabNames())}`)
     await rightClick('.tab'); await clickMenu('Close All')
     await waitFor(() => c.ev(`!!document.querySelector('[data-recent]')`), 'welcome again')
     await c.ev(`document.querySelector('[data-recent]').click()`)
     check('and back to the first folder', await waitFor(async () => (await c.ev(`document.querySelector('.tree-root')?.textContent`)) === 'my-ai-ide-e2e-project', 'back to project'))
-    fs.rmSync(other, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 })
+    try { fs.rmSync(other, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 }) } catch { /* a terminal started in that folder may still hold it; it is only a temp folder */ }
 
     // ---- Replace in files ----
     fs.writeFileSync(path.join(PROJ, 'r1.txt'), 'alpha beta alpha\nsecond alpha line\n')
@@ -772,6 +832,500 @@ function removeTestHistory() {
     await c.ev(`[...document.querySelectorAll('.search-box button')].find(b => b.textContent.trim() === '.*').click()`)
     await c.ev(`document.querySelector('.sidebar-views button').click()`) // back to the explorer
 
+    // ---- Stash, history and merge conflicts ----
+    // Stash takes untracked files too and branch switches move files around, so start from a clean tree.
+    gitSh('add -A'); gitSh('commit -q -m snapshot --allow-empty')
+    await c.ev(`document.querySelector('[data-view="git"]').click()`)
+    await gitRefresh()
+    fs.writeFileSync(path.join(PROJ, 'hello.txt'), 'stash me\n')
+    fs.writeFileSync(path.join(PROJ, 'stash-new.txt'), 'brand new\n')
+    await gitRefresh()
+    await waitFor(() => c.ev(`!!document.querySelector('.git-row[data-git-file="hello.txt"]')`), 'changed file listed')
+    await typeInput('[data-git-stash-message]', 'my stash') // Enter in the box stashes
+    check('Stash sets all changes aside (including new files)', await waitFor(() => gitSh('stash list').includes('my stash') && !fs.existsSync(path.join(PROJ, 'stash-new.txt')) && fs.readFileSync(path.join(PROJ, 'hello.txt'), 'utf8') !== 'stash me\n', 'stashed'))
+    check('the stash is listed with its message', await waitFor(() => c.ev(`[...document.querySelectorAll('[data-git-stash]')].some(r => r.textContent.includes('my stash'))`), 'stash row'))
+    await c.ev(`document.querySelector('[data-git-stash] [data-git-action="stash-apply"]').click()`)
+    check('Apply brings the changes back and keeps the stash', await waitFor(() => fs.existsSync(path.join(PROJ, 'stash-new.txt')) && gitSh('stash list').includes('my stash'), 'applied'))
+    gitSh('stash drop -q'); gitSh('checkout -- hello.txt'); fs.rmSync(path.join(PROJ, 'stash-new.txt'))
+    await gitRefresh()
+    await waitFor(() => c.ev(`document.querySelectorAll('[data-git-stash]').length === 0`), 'stash row gone after outside drop')
+    fs.writeFileSync(path.join(PROJ, 'hello.txt'), 'pop me\n'); await gitRefresh()
+    await waitFor(() => c.ev(`!document.querySelector('[data-git-action="stash"]').disabled`), 'stash enabled')
+    await c.ev(`document.querySelector('[data-git-action="stash"]').click()`)
+    await waitFor(() => c.ev(`document.querySelectorAll('[data-git-stash]').length === 1`), 'stash row again')
+    await c.ev(`document.querySelector('[data-git-stash] [data-git-action="stash-pop"]').click()`)
+    check('Pop restores the changes and removes the stash', await waitFor(() => fs.readFileSync(path.join(PROJ, 'hello.txt'), 'utf8') === 'pop me\n' && gitSh('stash list').trim() === '', 'popped'))
+    fs.writeFileSync(path.join(PROJ, 'hello.txt'), 'drop me\n'); await gitRefresh()
+    await waitFor(() => c.ev(`!document.querySelector('[data-git-action="stash"]').disabled`), 'stash enabled again')
+    await c.ev(`document.querySelector('[data-git-action="stash"]').click()`)
+    await waitFor(() => c.ev(`document.querySelectorAll('[data-git-stash]').length === 1`), 'stash row to drop')
+    await c.ev(`document.querySelector('[data-git-stash] [data-git-action="stash-drop"]').click()`)
+    check('Delete removes a stash (after a confirmation)', await waitFor(() => gitSh('stash list').trim() === '', 'dropped'))
+    gitSh('checkout -- hello.txt'); await gitRefresh()
+
+    // History
+    await c.ev(`document.querySelector('[data-git-view="history"]').click()`)
+    const commitSubjects = () => c.ev(`[...document.querySelectorAll('[data-git-commit] .git-subject')].map(e => e.textContent)`)
+    check('History lists the commits, newest first', await waitFor(async () => { const s = await commitSubjects(); return s.length >= 3 && s[0] === gitSh('log -1 --format=%s').trim() && s[s.length - 1] === 'initial' }, 'history list'), JSON.stringify(await commitSubjects()))
+    check('the newest commit shows the branch it is on', await c.ev(`!!document.querySelector('[data-git-commit] .git-ref')`))
+    const hash = gitSh('log --format=%H -- hello.txt').trim().split('\n')[0]
+    await c.ev(`document.querySelector('[data-git-commit="${hash}"]').click()`)
+    check('clicking a commit shows the files it changed', await waitFor(() => c.ev(`!!document.querySelector('[data-git-commit-file="hello.txt"]')`), 'commit file row'))
+    await c.ev(`document.querySelector('[data-git-commit-file="hello.txt"]').click()`)
+    check('clicking a file opens a diff of that commit', await waitFor(() => c.ev(`!!document.querySelector('.diff-view .monaco-diff-editor') && document.querySelector('.diff-title').textContent.includes('hello.txt (${hash.slice(0, 7)})')`), 'commit diff'))
+    await c.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`)
+    await waitFor(() => c.ev(`!document.querySelector('.diff-view')`), 'diff closed')
+    // File history from the palette
+    await openFromTree('hello.txt')
+    await ctrl('p', { shiftKey: true })
+    await c.ev(`(() => { const el = document.querySelector('.qp input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, 'file history'); el.dispatchEvent(new Event('input', { bubbles: true })) })()`)
+    await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('File History'))`), 'file history command')
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('File History')).click()`)
+    const fileLog = gitSh('log --format=%s --follow -- hello.txt').trim().split('\n')
+    check('File History shows only the commits that touched the file', await waitFor(async () => (await c.ev(`!!document.querySelector('.git-filter')`)) && JSON.stringify(await commitSubjects()) === JSON.stringify(fileLog), 'file history'), JSON.stringify(await commitSubjects()) + ' vs ' + JSON.stringify(fileLog))
+    await c.ev(`document.querySelector('[data-git-action="clear-filter"]').click()`)
+    check('"Show all" returns to the full history', await waitFor(async () => (await commitSubjects()).length > fileLog.length, 'filter cleared'))
+    await rightClick('.tab'); await clickMenu('Close All')
+    await c.ev(`document.querySelector('[data-git-view="changes"]').click()`)
+
+    // Merge conflicts
+    gitSh('checkout -q -b conflict-branch')
+    fs.writeFileSync(path.join(PROJ, 'conf.txt'), 'top\nbranch version\nbottom\n'); fs.writeFileSync(path.join(PROJ, 'conf2.txt'), 'branch two\n')
+    gitSh('add conf.txt conf2.txt'); gitSh('commit -q -m "branch side"')
+    gitSh('checkout -q main')
+    fs.writeFileSync(path.join(PROJ, 'conf.txt'), 'top\nmain version\nbottom\n'); fs.writeFileSync(path.join(PROJ, 'conf2.txt'), 'main two\n')
+    gitSh('add conf.txt conf2.txt'); gitSh('commit -q -m "main side"')
+    try { gitSh('merge conflict-branch') } catch { /* conflicts are the point */ }
+    await gitRefresh()
+    check('a merge with conflicts shows a banner with the count', await waitFor(() => c.ev(`/Merge in progress: 2 conflicted files/.test(document.querySelector('[data-git-merge]')?.textContent || '')`), 'merge banner'))
+    check('conflicted files are marked with !', await waitFor(async () => (await gitRows(false)).includes('conf.txt:!') && (await gitRows(false)).includes('conf2.txt:!'), 'conflict rows'), JSON.stringify(await gitRows(false)))
+    await openFromTree('conf.txt')
+    check('the editor colours the two sides of a conflict', await waitFor(() => c.ev(`!!document.querySelector('.monaco-editor .conflict-current') && !!document.querySelector('.monaco-editor .conflict-incoming')`), 'conflict colours'))
+    check('and offers Accept Current / Incoming / Both above it', await waitFor(() => c.ev(`(() => { const t = [...document.querySelectorAll('.monaco-editor .codelens-decoration a')].map(a => a.textContent); return ['Accept Current Change', 'Accept Incoming Change', 'Accept Both Changes'].every(x => t.includes(x)) })()`), 'codelens', 15000))
+    const lensBox = await c.ev(`(() => { const r = [...document.querySelectorAll('.monaco-editor .codelens-decoration a')].find(a => a.textContent === 'Accept Both Changes').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 } })()`)
+    for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) await c.send('Input.dispatchMouseEvent', { type, x: lensBox.x, y: lensBox.y, button: 'left', clickCount: 1 })
+    check('Accept Both keeps both sides and removes the markers', await waitFor(() => c.ev(`(() => { const t = document.querySelector('.monaco-editor .view-lines').textContent.replace(/ /g, ' '); return t.includes('main version') && t.includes('branch version') && !t.includes('<<<<<<<') && !t.includes('>>>>>>>') && !t.includes('=======') })()`), 'accepted both'))
+    check('the colours are gone once resolved', await waitFor(() => c.ev(`!document.querySelector('.monaco-editor .conflict-current')`), 'colours cleared'))
+    await ctrl('s')
+    check('saving writes the resolved text', await waitFor(() => fs.readFileSync(path.join(PROJ, 'conf.txt'), 'utf8').replace(/\r/g, '') === 'top\nmain version\nbranch version\nbottom\n', 'saved resolved'))
+    await rightClick('.tab'); await clickMenu('Close All')
+    await gitAction('stage', 'conf.txt')
+    check('a resolved and staged file leaves the conflicts', await waitFor(async () => !(await gitRows(false)).includes('conf.txt:!') && (await gitRows(true)).some((r) => r.startsWith('conf.txt:')), 'conf.txt staged'), JSON.stringify(await gitRows(true)))
+    await gitAction('take-theirs', 'conf2.txt')
+    check('the row buttons take a whole side of a file', await waitFor(() => fs.readFileSync(path.join(PROJ, 'conf2.txt'), 'utf8').replace(/\r/g, '') === 'branch two\n' && gitSh('status --porcelain').includes('M  conf2.txt'), 'took theirs'))
+    check('with everything resolved the banner asks you to commit', await waitFor(() => c.ev(`/Commit to finish/.test(document.querySelector('[data-git-merge]')?.textContent || '')`), 'banner commit'))
+    await typeInto('[data-git-message]', 'Merge conflict-branch')
+    await c.ev(`document.querySelector('[data-git-action="commit"]').click()`)
+    check('committing finishes the merge and the banner goes away', await waitFor(async () => gitSh('log -1 --format=%s').trim() === 'Merge conflict-branch' && (await c.ev(`!document.querySelector('[data-git-merge]')`)), 'merge committed'))
+    // abort
+    gitSh('checkout -q -b abort-branch'); fs.writeFileSync(path.join(PROJ, 'conf.txt'), 'abort side\n'); gitSh('commit -q -m "abort side" conf.txt')
+    gitSh('checkout -q main'); fs.writeFileSync(path.join(PROJ, 'conf.txt'), 'main again\n'); gitSh('commit -q -m "main again" conf.txt')
+    try { gitSh('merge abort-branch') } catch { /* conflict */ }
+    await gitRefresh()
+    await waitFor(() => c.ev(`!!document.querySelector('[data-git-merge]')`), 'second merge banner')
+    await c.ev(`document.querySelector('[data-git-action="merge-abort"]').click()`)
+    check('Abort goes back to before the merge', await waitFor(async () => fs.readFileSync(path.join(PROJ, 'conf.txt'), 'utf8').replace(/\r/g, '') === 'main again\n' && (await c.ev(`!document.querySelector('[data-git-merge]')`)), 'aborted'))
+    gitSh('checkout -q main'); gitSh('branch -D conflict-branch -q'); gitSh('branch -D abort-branch -q')
+    await c.ev(`document.querySelector('.sidebar-views button').click()`)
+
+    // ---- Split editor ----
+    if ((await tabNames()).length) { await rightClick('.tab'); await clickMenu('Close All') }
+    const helloOrig = fs.readFileSync(path.join(PROJ, 'hello.txt'), 'utf8')
+    await openFromTree('hello.txt')
+    check('no split group at first', await c.ev(`!document.querySelector('[data-split-pane]')`))
+    await rightClick('.tab'); await clickMenu('Split Right')
+    check('"Split Right" opens a second editor group showing the file', await waitFor(() => c.ev(`!!document.querySelector('[data-split-pane] .monaco-editor') && document.querySelector('[data-split-pane] .stab.active .tab-name')?.textContent === 'hello.txt'`), 'split opened'))
+    const splitText = () => c.ev(`document.querySelector('[data-split-pane] .view-lines')?.textContent.replace(/ /g, ' ') || ''`)
+    const mainText = () => c.ev(`document.querySelector('.group-main .view-lines')?.textContent.replace(/ /g, ' ') || ''`)
+    check('both groups show the same text', await waitFor(async () => (await splitText()).includes('hello world') && (await mainText()).includes('hello world'), 'same text'))
+    const sideBySide = await c.ev(`(() => { const a = document.querySelector('.group-main').getBoundingClientRect(), b = document.querySelector('[data-split-pane]').getBoundingClientRect(); return b.left >= a.right - 1 && Math.abs(a.top - b.top) < 3 && a.width > 100 && b.width > 100 })()`)
+    check('the groups sit side by side', sideBySide)
+    // Typing in the split editor edits the shared model
+    await c.ev(`document.querySelector('[data-split-pane] .monaco-editor textarea').focus()`)
+    await c.send('Input.insertText', { text: 'SPLIT-EDIT ' })
+    check('an edit made in the split group shows in the main group and marks the file unsaved', await waitFor(async () => (await mainText()).includes('SPLIT-EDIT') && (await dirtyTabs()).includes('hello.txt'), 'shared edit'))
+    check('and the split group tab shows the unsaved dot too', await c.ev(`!!document.querySelector('[data-split-pane] .stab .tab-dot')`))
+    await ctrl('s')
+    check('Ctrl+S in the split group saves the file', await waitFor(() => fs.readFileSync(path.join(PROJ, 'hello.txt'), 'utf8').includes('SPLIT-EDIT') && !fs.readFileSync(path.join(PROJ, 'hello.txt'), 'utf8').startsWith('hello world'), 'saved from split'))
+    check('the unsaved dots clear', await waitFor(async () => !(await dirtyTabs()).length && (await c.ev(`!document.querySelector('[data-split-pane] .tab-dot')`)), 'dots cleared'))
+    fs.writeFileSync(path.join(PROJ, 'hello.txt'), helloOrig)
+    await waitFor(async () => (await mainText()).includes('hello world') && !(await mainText()).includes('SPLIT-EDIT'), 'reloaded original')
+    // With the split group in use, new files open there
+    await c.ev(`document.querySelector('.tree-row[data-tree-path$="notes.md"]').click()`)
+    check('with the split group in use, a file opened from the explorer opens there', await waitFor(() => c.ev(`document.querySelector('[data-split-pane] .stab.active .tab-name')?.textContent === 'notes.md'`), 'opened in split'))
+    check('and the main group keeps showing its own file', (await activeTab()) === 'hello.txt')
+    check('the split group has a tab for each of its files', (await c.ev(`document.querySelectorAll('[data-split-pane] .stab').length`)) === 2)
+    await c.ev(`document.querySelector('[data-split-pane] .monaco-editor textarea').focus()`)
+    await ctrl('w')
+    check('Ctrl+W in the split group closes only its tab', await waitFor(async () => (await c.ev(`document.querySelectorAll('[data-split-pane] .stab').length`)) === 1 && (await tabNames()).includes('notes.md'), 'split tab closed'))
+    // Clicking in the main group sends new files back there
+    await c.ev(`document.querySelector('.group-main .monaco-editor textarea').focus()`)
+    await c.ev(`document.querySelector('.group-main .tabs').dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))`)
+    await openFromTree('plain.txt')
+    check('after working in the main group, files open there again', await waitFor(async () => (await activeTab()) === 'plain.txt' && (await c.ev(`document.querySelectorAll('[data-split-pane] .stab').length`)) === 1, 'opened in main'))
+    // Resizing, split down, close
+    const widthBefore = await c.ev(`document.querySelector('[data-split-pane]').getBoundingClientRect().width`)
+    const hb = await c.ev(`(() => { const r = document.querySelector('[data-split-handle]').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 } })()`)
+    await c.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: hb.x, y: hb.y, button: 'left', clickCount: 1 })
+    await c.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: hb.x - 150, y: hb.y, button: 'left' })
+    await c.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: hb.x - 150, y: hb.y, button: 'left', clickCount: 1 })
+    check('dragging the divider resizes the groups', await waitFor(async () => (await c.ev(`document.querySelector('[data-split-pane]').getBoundingClientRect().width`)) > widthBefore + 80, 'resized'))
+    await rightClick('.tab'); await clickMenu('Split Down')
+    check('"Split Down" stacks the groups', await waitFor(() => c.ev(`(() => { const a = document.querySelector('.group-main').getBoundingClientRect(), b = document.querySelector('[data-split-pane]').getBoundingClientRect(); return !!document.querySelector('.groups.down') && b.top >= a.bottom - 1 })()`), 'stacked'))
+    await c.ev(`document.querySelector('[data-split-close]').click()`)
+    check('the close button removes the split group', await waitFor(() => c.ev(`!document.querySelector('[data-split-pane]')`), 'split closed'))
+    // Ctrl+\ toggles; closing the file in the main group closes a split that only showed it
+    await ctrl('\\')
+    check('Ctrl+\\ opens a split of the current file', await waitFor(() => c.ev(`!!document.querySelector('[data-split-pane]')`), 'ctrl+backslash'))
+    await ctrl('\\')
+    check('and closes it again', await waitFor(() => c.ev(`!document.querySelector('[data-split-pane]')`), 'toggled off'))
+    await rightClick('.tab'); await clickMenu('Split Right')
+    await waitFor(() => c.ev(`!!document.querySelector('[data-split-pane]')`), 'split again')
+    await c.ev(`document.querySelector('.group-main .tabs').dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))`)
+    await rightClick('.tab'); await clickMenu('Close All')
+    check('closing the file everywhere closes the split group', await waitFor(() => c.ev(`!document.querySelector('[data-split-pane]')`), 'split gone with its files'))
+    check('no tabs are left over', (await tabNames()).length === 0)
+
+    // ---- Multi-root workspace (a second folder with its own git repository) ----
+    if ((await tabNames()).length) { await rightClick('.tab'); await clickMenu('Close All') }
+    const ws2 = path.join(os.tmpdir(), 'my-ai-ide-e2e-ws2-' + process.pid)
+    fs.rmSync(ws2, { recursive: true, force: true }); fs.mkdirSync(path.join(ws2, 'sub'), { recursive: true })
+    fs.writeFileSync(path.join(ws2, 'second.txt'), 'second folder line\n'); fs.writeFileSync(path.join(ws2, 'sub', 'deep.txt'), 'deep\n')
+    gitSh('init -q -b main', ws2); gitSh('config user.name "E2E Two"', ws2); gitSh('config user.email two@example.com', ws2); gitSh('config core.autocrlf false', ws2)
+    gitSh('add -A', ws2); gitSh('commit -q -m "ws2 first"', ws2)
+    fs.writeFileSync(path.join(ws2, 'second.txt'), 'second folder line\nUNIQUEWORD changed\n') // an uncommitted change in the second repository
+    const ws2name = path.basename(ws2)
+    // The Add Folder dialog is native, so seed what it would have saved and reload.
+    await c.ev(`(() => { const r = document.querySelector('.tree-root').title; localStorage.setItem('workspace:' + r.replace(/\\\\/g, '/').toLowerCase(), JSON.stringify([${JSON.stringify(ws2)}])) })()`)
+    await c.ev(`location.reload()`).catch(() => {})
+    await waitFor(() => c.ev(`document.querySelectorAll('[data-workspace-folder]').length === 2`), 'two workspace folders', 20000)
+    await c.ev(`window.confirm = () => true; window.__alerts = []; window.alert = (m) => window.__alerts.push(String(m))`)
+    check('the explorer shows both workspace folders', (await c.ev(`[...document.querySelectorAll('[data-workspace-folder] .tree-root span')].map(e => e.textContent)`)).includes(ws2name))
+    check('only the added folder has a remove button', (await c.ev(`document.querySelectorAll('[data-remove-folder]').length`)) === 1)
+    check('files of the second folder are listed', await waitFor(() => c.ev(`!!document.querySelector('.tree-row[data-tree-path$="second.txt"]')`), 'second.txt in tree'))
+    await c.ev(`document.querySelector('[data-view="git"]').click()`)
+    await waitFor(() => c.ev(`!!document.querySelector('[data-git-action="refresh"]')`), 'git panel after reload', 15000)
+    await gitRefresh()
+    check('the second folder repository is tracked: its change shows a git letter in the explorer', await waitFor(async () => { await c.ev(`document.querySelector('.sidebar-views button').click()`); return c.ev(`!!document.querySelector('.tree-row[data-tree-path$="second.txt"] .tree-git')`) }, 'git letter in second folder', 15000))
+    // Quick open lists files from every folder
+    await ctrl('p')
+    const quickItems = await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].map(i => i.textContent)`).then((r) => r.length && r), 'quick open list')
+    check('Quick Open lists files of both folders, naming the folder', quickItems.some((t) => t.includes('second.txt') && t.includes(ws2name + '/')) && quickItems.some((t) => t.includes('hello.txt')), JSON.stringify(quickItems.slice(0, 4)))
+    await c.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`)
+    // Search across folders
+    await c.ev(`document.querySelector('[data-view="search"]')?.click() || [...document.querySelectorAll('.sidebar-views button')][1].click()`)
+    await typeInput('[data-search-query]', 'UNIQUEWORD')
+    const wsHits = await waitFor(() => c.ev(`[...document.querySelectorAll('.search-file-name')].map(e => e.textContent)`).then((r) => r.length && r), 'search hits')
+    check('Find in files searches every folder and names the folder in the result', wsHits.some((h) => h.includes(ws2name + '/second.txt')), JSON.stringify(wsHits))
+    // Open a file from the second folder: change bars come from its own repository
+    await c.ev(`document.querySelector('.sidebar-views button').click()`)
+    await c.ev(`document.querySelector('.tree-row[data-tree-path$="second.txt"]').click()`)
+    await waitFor(async () => (await activeTab()) === 'second.txt', 'second.txt open')
+    check('a file of the second folder gets change bars from its own repository', await waitFor(() => c.ev(`!!document.querySelector('.monaco-editor .git-gutter-added, .monaco-editor .git-gutter-modified')`), 'gutter in second folder', 15000))
+    // Source control: pick the repository
+    await c.ev(`document.querySelector('[data-view="git"]').click()`)
+    check('Source Control offers a picker with both folders', await waitFor(() => c.ev(`document.querySelectorAll('[data-git-repo] option').length === 2`), 'repo picker'))
+    await c.ev(`(() => { const s = document.querySelector('[data-git-repo]'); s.value = [...s.options].find(o => o.textContent === '${ws2name}').value; s.dispatchEvent(new Event('change', { bubbles: true })) })()`)
+    check('choosing the second folder shows its repository changes', await waitFor(async () => (await gitRows(false)).join() === 'second.txt:M', 'ws2 rows'), JSON.stringify(await gitRows(false)))
+    await gitAction('stage', 'second.txt')
+    check('and staging there changes that repository, not the main one', await waitFor(() => gitSh('status --porcelain', ws2).startsWith('M  second.txt') && !gitSh('status --porcelain').includes('second.txt'), 'staged in ws2'))
+    await typeInto('[data-git-message]', 'ws2 second commit')
+    await waitFor(() => c.ev(`!document.querySelector('[data-git-action="commit"]').disabled`), 'commit enabled')
+    await c.ev(`document.querySelector('[data-git-action="commit"]').click()`)
+    check('committing there commits in the second repository', await waitFor(() => gitSh('log -1 --format=%s', ws2).trim() === 'ws2 second commit', 'ws2 commit').catch(async (e) => { console.log('DEBUG ws2 commit: note =', await c.ev(`document.querySelector('[data-git-note]')?.textContent`), '| msg =', await c.ev(`document.querySelector('[data-git-message]')?.value`), '| commit disabled =', await c.ev(`document.querySelector('[data-git-action="commit"]')?.disabled`), '| ws2 status =', gitSh('status --porcelain', ws2), '| main log =', gitSh('log -1 --format=%s').trim()); return false }))
+    await c.ev(`document.querySelector('[data-git-view="history"]').click()`)
+    check('its history lists its own commits', await waitFor(async () => (await c.ev(`[...document.querySelectorAll('[data-git-commit] .git-subject')].map(e => e.textContent)`)).join('|') === 'ws2 second commit|ws2 first', 'ws2 history'))
+    await c.ev(`document.querySelector('[data-git-view="changes"]').click()`)
+    // File history from a tab in the second folder jumps to that repository
+    await c.ev(`(() => { const s = document.querySelector('[data-git-repo]'); s.value = [...s.options].find(o => o.textContent !== '${ws2name}').value; s.dispatchEvent(new Event('change', { bubbles: true })) })()`)
+    await rightClick('.tab'); await clickMenu('Git: File History')
+    check('"File History" on a file of the second folder switches to that repository', await waitFor(() => c.ev(`document.querySelector('[data-git-repo]').selectedOptions[0].textContent === '${ws2name}' && !!document.querySelector('.git-filter')`), 'history repo switch'))
+    await rightClick('.tab'); await clickMenu('Close All')
+    await c.ev(`document.querySelector('.sidebar-views button').click()`)
+    // Replace across folders
+    await c.ev(`document.querySelectorAll('.sidebar-views button')[1].click()`)
+    await c.ev(`document.querySelector('[data-search-action="toggle-replace"]').click()`)
+    await typeInput('[data-search-replace]', 'REPLACED')
+    await waitFor(() => c.ev(`!document.querySelector('[data-search-action="replace-all"]').disabled`), 'replace enabled')
+    await c.ev(`document.querySelector('[data-search-action="replace-all"]').click()`)
+    check('Replace All rewrites files in the second folder too', await waitFor(() => fs.readFileSync(path.join(ws2, 'second.txt'), 'utf8').includes('REPLACED changed') && !fs.readFileSync(path.join(ws2, 'second.txt'), 'utf8').includes('UNIQUEWORD'), 'replaced in ws2'))
+    await c.ev(`document.querySelector('.sidebar-views button').click()`)
+    // Remove the folder again
+    await c.ev(`document.querySelector('[data-remove-folder]').click()`)
+    check('Remove takes the folder out of the workspace (the files stay on disk)', await waitFor(() => c.ev(`document.querySelectorAll('[data-workspace-folder]').length === 1`), 'removed') && fs.existsSync(path.join(ws2, 'second.txt')))
+    await c.ev(`location.reload()`).catch(() => {})
+    await waitFor(() => c.ev(`!!document.querySelector('.sidebar') && document.querySelectorAll('.tree-row').length > 0`), 'app back after removing the folder')
+    await c.ev(`window.confirm = () => true; window.__alerts = []; window.alert = (m) => window.__alerts.push(String(m))`)
+    check('and the removal is remembered', (await c.ev(`document.querySelectorAll('[data-workspace-folder]').length`)) === 1)
+    for (let i = 0; i < 10; i++) { try { fs.rmSync(ws2, { recursive: true, force: true }); break } catch { await sleep(500) } } // a watcher may still hold it for a moment
+
+    // ---- Next edit suggestions ----
+    if ((await tabNames()).length) { await rightClick('.tab'); await clickMenu('Close All') }
+    await setSetting('autocomplete', false) // ghost text would take the Tab key first
+    const edTextNow = () => c.ev(`(document.querySelector('.group-main .view-lines')?.textContent || document.querySelector('.monaco-editor .view-lines')?.textContent || '').replace(/ /g, ' ')`)
+    fs.writeFileSync(path.join(PROJ, 'nextedit.ts'), 'const alpha = 1\nconst beta = 2\nconst gamma = 3\nconst delta = 4\n')
+    await waitFor(() => c.ev(`!!document.querySelector('.tree-row[data-tree-path$="nextedit.ts"]')`), 'nextedit.ts in tree', 10000)
+    await openFromTree('nextedit.ts')
+    const nextEditRequests = () => requests.filter((r) => !r.body.stream && JSON.stringify(r.body.system || '').includes('predict the next edit')).length
+    const beforeNE = nextEditRequests()
+    await c.ev(`document.querySelector('.monaco-editor textarea').focus()`)
+    await edKey('End', { code: 'End', windowsVirtualKeyCode: 35 }) // end of line 1
+    await typeInEditor(' // changed')
+    check('after you stop typing, a next edit is requested', await waitFor(() => nextEditRequests() > beforeNE, 'next edit request', 15000))
+    const neReq = requests.filter((r) => !r.body.stream && JSON.stringify(r.body.system || '').includes('predict the next edit')).pop()
+    const nePrompt = String(neReq.body.messages[0].content)
+    check('the request carries the numbered file, the caret and the recent edit', /1\| const alpha = 1 \/\/ changed/.test(nePrompt) && /3\| const gamma = 3/.test(nePrompt) && /Caret: line 1/.test(nePrompt) && /Recent edits:\nline 1: "const alpha = 1" -> "const alpha = 1 \/\/ changed"/.test(nePrompt), nePrompt.slice(0, 400))
+    check('the suggestion appears under the target line', await waitFor(() => c.ev(`(() => { const z = document.querySelector('[data-next-edit]'); return !!z && z.textContent.includes('lines 3') && z.textContent.includes('const renamed = 2') })()`), 'next edit zone', 10000))
+    check('and the target line is highlighted', await c.ev(`!!document.querySelector('.monaco-editor .next-edit-target')`))
+    const lineNow = () => c.ev(`document.querySelector('.statusbar')?.textContent || ''`)
+    await edKey('Tab', { code: 'Tab', windowsVirtualKeyCode: 9 })
+    check('the first Tab takes the caret to the suggested line without changing anything', await waitFor(async () => /Ln 3/.test(await lineNow()), 'jumped to line 3') && !(await edTextNow()).includes('renamed'))
+    await edKey('Tab', { code: 'Tab', windowsVirtualKeyCode: 9 })
+    check('the second Tab applies it', await waitFor(async () => (await edTextNow()).includes('const renamed = 2') && !(await edTextNow()).includes('const gamma = 3'), 'applied'))
+    check('the suggestion box is gone and the file shows as modified', (await c.ev(`!document.querySelector('[data-next-edit]')`)) && (await dirtyTabs()).includes('nextedit.ts'))
+    check('the other lines are untouched', (await edTextNow()).includes('const alpha = 1 // changed') && (await edTextNow()).includes('const delta = 4') && (await edTextNow()).includes('const beta = 2'))
+    // Escape dismisses
+    const before2 = nextEditRequests()
+    await c.ev(`document.querySelector('.monaco-editor textarea').focus()`)
+    await typeInEditor('!')
+    await waitFor(() => nextEditRequests() > before2, 'second request', 15000)
+    await waitFor(() => c.ev(`!!document.querySelector('[data-next-edit]')`), 'zone again', 10000)
+    await edKey('Escape', { code: 'Escape', windowsVirtualKeyCode: 27 })
+    check('Escape dismisses a suggestion without changing the file', await waitFor(() => c.ev(`!document.querySelector('[data-next-edit]')`), 'dismissed') && (await edTextNow()).includes('const delta = 4'))
+    // Typing again clears it
+    await typeInEditor('?')
+    await waitFor(() => c.ev(`!!document.querySelector('[data-next-edit]')`), 'zone third time', 10000)
+    await typeInEditor('x')
+    check('typing more removes the suggestion straight away', await waitFor(() => c.ev(`!document.querySelector('[data-next-edit]')`), 'cleared by typing', 3000))
+    // The setting turns it off
+    await waitFor(() => c.ev(`!!document.querySelector('[data-next-edit]')`), 'zone fourth time', 10000)
+    await setSetting('nextEdit', false)
+    await c.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`)
+    const before3 = nextEditRequests()
+    await c.ev(`document.querySelector('.monaco-editor textarea').focus()`)
+    await typeInEditor('y')
+    await sleep(2500)
+    check('with the setting off no requests are made', nextEditRequests() === before3)
+    await setSetting('nextEdit', true)
+    await setSetting('autocomplete', true)
+    await c.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`)
+    await rightClick('.tab'); await clickMenu('Close All')
+    fs.rmSync(path.join(PROJ, 'nextedit.ts'), { force: true })
+
+    // ---- Background agents (their own git worktree; nothing changes until Apply) ----
+    if ((await tabNames()).length) { await rightClick('.tab'); await clickMenu('Close All') }
+    gitSh('add -A'); gitSh('commit -q -m "bg snapshot" --allow-empty')
+    const helloBefore = fs.readFileSync(path.join(PROJ, 'hello.txt'), 'utf8')
+    const bgCards = () => c.ev(`[...document.querySelectorAll('[data-bg-card]')].map(e => e.dataset.bgStatus)`)
+    await c.ev(`document.querySelector('[data-view="agents"]').click()`)
+    check('the Agents view explains how background tasks work', await waitFor(() => c.ev(`/Apply to my files/.test(document.querySelector('[data-bg-panel]')?.textContent || '')`), 'agents panel'))
+    await typeInto('[data-bg-input]', 'Create bg-created.txt and rename the greeting in hello.txt')
+    await c.ev(`document.querySelector('[data-bg-start]').click()`)
+    check('Start adds a task card', await waitFor(async () => (await bgCards()).length === 1, 'card appears').catch(async () => { console.log('DEBUG bg start error:', await c.ev(`document.querySelector('[data-bg-error]')?.textContent`), '| root:', await c.ev(`document.querySelector('.tree-root')?.title`)); return false }))
+    check('the task waits for approval of its command', await waitFor(async () => (await bgCards())[0] === 'waiting', 'waiting', 30000))
+    check('the command is shown in full with Run and Skip', await c.ev(`(() => { const w = document.querySelector('[data-bg-wait]'); return !!w && w.textContent.includes('bg-cmd-ok') && !!w.querySelector('[data-bg-action="run"]') && !!w.querySelector('[data-bg-action="skip"]') })()`))
+    check('the Agents tab shows a badge while it needs you', await c.ev(`!!document.querySelector('[data-bg-badge]')`))
+    check('so far nothing in your project has changed', fs.readFileSync(path.join(PROJ, 'hello.txt'), 'utf8') === helloBefore && !fs.existsSync(path.join(PROJ, 'bg-created.txt')) && gitSh('status --porcelain').trim() === '')
+    const worktrees = gitSh('worktree list')
+    check('the agent works in a separate git worktree on its own branch', /agent\/[0-9a-f]{8}-create-bg-created/.test(worktrees) && gitSh('branch --list "agent/*"').includes('agent/'), worktrees)
+    const wtPath = (/^(.+?)\s+[0-9a-f]+ \[agent\//m.exec(worktrees.split('\n').filter((l) => l.includes('agent/')).join('\n')) || [])[1]
+    check('its edits are already in that copy', !!wtPath && fs.existsSync(path.join(wtPath, 'bg-created.txt')) && /bg-hello/.test(fs.readFileSync(path.join(wtPath, 'hello.txt'), 'utf8')), String(wtPath))
+    check('the system prompt tells it that it works on a copy without anyone watching', requests.some((r) => r.body.tools && JSON.stringify(r.body.system).includes('This is a background task')))
+    await c.ev(`document.querySelector('[data-bg-action="run"]').click()`)
+    check('after Run it finishes', await waitFor(async () => (await bgCards())[0] === 'done', 'done', 30000))
+    check('the command ran in the copy', requests.some((r) => JSON.stringify(r.body.messages || []).includes('bg-cmd-ok')))
+    check('it reports what it did', await c.ev(`/created bg-created\.txt/.test(document.querySelector('[data-bg-summary]')?.textContent || '')`))
+    check('and lists the files it changed', await waitFor(() => c.ev(`(() => { const f = [...document.querySelectorAll('[data-bg-file]')].map(e => e.dataset.bgFile + ':' + e.querySelector('.git-letter').textContent).sort(); return f.join() === 'bg-created.txt:A,hello.txt:M' })()`), 'file list'))
+    check('your project is still untouched', fs.readFileSync(path.join(PROJ, 'hello.txt'), 'utf8') === helloBefore && !fs.existsSync(path.join(PROJ, 'bg-created.txt')))
+    await c.ev(`document.querySelector('[data-bg-file="hello.txt"]').click()`)
+    check('clicking a file shows what the agent changed', await waitFor(() => c.ev(`!!document.querySelector('.diff-view .monaco-diff-editor') && document.querySelector('.diff-title').textContent.includes('hello.txt (agent)')`), 'agent diff'))
+    await c.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`)
+    await waitFor(() => c.ev(`!document.querySelector('.diff-view')`), 'diff closed')
+    await c.ev(`document.querySelector('[data-bg-action="apply"]').click()`)
+    check('Apply puts the changes into your working tree', await waitFor(() => fs.existsSync(path.join(PROJ, 'bg-created.txt')) && /bg-hello/.test(fs.readFileSync(path.join(PROJ, 'hello.txt'), 'utf8')), 'applied'))
+    check('the card says so, and the files show in Source Control', (await waitFor(async () => (await bgCards())[0] === 'applied', 'applied status')) && /bg-created\.txt/.test(gitSh('status --porcelain')) && /hello\.txt/.test(gitSh('status --porcelain')), gitSh('status --porcelain'))
+    await c.ev(`document.querySelector('[data-bg-action="discard"]').click()`)
+    check('Remove deletes the copy and its branch', await waitFor(async () => (await bgCards()).length === 0 && !gitSh('worktree list').includes('agent/') && gitSh('branch --list "agent/*"').trim() === '' && !fs.existsSync(wtPath), 'removed'))
+    gitSh('reset -q --hard'); fs.rmSync(path.join(PROJ, 'bg-created.txt'), { force: true })
+    // Started from the agent panel, then stopped while it waits
+    await clickBtn('Agent', '.chat')
+    await typeInto('.chat textarea', 'Another background job')
+    await c.ev(`document.querySelector('[data-agent-background]').click()`)
+    check('"Background" in the agent panel starts the task there and shows the Agents view', await waitFor(async () => (await bgCards()).length === 1 && (await c.ev(`document.querySelector('[data-view="agents"]').classList.contains('on')`)), 'second task'))
+    await waitFor(async () => (await bgCards())[0] === 'waiting', 'second waiting', 30000)
+    await c.ev(`document.querySelector('[data-bg-action="skip"]').click()`)
+    await waitFor(async () => (await bgCards())[0] !== 'waiting', 'skipped')
+    await clickBtn('Chat', '.chat')
+    await waitFor(async () => ['done', 'failed', 'stopped'].includes((await bgCards())[0]), 'second finished', 30000)
+    check('Skip tells the agent the command was declined', requests.some((r) => JSON.stringify(r.body.messages || []).includes('The user declined to run this command')))
+    await c.ev(`document.querySelector('[data-bg-action="discard"]').click()`)
+    check('Discard throws away an unapplied task completely', await waitFor(async () => (await bgCards()).length === 0 && gitSh('branch --list "agent/*"').trim() === '' && !gitSh('worktree list').includes('agent/'), 'discarded') && !fs.existsSync(path.join(PROJ, 'bg-created.txt')))
+    check('and your project was never touched', gitSh('status --porcelain').trim() === '')
+    await c.ev(`document.querySelector('.sidebar-views button').click()`)
+
+    // ---- Debugger (a real Node program under the V8 inspector) ----
+    if ((await tabNames()).length) { await rightClick('.tab'); await clickMenu('Close All') }
+    fs.writeFileSync(path.join(PROJ, 'dbgtest.js'), 'function add(a, b) {\n  const sum = a + b\n  return sum\n}\nconst result = add(2, 3)\nconsole.log("result", result)\n')
+    await waitFor(() => c.ev(`!!document.querySelector('.tree-row[data-tree-path$="dbgtest.js"]')`), 'dbgtest.js in tree', 10000)
+    await openFromTree('notes.md')
+    await c.ev(`document.querySelector('[data-view="debug"]').click()`)
+    check('Start Debugging is disabled for a file Node cannot run', await waitFor(() => c.ev(`document.querySelector('[data-dbg-action="start"]')?.disabled === true`), 'start disabled for markdown'))
+    await openFromTree('dbgtest.js')
+    check('and enabled for a .js file', await waitFor(() => c.ev(`document.querySelector('[data-dbg-action="start"]')?.disabled === false`), 'start enabled'))
+    // A breakpoint from the margin: click next to line number 2
+    const glyphPoint = await c.ev(`(() => { const ln = [...document.querySelectorAll('.group-main .monaco-editor .line-numbers')].find((e) => e.textContent === '2'); const ed = document.querySelector('.group-main .monaco-editor').getBoundingClientRect(); const r = ln.getBoundingClientRect(); return { x: ed.left + 9, y: r.top + r.height / 2 } })()`)
+    for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) await c.send('Input.dispatchMouseEvent', { type, x: glyphPoint.x, y: glyphPoint.y, button: 'left', clickCount: 1 })
+    check('clicking the margin sets a breakpoint (a red dot appears)', await waitFor(() => c.ev(`document.querySelectorAll('.group-main .monaco-editor .debug-bp').length === 1`), 'breakpoint dot'))
+    check('and the Run view lists it', await c.ev(`!!document.querySelector('[data-dbg-bp="dbgtest.js:2"]')`))
+    // F9 toggles on the caret line
+    await c.ev(`document.querySelector('.group-main .monaco-editor textarea').focus()`)
+    await ctrl('Home')
+    await edKey('F9', { code: 'F9', windowsVirtualKeyCode: 120 })
+    check('F9 sets a breakpoint on the caret line (line 1)', await waitFor(() => c.ev(`!!document.querySelector('[data-dbg-bp="dbgtest.js:1"]')`), 'F9 breakpoint'))
+    await edKey('F9', { code: 'F9', windowsVirtualKeyCode: 120 })
+    check('and F9 again removes it', await waitFor(() => c.ev(`!document.querySelector('[data-dbg-bp="dbgtest.js:1"]')`), 'F9 off'))
+    // Start with F5
+    await edKey('F5', { code: 'F5', windowsVirtualKeyCode: 116 })
+    check('F5 starts the program and it stops at the breakpoint', await waitFor(() => c.ev(`document.querySelector('[data-dbg-status]')?.dataset.dbgStatus === 'paused'`), 'paused', 30000))
+    check('the status says why', await c.ev(`/on a breakpoint/.test(document.querySelector('[data-dbg-status]').textContent)`))
+    check('the stopped line is highlighted with an arrow in the margin', await waitFor(() => c.ev(`!!document.querySelector('.group-main .monaco-editor .debug-current-line') && !!document.querySelector('.group-main .monaco-editor .debug-arrow')`), 'current line'))
+    check('the call stack names the function and line', await c.ev(`document.querySelector('[data-dbg-frame="0"]')?.textContent.includes('add') && document.querySelector('[data-dbg-frame="0"]').textContent.includes('dbgtest.js:2')`))
+    check('variables show the arguments', await waitFor(() => c.ev(`document.querySelector('[data-dbg-var="a"] .dbg-var-value')?.textContent === '2' && document.querySelector('[data-dbg-var="b"] .dbg-var-value')?.textContent === '3'`), 'variables a, b'))
+    check('and a variable that is not assigned yet has no value to show (undefined, or not listed until it exists)', await waitFor(() => c.ev(`(() => { const v = document.querySelector('[data-dbg-var="sum"] .dbg-var-value')?.textContent; return v === undefined || v === 'undefined' || /TDZ|initiali[sz]ed/i.test(v) })()`), 'variable sum'))
+    // Watch and console
+    await typeInput('[data-dbg-watch-input]', 'a * b')
+    check('a watch expression is evaluated in the stopped frame', await waitFor(() => c.ev(`document.querySelector('[data-dbg-watch="a * b"] .dbg-var-value')?.textContent === '6'`), 'watch value'))
+    await typeInput('[data-dbg-console-input]', 'a + b')
+    check('the debug console evaluates expressions', await waitFor(() => c.ev(`/> a \\+ b\\n5\\n/.test(document.querySelector('[data-dbg-output]').textContent)`), 'console result'))
+    await typeInput('[data-dbg-console-input]', 'nope.x')
+    check('an error in the console is reported', await waitFor(() => c.ev(`/not defined/.test(document.querySelector('[data-dbg-output]').textContent)`), 'console error'))
+    // Stepping
+    await edKey('F10', { code: 'F10', windowsVirtualKeyCode: 121 })
+    check('F10 steps to the next line', await waitFor(() => c.ev(`document.querySelector('[data-dbg-frame="0"]')?.textContent.includes('dbgtest.js:3')`), 'stepped to line 3'))
+    check('and the variable now has its value (and the watch still works)', await waitFor(() => c.ev(`document.querySelector('[data-dbg-var="sum"] .dbg-var-value')?.textContent === '5' && document.querySelector('[data-dbg-watch="a * b"] .dbg-var-value')?.textContent === '6'`), 'sum = 5'))
+    check('the highlighted line moved with it', await c.ev(`(() => { const hl = document.querySelector('.group-main .monaco-editor .debug-current-line'); const ln = [...document.querySelectorAll('.group-main .monaco-editor .line-numbers')].find((e) => e.textContent === '3'); if (!hl || !ln) return false; const a = hl.getBoundingClientRect(), b = ln.getBoundingClientRect(); return Math.abs((a.top + a.height / 2) - (b.top + b.height / 2)) < 6 })()`))
+    await c.ev(`document.querySelector('[data-dbg-action="continue"]').click()`)
+    check('Continue runs the program to the end', await waitFor(() => c.ev(`document.querySelector('[data-dbg-status]')?.dataset.dbgStatus === 'ended'`), 'ended', 20000))
+    check('its output is in the debug console, with the exit code', await c.ev(`(() => { const t = document.querySelector('[data-dbg-output]').textContent; return t.includes('result 5') && /exit code 0/.test(t) })()`))
+    check('the stop highlight is gone', await c.ev(`!document.querySelector('.group-main .monaco-editor .debug-current-line')`))
+    // Stop while paused, condition
+    await c.ev(`document.querySelector('[data-dbg-bp="dbgtest.js:2"] [data-dbg-condition]').focus()`)
+    await typeInput('[data-dbg-bp="dbgtest.js:2"] [data-dbg-condition]', 'a === 99')
+    check('a breakpoint can have a condition (shown with a different dot)', await waitFor(() => c.ev(`!!document.querySelector('.group-main .monaco-editor .debug-bp-cond')`), 'conditional dot'))
+    await c.ev(`document.querySelector('.group-main .monaco-editor textarea').focus()`)
+    await edKey('F5', { code: 'F5', windowsVirtualKeyCode: 116 })
+    await sleep(2500)
+    check('a condition that is false lets the program run straight through', await c.ev(`document.querySelector('[data-dbg-status]')?.dataset.dbgStatus === 'ended' && document.querySelector('[data-dbg-output]').textContent.split('result 5').length === 2 && !document.querySelector('.group-main .monaco-editor .debug-current-line')`))
+    await typeInput('[data-dbg-bp="dbgtest.js:2"] [data-dbg-condition]', '')
+    await c.ev(`document.querySelector('[data-dbg-bp="dbgtest.js:2"] [data-dbg-condition]').blur()`)
+    await waitFor(() => c.ev(`!document.querySelector('.group-main .monaco-editor .debug-bp-cond')`), 'condition cleared')
+    await c.ev(`document.querySelector('.group-main .monaco-editor textarea').focus()`)
+    await edKey('F5', { code: 'F5', windowsVirtualKeyCode: 116 })
+    await waitFor(() => c.ev(`document.querySelector('[data-dbg-status]')?.dataset.dbgStatus === 'paused'`), 'paused again', 30000)
+    await edKey('F5', { code: 'F5', shiftKey: true, windowsVirtualKeyCode: 116, modifiers: 8 })
+    check('Shift+F5 stops a stopped program', await waitFor(() => c.ev(`document.querySelector('[data-dbg-status]')?.dataset.dbgStatus === 'ended'`), 'stopped', 20000))
+    await c.ev(`document.querySelector('[data-dbg-action="clear-breakpoints"]').click()`)
+    check('Remove All Breakpoints clears the margin and the list', await waitFor(() => c.ev(`!document.querySelector('.group-main .monaco-editor .debug-bp') && !document.querySelector('[data-dbg-bp]')`), 'breakpoints cleared'))
+    await rightClick('.tab'); await clickMenu('Close All')
+    await c.ev(`document.querySelector('.sidebar-views button').click()`)
+    fs.rmSync(path.join(PROJ, 'dbgtest.js'), { force: true })
+
+    // ---- Extensions (from a fake registry: a theme + snippets package and a native extension with code) ----
+    if ((await tabNames()).length) { await rightClick('.tab'); await clickMenu('Close All') }
+    await c.ev(`document.querySelector('[data-view="ext"]').click()`)
+    check('the Extensions view starts empty and says what is supported', await waitFor(() => c.ev(`/Themes and snippets from VS Code extensions work here/.test(document.querySelector('[data-ext-panel]')?.textContent || '')`), 'ext panel'))
+    await typeInput('[data-ext-query]', 'test')
+    check('searching the registry lists the extensions', await waitFor(() => c.ev(`document.querySelectorAll('[data-ext-result]').length === 2`), 'registry results'))
+    check('each result shows its id and download count', await c.ev(`(() => { const t = document.querySelector('[data-ext-result="acme.nightsnip"]').textContent; return t.includes('acme.nightsnip') && t.includes('4,321 downloads') })()`))
+    await c.ev(`document.querySelector('[data-ext-result="acme.nightsnip"] [data-ext-install]').click()`)
+    check('installing a theme + snippets package from the registry works', await waitFor(() => c.ev(`!!document.querySelector('[data-ext="acme.nightsnip"]')`), 'nightsnip installed', 30000))
+    check('the Installed list says what it brings', await c.ev(`(() => { const t = document.querySelector('[data-ext="acme.nightsnip"]').textContent; return t.includes('Night Snip') && t.includes('1 theme') && t.includes('1 snippet file') })()`))
+    check('it is data only: no "runs code" warning', await c.ev(`!document.querySelector('[data-ext="acme.nightsnip"] [data-ext-runs-code]')`))
+    check('the registry list now shows it as installed', await c.ev(`!document.querySelector('[data-ext-result="acme.nightsnip"] [data-ext-install]')`))
+    // The theme is in the theme list
+    await ctrl('p', { shiftKey: true })
+    await c.ev(`(() => { const el = document.querySelector('.qp input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, 'color theme'); el.dispatchEvent(new Event('input', { bubbles: true })) })()`)
+    await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Color Theme'))`), 'theme command')
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('Color Theme')).click()`)
+    const themeNames = await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].map(i => i.textContent)`).then((r) => r.length > 5 && r), 'theme list')
+    const themeBefore = (themeNames.find((n) => n.includes('current')) || '').replace(/(dark|light|high contrast|custom).*$/i, '').trim()
+    check('the extension\'s theme appears in the theme picker', themeNames.some((n) => n.includes('Night Test')), JSON.stringify(themeNames.slice(-4)))
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('Night Test')).click()`)
+    check('choosing it applies its colours to the editor and the UI', await waitFor(async () => (await bgVar()) === '#011627' && (await c.ev(`getComputedStyle(document.documentElement).getPropertyValue('--accent').trim()`)) === '#7e57c2', 'night theme applied'), await bgVar())
+    // Snippets
+    fs.writeFileSync(path.join(PROJ, 'snip.js'), '')
+    await waitFor(() => c.ev(`!!document.querySelector('.tree-row[data-tree-path$="snip.js"]')`), 'snip.js in tree', 10000)
+    await c.ev(`document.querySelector('[data-view="ext"]').click()`)
+    await openFromTree('snip.js')
+    await typeInEditor('log')
+    await edKey(' ', { code: 'Space', modifiers: 2, windowsVirtualKeyCode: 32 }) // Ctrl+Space
+    await c.ev(`document.querySelector('.group-main .monaco-editor textarea').focus()`)
+    check('typing a snippet prefix offers the snippet', await waitFor(() => c.ev(`[...document.querySelectorAll('.suggest-widget .monaco-list-row')].some(r => r.textContent.includes('log') && r.textContent.includes('Print'))`), 'snippet suggestion', 10000).catch(() => false) || await waitFor(() => c.ev(`[...document.querySelectorAll('.suggest-widget .monaco-list-row')].some(r => r.textContent.includes('log'))`), 'snippet suggestion (label only)', 5000))
+    await c.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`)
+    await edKey('Escape', { code: 'Escape', windowsVirtualKeyCode: 27 })
+    await rightClick('.tab'); await clickMenu('Close All')
+    fs.rmSync(path.join(PROJ, 'snip.js'), { force: true })
+    // A native extension with code
+    await c.ev(`document.querySelector('[data-view="ext"]').click()`)
+    await c.ev(`document.querySelector('[data-ext-result="me.hello"] [data-ext-install]').click()`)
+    check('an extension that runs code is installed, with a warning', await waitFor(() => c.ev(`!!document.querySelector('[data-ext="me.hello"] [data-ext-runs-code]')`), 'hello installed', 30000))
+    await ctrl('p', { shiftKey: true })
+    await c.ev(`(() => { const el = document.querySelector('.qp input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, 'upper case'); el.dispatchEvent(new Event('input', { bubbles: true })) })()`)
+    check('its commands appear in the command palette', await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Hello Ext: Upper Case Selection'))`), 'extension command in palette'))
+    await c.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`)
+    fs.writeFileSync(path.join(PROJ, 'shout.txt'), 'make me loud\n')
+    await waitFor(() => c.ev(`!!document.querySelector('.tree-row[data-tree-path$="shout.txt"]')`), 'shout.txt in tree', 10000)
+    await openFromTree('shout.txt')
+    await c.ev(`document.querySelector('.group-main .monaco-editor textarea').focus()`)
+    await ctrl('a')
+    await edKey('a', { code: 'KeyA', modifiers: 2, windowsVirtualKeyCode: 65 })
+    await ctrl('p', { shiftKey: true })
+    await c.ev(`(() => { const el = document.querySelector('.qp input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, 'upper case'); el.dispatchEvent(new Event('input', { bubbles: true })) })()`)
+    await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Upper Case Selection'))`), 'command again')
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('Upper Case Selection')).click()`)
+    check('running it changes the selected text in the editor (the extension used the editor API)', await waitFor(() => c.ev(`document.querySelector('.group-main .view-lines').textContent.replace(/ /g, ' ').includes('MAKE ME LOUD')`), 'upper-cased', 30000))
+    check('and it showed a message', await waitFor(() => c.ev(`/upper-cased/.test(document.querySelector('[data-toast]')?.textContent || '')`), 'extension toast'))
+    // A command that asks for input
+    await ctrl('p', { shiftKey: true })
+    await c.ev(`(() => { const el = document.querySelector('.qp input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, 'ask'); el.dispatchEvent(new Event('input', { bubbles: true })) })()`)
+    await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Ask For A Name'))`), 'ask command')
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('Ask For A Name')).click()`)
+    check('a command can ask the user for text in the editor\'s own dialog', await waitFor(() => c.ev(`!!document.querySelector('[data-input-dialog]') && document.body.textContent.includes('Your name?')`), 'input dialog from extension'))
+    await typeInput('[data-input-dialog]', 'Zed')
+    check('and gets the answer', await waitFor(() => c.ev(`/Hello Zed/.test(document.querySelector('[data-toast]')?.textContent || '')`), 'greeting toast'))
+    // Command that fails
+    await ctrl('p', { shiftKey: true })
+    await c.ev(`(() => { const el = document.querySelector('.qp input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, 'always'); el.dispatchEvent(new Event('input', { bubbles: true })) })()`)
+    await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Always Fails'))`), 'fail command')
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('Always Fails')).click()`)
+    check('an error in an extension command is shown, not swallowed', await waitFor(() => c.ev(`document.querySelector('[data-toast]')?.classList.contains('error') && /deliberate failure/.test(document.querySelector('[data-toast]').textContent)`), 'error toast'))
+    // Disable, uninstall
+    await rightClick('.tab'); await clickMenu('Close All')
+    fs.rmSync(path.join(PROJ, 'shout.txt'), { force: true })
+    await c.ev(`document.querySelector('[data-view="ext"]').click()`)
+    await c.ev(`document.querySelector('[data-ext="me.hello"] [data-ext-enabled]').click()`)
+    await waitFor(() => c.ev(`document.querySelector('[data-ext="me.hello"]')?.classList.contains('off')`), 'row shows disabled')
+    await ctrl('p', { shiftKey: true })
+    await c.ev(`(() => { const el = document.querySelector('.qp input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, 'upper case'); el.dispatchEvent(new Event('input', { bubbles: true })) })()`)
+    await sleep(500)
+    check('disabling an extension removes its commands', await waitFor(() => c.ev(`![...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Upper Case Selection'))`), 'command gone when disabled'))
+    await c.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`)
+    await c.ev(`document.querySelector('[data-ext="me.hello"] [data-ext-uninstall]').click()`)
+    check('uninstalling removes it from the list', await waitFor(() => c.ev(`!document.querySelector('[data-ext="me.hello"]')`), 'hello uninstalled'))
+    await c.ev(`document.querySelector('[data-ext="acme.nightsnip"] [data-ext-uninstall]').click()`)
+    check('uninstalling the theme package puts the default theme back', await waitFor(async () => !(await c.ev(`!!document.querySelector('[data-ext="acme.nightsnip"]')`)) && (await bgVar()) === '#1f1f1f', 'theme reverted'), await bgVar())
+    // give the later tests the theme they started with
+    if (themeBefore && !/dark modern/i.test(themeBefore)) {
+      await ctrl('p', { shiftKey: true })
+      await c.ev(`(() => { const el = document.querySelector('.qp input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, 'color theme'); el.dispatchEvent(new Event('input', { bubbles: true })) })()`)
+      await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Color Theme'))`), 'theme command again')
+      await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('Color Theme')).click()`)
+      await waitFor(() => c.ev(`document.querySelectorAll('.qp-item').length > 5`), 'theme list again')
+      await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.startsWith(${JSON.stringify(themeBefore)})).click()`)
+      await sleep(400)
+    }
+    await c.ev(`document.querySelector('.sidebar-views button').click()`)
+
     // ---- AI features: project rules, @ mentions, images, Apply, usage ----
     await c.ev(`window.__confirms = []; window.__confirmAnswer = true; window.confirm = (m) => { window.__confirms.push(String(m)); return window.__confirmAnswer }; window.__alerts = []; window.alert = (m) => window.__alerts.push(String(m))`)
     const lastChatRequest = () => requests.filter((r) => r.body.stream && !r.body.tools && r.body.model !== 'claude-sonnet-5-5' || false).pop() || requests.filter((r) => r.body.stream && !r.body.tools).pop()
@@ -802,6 +1356,32 @@ function removeTestHistory() {
     // @folder
     req = await sendChat('summarize @src/')
     check('@folder sends the folder listing', systemOf(req).includes('Contents of the folder src/') && systemOf(req).includes('comp.tsx') && systemOf(req).includes('lib/'), systemOf(req).slice(-200))
+
+    // Search by meaning (local index, Claude expands the question) and @codebase
+    fs.writeFileSync(path.join(PROJ, 'src', 'payments.ts'), 'export function chargeCreditCard(customer: Customer, cents: number) {\n  return gateway.charge(customer.card, cents)\n}\n')
+    await c.ev(`document.querySelectorAll('.sidebar-views button')[1].click()`)
+    await c.ev(`document.querySelector('[data-search-semantic]').click()`)
+    check('the search box switches to asking about the code', await c.ev(`/Ask about the code/.test(document.querySelector('[data-search-query]').placeholder) && ![...document.querySelectorAll('.search-box button')].some(b => b.textContent === 'Aa')`))
+    await typeInput('[data-search-query]', 'bill the customer')
+    check('a plain-words question finds the code that does it', await waitFor(() => c.ev(`document.querySelector('[data-sem-hit]')?.dataset.semHit === 'src/payments.ts'`), 'semantic hit', 25000))
+    check('the result shows what Claude added to the question and how many files were indexed', await c.ev(`(() => { const t = document.querySelector('[data-search-sem-info]').textContent; return /files indexed/.test(t) && /also looked for: charge, credit/.test(t) })()`), await c.ev(`document.querySelector('[data-search-sem-info]')?.textContent`))
+    const meaningNote = await c.ev(`document.querySelector('[data-search-sem-info]').textContent + ' | ' + (document.querySelector('[data-search-meaning]')?.textContent || '')`)
+    check('the search model runs in the packaged app (or says why it cannot, e.g. offline)', /matched by meaning/.test(meaningNote) || /Learning your code|not available/.test(meaningNote), meaningNote)
+    check('each result shows the first lines of the code', await c.ev(`document.querySelector('[data-sem-hit] .search-sem-code').textContent.includes('chargeCreditCard')`))
+    await c.ev(`document.querySelector('[data-sem-hit]').click()`)
+    check('clicking a result opens the file', await waitFor(async () => (await activeTab()) === 'payments.ts', 'payments.ts open'))
+    await rightClick('.tab'); await clickMenu('Close All')
+    await c.ev(`document.querySelector('[data-search-semantic]').click()`)
+    check('switching it off brings back match case and regex', await c.ev(`[...document.querySelectorAll('.search-box button')].some(b => b.textContent === 'Aa')`))
+    await c.ev(`document.querySelector('.sidebar-views button').click()`)
+    await typeInto('.chat textarea', '@co')
+    check('@ offers codebase', await waitFor(() => c.ev(`[...document.querySelectorAll('.mention-item')].some(m => m.dataset.mention === 'codebase')`), 'codebase mention'))
+    await typeInto('.chat textarea', '')
+    req = await sendChat('@codebase how do we bill the customer?')
+    check('@codebase sends the code found by searching the project', systemOf(req).includes('Code found by searching the whole project') && systemOf(req).includes('chargeCreditCard') && systemOf(req).includes('src/payments.ts:1-'), systemOf(req).slice(-300))
+    check('the question itself is sent without the @codebase word', JSON.stringify(req.body.messages[req.body.messages.length - 1]).includes('how do we bill the customer?'))
+    check('and the message notes it', await c.ev(`[...document.querySelectorAll('.chat-note')].some(n => n.textContent.includes('@codebase'))`))
+    fs.rmSync(path.join(PROJ, 'src', 'payments.ts'), { force: true })
 
     // @problems (bad.ts has a syntax error; open it so the editor analyses it)
     fs.writeFileSync(path.join(PROJ, 'src', 'bad.ts'), 'const x: number = ;\n')
@@ -882,8 +1462,7 @@ function removeTestHistory() {
     const beforeInline = requests.length
     await typeInput('.ie-bar input', 'make it shout')
     check('inline edit sends the project rules too', await waitFor(() => requests.length > beforeInline && JSON.stringify(requests[requests.length - 1].body.system).includes('ZEBRA-RULE-42'), 'inline request with rules', 15000))
-    await c.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`)
-    await waitFor(() => c.ev(`!document.querySelector('.qp.ie')`), 'inline edit closed')
+    await waitFor(() => c.ev(`(() => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); return !document.querySelector('.qp.ie') })()`), 'inline edit closed')
     await rightClick('.tab'); await clickMenu('Close All')
     fs.rmSync(path.join(PROJ, 'AGENTS.md'), { force: true })
 
@@ -1052,6 +1631,372 @@ function removeTestHistory() {
     check('deleting the active theme file falls back to the default theme', await waitFor(async () => (await bgVar()) === '#1f1f1f', 'fallback to default'))
     await c.ev(`document.querySelector('button[data-setting="reset"]').click()`)
     check('Reset to defaults restores font, zoom, theme and minimap', await waitFor(async () => (await fontOf()).size === '14px' && /Cascadia Code/.test((await fontOf()).family) && (await bgVar()) === '#1f1f1f' && (await c.ev(`Math.abs(window.devicePixelRatio - 1) < 0.02`)) && (await minimapShown()), 'reset applied'))
+
+    // ---- Tasks and launch configurations ----
+    // the page was reloaded by the update tests, which dropped the dialog overrides
+    await c.ev(`window.confirm = () => true; window.__alerts = []; window.alert = (m) => window.__alerts.push(String(m))`)
+    await c.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`)
+    await waitFor(() => c.ev(`!document.querySelector('.qp.settings')`), 'settings closed before tasks')
+    const paletteT = async (text) => {
+      await ctrl('p', { shiftKey: true })
+      await c.ev(`(() => { const el = document.querySelector('.qp input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, ${JSON.stringify(text)}); el.dispatchEvent(new Event('input', { bubbles: true })) })()`)
+    }
+    fs.writeFileSync(path.join(PROJ, 'package.json'), JSON.stringify({ name: 'proj', scripts: { hello: 'echo hi' } }))
+    fs.mkdirSync(path.join(PROJ, '.ai-ide'), { recursive: true })
+    fs.writeFileSync(path.join(PROJ, '.ai-ide', 'tasks.json'), JSON.stringify({ version: '2.0.0', tasks: [
+      { label: 'Echo it', type: 'shell', command: 'Write-Host', args: ['task-ran-ok', 'two words'], group: 'build' },
+      { label: 'Second step', command: 'Write-Output "second-step-ok"', dependsOn: ['Echo it'] }
+    ] }))
+    fs.mkdirSync(path.join(PROJ, 'src'), { recursive: true })
+    fs.writeFileSync(path.join(PROJ, 'argsprog.js'), 'console.log("ARGS=" + process.argv.slice(2).join(",") + " FOO=" + process.env.FOO + " CWD=" + require("path").basename(process.cwd()))\n')
+    fs.writeFileSync(path.join(PROJ, '.ai-ide', 'launch.json'), '{ "version": "0.2.0", "configurations": [ { "name": "With args", "type": "node", "request": "launch", "program": "${workspaceFolder}/argsprog.js", "args": ["a1", "b2"], "env": { "FOO": "bar" }, "cwd": "${workspaceFolder}/src" }, { "name": "Broken", "type": "chrome", "program": "x" } ] }')
+    await paletteT('run task')
+    await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Tasks: Run Task'))`), 'run task command')
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('Tasks: Run Task')).click()`)
+    await c.ev(`window.__alerts = []`)
+    const taskItems = await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].map(i => i.textContent)`).then((r) => r.some((t) => t.includes('Echo it')) && r), 'task list')
+    check('Run Task lists the tasks of the file and the npm scripts', taskItems.some((t) => t.includes('Echo it') && t.includes('[build]')) && taskItems.some((t) => t.includes('Second step')) && taskItems.some((t) => t.includes('npm: ')), JSON.stringify(taskItems))
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('Second step')).click()`)
+    check('running a task opens a terminal named after it', await waitFor(async () => (await termTabs()).includes('Task: Second step'), 'task terminal tab'), JSON.stringify(await termTabs()))
+    check('the command ran in the terminal (an argument with spaces stayed one argument)', await waitFor(async () => { const t = await termText(); return t.includes('task-ran-ok two words') }, 'task output', 30000))
+    check('and its dependency ran first, then the task itself', await waitFor(async () => { const t = await termText(); return t.indexOf('task-ran-ok') >= 0 && t.indexOf('second-step-ok') > t.indexOf('task-ran-ok') }, 'dependency order', 30000))
+    await c.ev(`[...document.querySelectorAll('.term-tab')].find(t => t.textContent.includes('Task: Second step'))?.querySelector('.close')?.click()`)
+    await paletteT('build task')
+    await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Run Build Task'))`), 'build task command')
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('Run Build Task')).click()`)
+    check('Run Build Task runs the only task in the build group straight away', await waitFor(async () => (await termTabs()).includes('Task: Echo it'), 'build task tab'))
+    await c.ev(`[...document.querySelectorAll('.term-tab')].find(t => t.textContent.includes('Task: Echo it'))?.querySelector('.close')?.click()`)
+    // Launch configuration
+    await c.ev(`document.querySelector('[data-view="debug"]').click()`)
+    check('the Run view offers the launch configurations that can be used', await waitFor(() => c.ev(`[...document.querySelectorAll('[data-dbg-config] option')].map(o => o.textContent).join() === 'Current file,With args'`), 'config options'))
+    check('and says why another one cannot', await c.ev(`/Broken.*only "node"/.test(document.querySelector('[data-dbg-problems]')?.textContent || '')`))
+    await c.ev(`(() => { const s = document.querySelector('[data-dbg-config]'); Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(s, 'With args'); s.dispatchEvent(new Event('change', { bubbles: true })) })()`)
+    await waitFor(() => c.ev(`document.querySelector('[data-dbg-action="start"]')?.disabled === false`), 'start enabled for the configuration')
+    await c.ev(`document.querySelector('[data-dbg-action="start"]').click()`)
+    check('Start runs the configuration with its arguments, environment and folder', await waitFor(() => c.ev(`/ARGS=a1,b2 FOO=bar CWD=src/.test(document.querySelector('[data-dbg-output]')?.textContent || '')`), 'launch config output', 30000).catch(async (e) => { console.log('DIAG', JSON.stringify(await c.ev(`[document.querySelector('[data-dbg-output]')?.textContent, document.querySelector('[data-dbg-status]')?.dataset.dbgStatus, document.querySelector('[data-dbg-config]')?.value, document.querySelector('[data-dbg-problems]')?.textContent]`))); throw e }))
+    await c.ev(`(() => { const s = document.querySelector('[data-dbg-config]'); Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(s, ''); s.dispatchEvent(new Event('change', { bubbles: true })) })()`)
+    // Starter files
+    fs.rmSync(path.join(PROJ, '.ai-ide'), { recursive: true, force: true })
+    await paletteT('tasks file')
+    await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Open Tasks File'))`), 'open tasks file command')
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('Open Tasks File')).click()`)
+    check('"Open Tasks File" creates a starter file and opens it', await waitFor(async () => (await activeTab()) === 'tasks.json' && fs.existsSync(path.join(PROJ, '.ai-ide', 'tasks.json')), 'tasks.json opened'))
+    await rightClick('.tab'); await clickMenu('Close All')
+    fs.rmSync(path.join(PROJ, '.ai-ide'), { recursive: true, force: true }); fs.rmSync(path.join(PROJ, 'argsprog.js'), { force: true })
+    await c.ev(`document.querySelector('.sidebar-views button').click()`)
+
+    // ---- Three-way merge editor ----
+    if ((await tabNames()).length) { await rightClick('.tab'); await clickMenu('Close All') }
+    gitSh('add -A'); gitSh('commit -q -m "before merge editor test" --allow-empty')
+    fs.writeFileSync(path.join(PROJ, 'merge3.txt'), 'a\nb\nc\nd\ne\nm\nn\no\np\nf\ng\n'); gitSh('add merge3.txt'); gitSh('commit -q -m "merge3 base"')
+    gitSh('checkout -q -b m3-theirs')
+    fs.writeFileSync(path.join(PROJ, 'merge3.txt'), 'a\nB-theirs\nc\nd\ne\nm\nn\no\np\nF-theirs\ng\n'); gitSh('commit -q -am "theirs side"')
+    gitSh('checkout -q main')
+    fs.writeFileSync(path.join(PROJ, 'merge3.txt'), 'a\nB-ours\nc\nd\ne\nm\nn\no\np\nF-ours\ng\n'); gitSh('commit -q -am "ours side"')
+    try { gitSh('merge m3-theirs') } catch { /* conflicts are the point */ }
+    await c.ev(`document.querySelector('[data-view="git"]').click()`)
+    await gitRefresh()
+    await waitFor(async () => (await gitRows(false)).includes('merge3.txt:!'), 'merge3.txt conflicted')
+    await c.ev(`document.querySelector('.git-row[data-git-file="merge3.txt"] [data-git-action="merge-editor"]').click()`)
+    check('a conflicted file has a button that opens the merge editor', await waitFor(() => c.ev(`!!document.querySelector('[data-merge-view]')`), 'merge view'))
+    check('it has two panes for the two versions and a result pane', await c.ev(`['ours', 'theirs', 'result'].every((p) => !!document.querySelector('[data-merge-pane="' + p + '"] .monaco-editor'))`))
+    check('it counts the conflicts', await waitFor(() => c.ev(`document.querySelector('[data-merge-left]')?.textContent === '2 conflicts left'`), 'two conflicts'))
+    const paneText = (p) => c.ev(`(document.querySelector('[data-merge-pane="${p}"] .view-lines')?.textContent || '').replace(/ /g, ' ')`)
+    check('the top panes show each side\'s whole file', await waitFor(async () => { const o = await paneText('ours'), t = await paneText('theirs'); return o.includes('B-ours') && o.includes('F-ours') && !o.includes('B-theirs') && t.includes('B-theirs') && t.includes('F-theirs') && !t.includes('B-ours') }, 'pane texts'))
+    check('the conflicting lines are marked in them', await c.ev(`!!document.querySelector('[data-merge-pane="ours"] .conflict-current') && !!document.querySelector('[data-merge-pane="theirs"] .conflict-incoming')`))
+    check('the result starts as the file with its conflict markers', await waitFor(async () => { const r = await paneText('result'); return r.includes('<<<<<<<') && r.includes('B-ours') && r.includes('B-theirs') && r.includes('>>>>>>>') }, 'result with markers'))
+    await c.ev(`document.querySelector('[data-merge-action="theirs"]').click()`)
+    check('Accept Incoming resolves the selected conflict', await waitFor(() => c.ev(`document.querySelector('[data-merge-left]')?.textContent === '1 conflict left'`), 'one left'))
+    const r1 = await paneText('result')
+    check('with the incoming lines and without markers for it', r1.includes('B-theirs') && !r1.includes('B-ours') && r1.includes('F-ours') && r1.includes('F-theirs'), r1.slice(0, 160))
+    await c.ev(`document.querySelector('[data-merge-action="next"]').click()`)
+    check('Next conflict takes the caret to the one left', await waitFor(() => c.ev(`(() => { const r = document.querySelector('[data-merge-pane="result"] .current-line'); return !!r })()`), 'caret in result'))
+    await c.ev(`document.querySelector('[data-merge-action="both"]').click()`)
+    check('Accept Both keeps both sides of the other conflict', await waitFor(() => c.ev(`document.querySelector('[data-merge-left]')?.textContent === 'All conflicts resolved'`), 'all resolved'))
+    await waitFor(async () => !(await paneText('result')).includes('<<<<<<<'), 'result without markers', 10000).catch(() => undefined)
+    const r2 = await paneText('result')
+    check('so nothing is left to decide', !r2.includes('<<<<<<<') && !r2.includes('=======') && r2.indexOf('F-ours') > 0 && r2.indexOf('F-theirs') > r2.indexOf('F-ours'), r2.slice(0, 160))
+    await c.ev(`document.querySelector('[data-merge-action="complete"]').click()`)
+    check('Complete Merge writes the file and closes the editor', await waitFor(() => !fs.readFileSync(path.join(PROJ, 'merge3.txt'), 'utf8').includes('<<<<<<<') && fs.readFileSync(path.join(PROJ, 'merge3.txt'), 'utf8').replace(/\r/g, '') === 'a\nB-theirs\nc\nd\ne\nm\nn\no\np\nF-ours\nF-theirs\ng\n', 'file written') && (await c.ev(`!document.querySelector('[data-merge-view]')`)), fs.readFileSync(path.join(PROJ, 'merge3.txt'), 'utf8'))
+    check('and marks the file resolved: it is no longer a conflict and is staged', await waitFor(async () => !(await gitRows(false)).includes('merge3.txt:!') && (await gitRows(true)).some((x) => x.startsWith('merge3.txt:')), 'staged after merge editor'), JSON.stringify(await gitRows(true)))
+    check('the merge can now be committed', await c.ev(`/Commit to finish/.test(document.querySelector('[data-git-merge]')?.textContent || '')`))
+    gitSh('commit -q -m "merged with the merge editor"')
+    // No conflicts: nothing to open
+    await openFromTree('merge3.txt')
+    await c.ev(`window.__alerts = []`)
+    await paletteT('merge editor')
+    await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Open Merge Editor'))`), 'merge editor command')
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('Open Merge Editor')).click()`)
+    check('asking for the merge editor on a file without conflicts says so', await waitFor(() => c.ev(`window.__alerts.some((a) => /no merge conflicts/.test(a))`), 'no conflicts alert') && (await c.ev(`!document.querySelector('[data-merge-view]')`)))
+    await rightClick('.tab'); await clickMenu('Close All')
+    // A conflict opened from the editor's own link
+    gitSh('checkout -q -b m3-again'); fs.writeFileSync(path.join(PROJ, 'merge3.txt'), 'x\n'); gitSh('commit -q -am "again"')
+    gitSh('checkout -q main'); fs.writeFileSync(path.join(PROJ, 'merge3.txt'), 'y\n'); gitSh('commit -q -am "main again"')
+    try { gitSh('merge m3-again') } catch { /* conflict */ }
+    await gitRefresh()
+    await openFromTree('merge3.txt')
+    await waitFor(() => c.ev(`[...document.querySelectorAll('.monaco-editor .codelens-decoration a')].some(a => a.textContent === 'Open Merge Editor')`), 'open merge editor link', 15000)
+    await c.ev(`window.__alerts = []; window.__mergeEvents = 0; window.addEventListener('myaiide-open-merge', () => { window.__mergeEvents++ })`)
+    const lensBox2 = await c.ev(`(() => { const r = [...document.querySelectorAll('.monaco-editor .codelens-decoration a')].find(a => a.textContent === 'Open Merge Editor').getBoundingClientRect(); return { x: r.x + 6, y: r.y + r.height / 2 } })()`)
+    for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) await c.send('Input.dispatchMouseEvent', { type, x: lensBox2.x, y: lensBox2.y, button: 'left', clickCount: 1 })
+    check('the link above a conflict in the editor opens the merge editor too', await waitFor(() => c.ev(`!!document.querySelector('[data-merge-view]')`), 'merge editor from link').catch(async (e) => { console.log('DIAG2', JSON.stringify(await c.ev(`[window.__alerts, window.__mergeEvents, document.querySelector('[data-diff-view]') ? 'diff' : '', [...document.querySelectorAll('.codelens-decoration a')].map(a => a.textContent), !!document.querySelector('[data-merge-view]')]`))); return false }))
+    await c.ev(`document.querySelector('[data-merge-action="close"]').click()`)
+    check('Close leaves the file as it was', await waitFor(() => c.ev(`!document.querySelector('[data-merge-view]')`), 'closed') && fs.readFileSync(path.join(PROJ, 'merge3.txt'), 'utf8').includes('<<<<<<<'))
+    await rightClick('.tab'); await clickMenu('Close All')
+    gitSh('merge --abort'); gitSh('checkout -q main'); gitSh('branch -D m3-theirs -q'); gitSh('branch -D m3-again -q')
+    await c.ev(`document.querySelector('.sidebar-views button').click()`)
+
+    // ---- Accessibility: landmarks, roles, keyboard, focus, announcements ----
+    await c.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`)
+    if ((await tabNames()).length) { await rightClick('.tab'); await clickMenu('Close All') }
+    const pressKey = (k, vk, extra = {}) => edKey(k, { code: extra.code ?? k, windowsVirtualKeyCode: vk, ...extra })
+    const activeEl = () => c.ev(`(() => { const a = document.activeElement; return a ? (a.getAttribute('data-tree-path') || a.getAttribute('data-tab-path') || a.getAttribute('aria-label') || a.id || a.tagName + '.' + a.className) : null })()`)
+    check('the main parts of the window are landmarks with names', await c.ev(`!!document.querySelector('aside[aria-label="Side bar"]') && !!document.querySelector('main[aria-label="Editor"]') && !!document.querySelector('footer[aria-label="Status bar"]') && !!document.querySelector('aside.chat[aria-label]')`))
+    check('the sidebar views are a tablist whose selected tab is marked', await c.ev(`(() => { const l = document.querySelector('.sidebar-views'); return l.getAttribute('role') === 'tablist' && l.querySelectorAll('[role="tab"]').length >= 6 && l.querySelectorAll('[aria-selected="true"]').length === 1 })()`))
+    check('there are live regions for announcements', await c.ev(`!!document.querySelector('[data-live-polite][aria-live="polite"]') && !!document.querySelector('[data-live-assertive][role="alert"]')`))
+
+    // File tree: roles and arrow keys
+    await c.ev(`document.querySelector('[data-view="files"]')?.click() || document.querySelector('.sidebar-views [role="tab"]').click()`)
+    check('the explorer is a tree of treeitems with levels', await c.ev(`document.querySelector('.tree[role="tree"]') && [...document.querySelectorAll('.tree-row')].every((r) => r.getAttribute('role') === 'treeitem' && Number(r.getAttribute('aria-level')) >= 1)`))
+    await c.ev(`document.querySelector('.tree-row[tabindex="0"]').focus()`)
+    const firstFocus = await activeEl()
+    await pressKey('ArrowDown', 40)
+    check('the arrow keys move through the tree', (await activeEl()) !== firstFocus && /\.|[\\/]/.test(String(await activeEl())), String(await activeEl()))
+    await c.ev(`[...document.querySelectorAll('.tree-row')].find((r) => r.getAttribute('aria-expanded') === 'false')?.focus()`)
+    const folderPath = await activeEl()
+    await pressKey('ArrowRight', 39)
+    check('Right opens a folder (aria-expanded changes)', await waitFor(() => c.ev(`[...document.querySelectorAll('.tree-row')].find((r) => r.dataset.treePath === ${JSON.stringify(String(folderPath))})?.getAttribute('aria-expanded') === 'true'`), 'folder expanded by key'), String(folderPath))
+    await pressKey('ArrowLeft', 37)
+    check('Left closes it again', await waitFor(() => c.ev(`[...document.querySelectorAll('.tree-row')].find((r) => r.dataset.treePath === ${JSON.stringify(String(folderPath))})?.getAttribute('aria-expanded') === 'false'`), 'folder collapsed by key'))
+    await c.ev(`document.querySelector('.tree-row[data-tree-path$="hello.txt"]').focus()`)
+    await pressKey('Enter', 13, { code: 'Enter' })
+    check('Enter opens the file', await waitFor(async () => (await activeTab()) === 'hello.txt', 'hello.txt by Enter'))
+    // Context menu from the keyboard, with focus coming back
+    await c.ev(`document.querySelector('.tree-row[data-tree-path$="hello.txt"]').focus()`)
+    await pressKey('F10', 121, { modifiers: 8 })
+    check('Shift+F10 opens the context menu, which is a menu of menuitems', await waitFor(() => c.ev(`document.querySelector('[data-context-menu][role="menu"] [role="menuitem"]') !== null`), 'keyboard menu'))
+    await pressKey('ArrowDown', 40)
+    check('the arrow keys move through its items', await c.ev(`document.querySelectorAll('[data-context-menu] .ctx-item.hi').length === 1 && document.querySelector('[data-context-menu]').getAttribute('aria-activedescendant') === document.querySelector('.ctx-item.hi').id`))
+    await pressKey('Escape', 27, { code: 'Escape' })
+    check('Escape closes it and focus returns to the row', await waitFor(async () => (await c.ev(`!document.querySelector('[data-context-menu]')`)) && /hello\.txt$/.test(String(await activeEl())), 'focus restored after menu'), String(await activeEl()))
+
+    // Tabs
+    await c.ev(`document.querySelector('.tree-row[data-tree-path$="notes.md"]').click()`)
+    await waitFor(async () => (await tabNames()).length === 2, 'two tabs')
+    check('open files are tabs in a tablist; only the current one is in the tab order', await c.ev(`(() => { const l = document.querySelector('.tabs'); const t = [...l.querySelectorAll('[role="tab"]')]; return l.getAttribute('role') === 'tablist' && t.length === 2 && t.filter((x) => x.getAttribute('aria-selected') === 'true').length === 1 && t.filter((x) => x.tabIndex === 0).length === 1 })()`))
+    await c.ev(`document.querySelector('.tabs [aria-selected="true"]').focus()`)
+    const tabBefore = await activeTab()
+    await pressKey('ArrowLeft', 37)
+    check('the arrow keys switch tabs and move focus with them', await waitFor(async () => (await activeTab()) !== tabBefore && /data-tab-path|\.|[\\/]/.test(String(await activeEl())), 'tab by arrow'))
+    await rightClick('.tab'); await clickMenu('Close All')
+
+    // Quick pick
+    await ctrl('p')
+    check('Quick Open is a dialog with a combobox and a listbox of options', await waitFor(() => c.ev(`(() => { const d = document.querySelector('.qp[role="dialog"]'); const i = d?.querySelector('input[role="combobox"]'); return !!d && d.getAttribute('aria-modal') === 'true' && !!i && i.getAttribute('aria-expanded') === 'true' && d.querySelector('[role="listbox"] [role="option"]') !== null })()`), 'quick open roles'))
+    const act0 = await c.ev(`document.querySelector('input[role="combobox"]').getAttribute('aria-activedescendant')`)
+    await pressKey('ArrowDown', 40)
+    const act1 = await c.ev(`document.querySelector('input[role="combobox"]').getAttribute('aria-activedescendant')`)
+    check('the highlighted option is named by aria-activedescendant and it changes with the arrows', !!act0 && !!act1 && act0 !== act1 && (await c.ev(`document.getElementById(${JSON.stringify(act1)})?.getAttribute('aria-selected') === 'true'`)))
+    for (let i = 0; i < 4; i++) await pressKey('Tab', 9)
+    check('Tab cannot leave the dialog', await c.ev(`!!document.activeElement.closest('.qp')`))
+    await typeInput('.qp input', 'zzzz-no-such-file')
+    check('how many results there are is announced', await waitFor(() => c.ev(`/No results|result/.test(document.querySelector('[data-live-polite]').textContent)`), 'quick pick announcement', 5000).catch(() => false))
+    await pressKey('Escape', 27, { code: 'Escape' })
+
+    // Dialogs keep focus and give it back
+    await c.ev(`document.querySelector('.statusbar button').focus()`)
+    const opener = await c.ev(`document.activeElement.textContent`)
+    await clickBtn('Settings', '.statusbar')
+    check('Settings is a modal dialog and focus is inside it', await waitFor(() => c.ev(`(() => { const d = document.querySelector('.qp.settings'); return !!d && d.getAttribute('role') === 'dialog' && d.getAttribute('aria-modal') === 'true' && d.contains(document.activeElement) })()`), 'settings dialog focus'))
+    check('the accessibility settings are there', await c.ev(`!!document.querySelector('[data-setting="screenReader"]') && !!document.querySelector('[data-setting="reduceMotion"]')`))
+    await c.ev(`document.querySelector('input[data-setting="reduceMotion"]').click()`)
+    check('Reduce motion switches animations off for the whole window', await waitFor(() => c.ev(`document.documentElement.classList.contains('reduce-motion')`), 'reduce motion class'))
+    await c.ev(`document.querySelector('input[data-setting="reduceMotion"]').click()`)
+    await c.ev(`document.querySelector('input[data-setting="screenReader"]').click()`)
+    check('Screen reader support is remembered', await waitFor(() => c.ev(`JSON.parse(localStorage.getItem('settings') || localStorage.getItem('app-settings') || '{}').screenReader === true || document.querySelector('input[data-setting="screenReader"]').checked`), 'screen reader setting'))
+    await c.ev(`document.querySelector('input[data-setting="screenReader"]').click()`)
+    await pressKey('Escape', 27, { code: 'Escape' })
+    check('closing it puts focus back where it was', await waitFor(() => c.ev(`document.activeElement && document.activeElement.closest('.statusbar') !== null`), 'focus restored after settings'), opener)
+
+    // Moving between regions
+    await openFromTree('hello.txt')
+    await c.ev(`document.querySelector('.group-main .monaco-editor textarea').focus()`)
+    await pressKey('F6', 117)
+    check('F6 moves from the editor to the next part of the window', await waitFor(() => c.ev(`!!document.activeElement.closest('aside.chat') || !!document.activeElement.closest('.terminal-panel')`), 'F6 forward'))
+    await pressKey('F6', 117, { modifiers: 8 })
+    check('Shift+F6 goes back', await waitFor(() => c.ev(`!!document.activeElement.closest('.groups')`), 'F6 back'))
+    await paletteT('focus side bar')
+    await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Focus Side Bar'))`), 'focus command')
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('Focus Side Bar')).click()`)
+    check('"Focus Side Bar" puts the keyboard in the explorer', await waitFor(() => c.ev(`!!document.activeElement.closest('.sidebar')`), 'focus side bar'))
+    check('the move is announced', await c.ev(`/Side bar/.test(document.querySelector('[data-live-polite]').textContent)`))
+    await rightClick('.tab'); await clickMenu('Close All')
+
+    // Focus is visible, and colours are readable
+    await c.ev(`document.body.focus(); document.activeElement && document.activeElement.blur()`)
+    await pressKey('Tab', 9)
+    const ring = await c.ev(`(() => { const s = getComputedStyle(document.activeElement); return { style: s.outlineStyle, width: parseFloat(s.outlineWidth) } })()`)
+    check('a control reached with the Tab key has a visible focus ring', ring.style !== 'none' && ring.width >= 2, JSON.stringify(ring))
+    const cssv = await c.ev(`(() => { const g = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim(); return { bg: g('--bg'), side: g('--side'), fg: g('--fg'), muted: g('--muted'), accentText: g('--accent-text'), danger: g('--danger') } })()`)
+    const lumOf = (h) => { const v = [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16) / 255).map((x) => (x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4))); return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2] }
+    const ratioOf = (a, b) => { const x = lumOf(a), y = lumOf(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05) }
+    check('the colours in use now pass WCAG AA (text, secondary text, links, errors)', ratioOf(cssv.fg, cssv.bg) >= 4.5 && ratioOf(cssv.muted, cssv.bg) >= 4.5 && ratioOf(cssv.muted, cssv.side) >= 4.5 && ratioOf(cssv.accentText, cssv.bg) >= 4.5 && ratioOf(cssv.danger, cssv.bg) >= 4.5, JSON.stringify(cssv))
+
+    // ---- Notebooks ----
+    await c.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`)
+    if ((await tabNames()).length) { await rightClick('.tab'); await clickMenu('Close All') }
+    const nbKernels = await c.ev(`window.api.nbKernels()`)
+    const hasPy = nbKernels.some((k) => k.id === 'python')
+    await paletteT('create new notebook')
+    await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Create New Notebook'))`), 'new notebook command')
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('Create New Notebook')).click()`)
+    await waitFor(() => c.ev(`!!document.querySelector('[data-input-dialog]')`), 'notebook name dialog')
+    await typeInput('[data-input-dialog]', 'e2e.ipynb')
+    check('"Create New Notebook" makes the file and opens it as a notebook', await waitFor(async () => (await activeTab()) === 'e2e.ipynb' && (await c.ev(`!!document.querySelector('[data-notebook] [data-nb-cell]')`)), 'notebook opened'))
+    const onDisk = () => JSON.parse(fs.readFileSync(path.join(PROJ, 'e2e.ipynb'), 'utf8'))
+    check('the new file is a valid, empty Python notebook with one code cell', onDisk().nbformat === 4 && onDisk().cells.length === 1 && onDisk().cells[0].cell_type === 'code' && onDisk().metadata.kernelspec.language === 'python')
+    const cellTextarea = (n = 0) => `[...document.querySelectorAll('[data-nb-cell]')][${n}].querySelector('.monaco-editor textarea')`
+    const typeInCell = async (n, text) => { await waitFor(() => c.ev(`!!${cellTextarea(n)}`), 'cell editor ' + n); await c.ev(`${cellTextarea(n)}.focus()`); for (const ch of text) await edKey(ch, { text: ch, unmodifiedText: ch }) }
+    const nbCount = () => c.ev(`document.querySelectorAll('[data-nb-cell]').length`)
+    const nbStatus = () => c.ev(`document.querySelector('[data-nb-status]')?.dataset.nbStatus`)
+    await typeInCell(0, hasPy ? 'print("hi from notebook")' : '1 + 1')
+    if (!hasPy) await c.ev(`(() => { const s = document.querySelector('[data-nb-kernel]'); Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(s, 'javascript'); s.dispatchEvent(new Event('change', { bubbles: true })) })()`)
+    check('typing in a cell marks the file as modified', await waitFor(async () => (await dirtyTabs()).includes('e2e.ipynb'), 'notebook dirty'))
+    await edKey('Enter', { code: 'Enter', windowsVirtualKeyCode: 13, modifiers: 8 }) // Shift+Enter
+    check('Shift+Enter runs the cell; its output appears under it', await waitFor(() => c.ev(hasPy ? `/hi from notebook/.test(document.querySelector('[data-nb-cell] [data-nb-outputs]')?.textContent || '')` : `document.querySelector('[data-nb-cell] [data-nb-outputs]')?.textContent.includes('2')`), 'cell output', 30000))
+    check('the cell shows its execution number', await c.ev(`document.querySelector('[data-nb-cell] [data-nb-count]').textContent === '[1]'`))
+    check('and a new cell was added after it, with the caret in it', (await nbCount()) === 2)
+    check('the kernel is ready afterwards', await waitFor(async () => (await nbStatus()) === 'ready', 'kernel ready', 10000))
+    await ctrl('s')
+    const nbSaved = await waitFor(() => { try { return onDisk().cells[0].outputs.length > 0 && onDisk() } catch { return false } }, 'notebook saved with outputs', 10000)
+    check('saving writes the cells and the outputs in nbformat 4', !!nbSaved && nbSaved.cells[0].execution_count === 1 && nbSaved.cells[0].source.join('').length > 0 && (nbSaved.cells[0].outputs[0].output_type === 'stream') === hasPy, JSON.stringify(nbSaved && nbSaved.cells[0]).slice(0, 200))
+    // Markdown
+    await c.ev(`document.querySelector('[data-nb-action="add-markdown"]').click()`)
+    await waitFor(async () => (await nbCount()) === 3, 'text cell added')
+    await typeInCell(2, '# A heading')
+    await edKey('Enter', { code: 'Enter', windowsVirtualKeyCode: 13, modifiers: 8 })
+    check('a text cell is shown as formatted text once run', await waitFor(() => c.ev(`document.querySelector('[data-nb-type="markdown"] [data-nb-md] h1')?.textContent === 'A heading'`), 'markdown rendered'))
+    // an error, a kernel switch
+    await typeInCell(1, hasPy ? '1 / 0' : 'null.boom')
+    await c.ev(`document.querySelectorAll('[data-nb-cell]')[1].querySelector('[data-nb-run]').click()`)
+    check('an error is shown in the cell with its name', await waitFor(() => c.ev(`/ZeroDivisionError|TypeError/.test(document.querySelectorAll('[data-nb-cell]')[1].querySelector('.nb-error')?.textContent || '')`), 'error output', 30000))
+    await c.ev(`(() => { const s = document.querySelector('[data-nb-kernel]'); Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(s, 'javascript'); s.dispatchEvent(new Event('change', { bubbles: true })) })()`)
+    await waitFor(async () => onDisk().metadata.kernelspec.language === 'javascript', 'kernel recorded', 10000).catch(() => undefined)
+    await ctrl('s')
+    check('changing the kernel is recorded in the notebook\'s metadata', await waitFor(() => onDisk().metadata.kernelspec.language === 'javascript', 'metadata saved', 10000))
+    await c.ev(`document.querySelectorAll('[data-nb-cell]')[1].querySelector('.nb-error') && (document.querySelector('[data-nb-action="clear"]').click(), true)`)
+    check('Clear Outputs empties the outputs and numbers', await waitFor(() => c.ev(`document.querySelectorAll('[data-nb-outputs]').length === 0 && document.querySelector('[data-nb-count]').textContent === '[ ]'`), 'outputs cleared'))
+    // a JavaScript cell on the JavaScript kernel
+    await c.ev(`document.querySelectorAll('[data-nb-cell]')[1].querySelector('.monaco-editor') && (() => { const ta = ${cellTextarea(1)}; ta.focus(); })()`)
+    await c.ev(`${cellTextarea(1)}.focus()`)
+    await edKey('a', { code: 'KeyA', modifiers: 2, windowsVirtualKeyCode: 65 }) // select all
+    await edKey('Backspace', { code: 'Backspace', windowsVirtualKeyCode: 8 }) // typing over a selection would wrap it in brackets
+    for (const ch of '[1, 2, 3].map((n) => n * 2)') await edKey(ch, { text: ch, unmodifiedText: ch })
+    await c.ev(`document.querySelectorAll('[data-nb-cell]')[1].querySelector('[data-nb-run]').click()`)
+    check('the JavaScript kernel runs a cell too', await waitFor(() => c.ev(`/2, 4, 6/.test(document.querySelectorAll('[data-nb-cell]')[1].querySelector('[data-nb-outputs]')?.textContent || '')`), 'js result', 30000))
+    // keyboard: command mode
+    await edKey('Escape', { code: 'Escape', windowsVirtualKeyCode: 27 })
+    check('Escape leaves the cell editor for command mode (the cell itself has focus)', await waitFor(() => c.ev(`document.activeElement?.hasAttribute('data-nb-cell')`), 'command mode'))
+    const nbBefore = await nbCount()
+    await edKey('b', { text: 'b', unmodifiedText: 'b', code: 'KeyB' })
+    check('B adds a cell below', await waitFor(async () => (await nbCount()) === nbBefore + 1, 'cell added by key'))
+    for (let i = 0; i < 6 && !(await c.ev(`document.activeElement?.hasAttribute('data-nb-cell')`)); i++) { await edKey('Escape', { code: 'Escape', windowsVirtualKeyCode: 27 }); await sleep(400) }
+    await waitFor(() => c.ev(`document.activeElement?.hasAttribute('data-nb-cell')`), 'command mode before D D')
+    await c.ev(`(() => { const el = document.activeElement; for (let i = 0; i < 2; i++) el.dispatchEvent(new KeyboardEvent('keydown', { key: 'd', bubbles: true, cancelable: true })) })()`) // both inside the double-press window, however busy the machine is
+    check('D twice deletes the cell', await waitFor(async () => (await nbCount()) === nbBefore, 'cell deleted by key'))
+    // stop, text view
+    await c.ev(`document.querySelector('[data-nb-action="stop"]').click()`)
+    check('Stop ends the kernel', await waitFor(async () => (await nbStatus()) === 'stopped', 'kernel stopped'))
+    await c.ev(`document.querySelector('[data-notebook] .nb-toolbar button:last-child').click()`)
+    check('"{ }" shows the notebook as JSON text', await waitFor(() => c.ev(`!document.querySelector('[data-notebook]') && /"cells"/.test(document.querySelector('.group-main .view-lines')?.textContent || '')`), 'text view'))
+    await paletteT('as notebook')
+    await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Open as Notebook'))`), 'toggle command')
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('Open as Notebook')).click()`)
+    check('and the palette brings the cells back', await waitFor(() => c.ev(`!!document.querySelector('[data-notebook] [data-nb-cell]')`), 'notebook view again'))
+    await ctrl('s')
+    await rightClick('.tab'); await clickMenu('Close All')
+    fs.writeFileSync(path.join(PROJ, 'broken.ipynb'), '{ not json')
+    await waitFor(() => c.ev(`!!document.querySelector('.tree-row[data-tree-path$="broken.ipynb"]')`), 'broken.ipynb in tree', 10000)
+    await openFromTree('broken.ipynb')
+    check('a damaged notebook says what is wrong and offers the text', await waitFor(() => c.ev(`/not valid JSON/.test(document.querySelector('[data-nb-error]')?.textContent || '')`), 'notebook error'))
+    await rightClick('.tab'); await clickMenu('Close All')
+    fs.rmSync(path.join(PROJ, 'broken.ipynb'), { force: true }); fs.rmSync(path.join(PROJ, 'e2e.ipynb'), { force: true })
+
+    // ---- SSH terminal and WSL folder ----
+    await c.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`)
+    await waitFor(() => c.ev(`!document.querySelector('.qp.settings')`), 'settings closed')
+    const palette = async (text) => {
+      await ctrl('p', { shiftKey: true })
+      await c.ev(`(() => { const el = document.querySelector('.qp input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, ${JSON.stringify(text)}); el.dispatchEvent(new Event('input', { bubbles: true })) })()`)
+    }
+    await palette('ssh terminal')
+    await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('New SSH Terminal'))`), 'ssh command')
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('New SSH Terminal')).click()`)
+    check('"New SSH Terminal" asks for an address', await waitFor(() => c.ev(`!!document.querySelector('[data-input-dialog]') && /SSH address/.test(document.querySelector('.input-dialog').textContent)`), 'ssh dialog'))
+    const tabsBeforeSsh = (await termTabs()).length
+    await typeInput('[data-input-dialog]', '-oProxyCommand=calc')
+    check('something that ssh would read as an option is refused with a message', await waitFor(() => c.ev(`/host name/.test(document.querySelector('.input-dialog')?.textContent || '')`), 'ssh validation') && (await termTabs()).length === tabsBeforeSsh)
+    await typeInput('[data-input-dialog]', '10.255.255.1')
+    check('a valid address opens a terminal tab for the session', await waitFor(async () => (await termTabs()).includes('SSH: 10.255.255.1'), 'ssh tab', 4000), JSON.stringify(await termTabs()))
+    await c.ev(`[...document.querySelectorAll('.term-tab')].find(t => t.textContent.includes('SSH: 10.255.255.1'))?.querySelector('.close')?.click()`)
+    await palette('wsl folder')
+    await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Open WSL Folder'))`), 'wsl command')
+    await c.ev(`window.__alerts = []; [...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('Open WSL Folder')).click()`)
+    const wslOutcome = await waitFor(async () => (await c.ev(`window.__alerts.some(a => /No WSL distribution/.test(a))`)) ? 'none' : (await c.ev(`[...document.querySelectorAll('.qp-item')].some(i => /Open a folder in this Linux distribution/.test(i.textContent))`)) ? 'list' : false, 'WSL answer', 10000)
+    check('"Open WSL Folder" lists the installed distributions, or says that there are none', wslOutcome === 'none' || wslOutcome === 'list', String(wslOutcome))
+    await c.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`)
+
+    // ---- Folder over SSH (against an SSH server in this process) ----
+    const sshRoot = path.join(os.tmpdir(), 'e2e-ssh-' + process.pid)
+    fs.rmSync(sshRoot, { recursive: true, force: true })
+    fs.mkdirSync(path.join(sshRoot, 'home', 'tester', 'proj', 'sub'), { recursive: true })
+    fs.writeFileSync(path.join(sshRoot, 'home', 'tester', 'proj', 'remote.ts'), 'export const remote = 1\n')
+    fs.writeFileSync(path.join(sshRoot, 'home', 'tester', 'proj', 'sub', 'deep.txt'), 'a needle-in-the-remote here\n')
+    const sshServer = require('./sshserver.cjs')(sshRoot)
+    await new Promise((r) => sshServer.listen(0, '127.0.0.1', r))
+    const sshPort = sshServer.address().port
+    const localRoot = await c.ev(`document.querySelector('.statusbar .sb-item').title`)
+    await palette('folder over ssh')
+    await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Open Folder over SSH'))`), 'ssh folder command')
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('Open Folder over SSH')).click()`)
+    check('"Open Folder over SSH" asks for an address', await waitFor(() => c.ev(`!!document.querySelector('[data-input-dialog]') && /over SSH/.test(document.querySelector('.input-dialog').textContent)`), 'ssh folder dialog'))
+    await typeInput('[data-input-dialog]', 'tester@127.0.0.1:' + sshPort)
+    check('a computer seen for the first time asks you to trust its fingerprint', await waitFor(() => c.ev(`/SHA256:/.test(document.querySelector('[data-choice-dialog]')?.textContent || '')`), 'trust dialog'))
+    await c.ev(`document.querySelector('[data-choice="Trust and connect"]').click()`)
+    check('then asks for the password, hiding what is typed', await waitFor(() => c.ev(`document.querySelector('[data-input-dialog]')?.type === 'password'`), 'password dialog'))
+    await typeInput('[data-input-dialog]', 'secret')
+    check('and shows the folders of the computer to pick from', await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Open this folder')) && [...document.querySelectorAll('.qp-item')].some(i => i.textContent.trim().startsWith('proj'))`), 'remote folder picker'))
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.trim().startsWith('proj')).click()`)
+    await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].some(i => i.textContent.includes('Open this folder') && i.textContent.includes('/home/tester/proj'))`), 'inside proj')
+    await c.ev(`[...document.querySelectorAll('.qp-item')].find(i => i.textContent.includes('Open this folder')).click()`)
+    check('opening it makes that folder the project, with an SSH badge in the status bar', await waitFor(() => c.ev(`!!document.querySelector('[data-sb="ssh"]') && /proj/.test(document.querySelector('.statusbar .sb-item').textContent)`), 'remote root open'))
+    check('the explorer lists the files on the other computer', await waitFor(() => c.ev(`!!document.querySelector('.tree-row[data-tree-path$="remote.ts"]') && !!document.querySelector('.tree-row[data-tree-path$="sub"]')`), 'remote tree'))
+    await openFromTree('remote.ts')
+    check('a remote file opens in the editor with its contents', await waitFor(() => c.ev(`/export\\s+const\\s+remote\\s*=\\s*1/.test(document.querySelector('.group-main .view-lines')?.textContent || '')`), 'remote content'))
+    await typeInEditor('// edited over ssh\n')
+    await ctrl('s')
+    check('saving writes the change to the other computer', await waitFor(() => fs.readFileSync(path.join(sshRoot, 'home', 'tester', 'proj', 'remote.ts'), 'utf8').includes('// edited over ssh'), 'remote file saved', 10000))
+    await c.ev(`document.querySelectorAll('.sidebar-views button')[1].click()`)
+    await typeInput('.search-box input', 'needle-in-the-remote')
+    check('Find in files searches the other computer', await waitFor(() => c.ev(`[...document.querySelectorAll('.search-hit')].some(h => /needle-in-the-remote/.test(h.textContent))`), 'remote search', 15000))
+    await c.ev(`document.querySelector('[data-view="git"]').click()`)
+    check('Source Control says it is not available there instead of failing', await waitFor(() => c.ev(`/over SSH/.test(document.querySelector('.sidebar')?.textContent || '')`), 'git remote message'))
+    await c.ev(`document.querySelectorAll('.sidebar-views button')[0].click()`)
+    await waitFor(() => c.ev(`!!document.querySelector('.tree-row[data-tree-path$="remote.ts"]')`), 'remote.ts in the tree again')
+    await rightClick('.tree-row[data-tree-path$="remote.ts"]')
+    await clickMenu('Rename')
+    await typeInput('[data-input-dialog]', 'renamed.ts')
+    check('renaming a remote file works', await waitFor(() => fs.existsSync(path.join(sshRoot, 'home', 'tester', 'proj', 'renamed.ts')) && !fs.existsSync(path.join(sshRoot, 'home', 'tester', 'proj', 'remote.ts')), 'remote rename', 10000))
+    await waitFor(() => c.ev(`!!document.querySelector('.tree-row[data-tree-path$="renamed.ts"]')`), 'renamed.ts in the tree')
+    await rightClick('.tree-row[data-tree-path$="renamed.ts"]')
+    await clickMenu('Delete')
+    check('and deleting one removes it from the other computer', await waitFor(() => !fs.existsSync(path.join(sshRoot, 'home', 'tester', 'proj', 'renamed.ts')), 'remote delete', 10000))
+    await c.ev(`window.__alerts = []`)
+    const back = await c.ev(`window.api.fsIsDir(${JSON.stringify(localRoot)})`)
+    check('the local project folder is still there to go back to', back === true)
+    await c.ev(`window.api.sshDisconnect('127-0-0-1')`)
+    sshServer.close()
+    fs.rmSync(sshRoot, { recursive: true, force: true })
 
     check('no uncaught renderer errors', c.errors.length === 0, c.errors.slice(0, 3).join(' | '))
   } catch (e) {

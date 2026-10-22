@@ -22,6 +22,7 @@ interface Msg {
 
 // Extra things the user can attach with @, besides files and folders.
 const SPECIAL_MENTIONS = [
+  { token: 'codebase', detail: 'Search the whole project for code relevant to your question' },
   { token: 'git', detail: 'The current changes (diff)' },
   { token: 'problems', detail: 'Errors and warnings in open files' },
   { token: 'terminal', detail: 'What the selected terminal shows' }
@@ -383,7 +384,14 @@ export function ChatPanel({
       const wanted = new Set<string>()
       const tokens = new Set([...text.matchAll(/(?:^|\s)@(\S+)/g)].map((m) => m[1].replace(/[.,;:!?)]+$/, '')))
       for (const t of tokens) {
-        if (t === 'git') {
+        if (t === 'codebase') {
+          const question = text.replace(/(?:^|\s)@codebase\b/g, ' ').trim() || text
+          const found = await window.api.indexSearch([root], question, { limit: 8 })
+          const body = found.ok
+            ? found.hits.map((h) => h.rel + ':' + h.start + '-' + h.end + '\n```\n' + h.text + '\n```').join('\n\n') || 'Nothing relevant was found.'
+            : 'The search failed: ' + (found.error ?? 'unknown error')
+          extras.push({ title: 'Code found by searching the whole project for this question', body, note: '@codebase' })
+        } else if (t === 'git') {
           extras.push({ title: 'Git changes (diff of the working tree against HEAD)', body: '```diff\n' + (await window.api.gitDiffText(root)) + '\n```', note: '@git' })
         } else if (t === 'problems') {
           extras.push({ title: 'Problems (errors and warnings) reported in the open files', body: getProblemsText() || 'No problems.', note: '@problems' })
@@ -468,7 +476,7 @@ export function ChatPanel({
 
   if (hasKey === false || editingKey) {
     return (
-      <aside className="chat">
+      <aside className="chat" aria-label="AI chat">
         <div className="chat-header">AI CHAT</div>
         <div className="chat-key">
           <p>Enter your Anthropic API key. It is encrypted with Windows and stored only on this PC.</p>

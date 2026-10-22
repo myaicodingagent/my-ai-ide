@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import { useFocusTrap } from './a11y'
 import { monaco } from './monaco-setup'
 import { acquireDiffEditor, releaseDiffEditor } from './diffPool'
 import { editorOptions } from './settings'
@@ -25,6 +26,8 @@ export function CommandDialog({
   request: CommandApproval
   onDecide: (ok: boolean) => void
 }): JSX.Element {
+  const boxRef = useRef<HTMLDivElement>(null)
+  useFocusTrap(boxRef, '[data-decline]') // the safe choice has focus, so a stray Enter does not run the command
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
       if (e.key === 'Escape') onDecide(false)
@@ -35,7 +38,7 @@ export function CommandDialog({
 
   return (
     <div className="qp-backdrop">
-      <div className="qp ie">
+      <div className="qp ie" ref={boxRef} role="alertdialog" aria-modal="true" aria-label="The agent wants to run a command">
         <div className="ie-status">The agent wants to run this command in:</div>
         <div className="ie-status cmd-cwd">{request.cwd}</div>
         <pre className="cmd-text">{request.command}</pre>
@@ -46,7 +49,7 @@ export function CommandDialog({
           <button className="primary" onClick={() => onDecide(true)}>
             Run
           </button>
-          <button onClick={() => onDecide(false)}>Don&apos;t run</button>
+          <button data-decline onClick={() => onDecide(false)}>Don&apos;t run</button>
         </div>
       </div>
     </div>
@@ -63,6 +66,8 @@ export function ApprovalDialog({
   onDecide: (ok: boolean) => void
 }): JSX.Element {
   const host = useRef<HTMLDivElement>(null)
+  const boxRef = useRef<HTMLDivElement>(null)
+  useFocusTrap(boxRef, '[data-decline]')
 
   useEffect(() => {
     // A custom scheme keeps these models from clashing with the real file's model.
@@ -95,7 +100,7 @@ export function ApprovalDialog({
 
   return (
     <div className="qp-backdrop">
-      <div className="qp ie approval">
+      <div className="qp ie approval" ref={boxRef} role="alertdialog" aria-modal="true" aria-label={`Review a change to ${approval.path}`}>
         <div className="ie-status">
           {approval.isNew ? 'Create' : 'Edit'} <b>{approval.path}</b>
         </div>
@@ -109,7 +114,7 @@ export function ApprovalDialog({
           <button className="primary" onClick={() => onDecide(true)}>
             Accept
           </button>
-          <button onClick={() => onDecide(false)}>Reject</button>
+          <button data-decline onClick={() => onDecide(false)}>Reject</button>
         </div>
       </div>
     </div>

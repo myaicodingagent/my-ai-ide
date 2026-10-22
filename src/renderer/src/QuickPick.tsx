@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { announce, useFocusTrap } from './a11y'
 
 export interface PickItem {
   label: string
@@ -41,6 +42,9 @@ export function QuickPick({
   const [sel, setSel] = useState(initialIndex)
   const inputRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
+  const boxRef = useRef<HTMLDivElement>(null)
+  const uid = useId()
+  useFocusTrap(boxRef)
   useEffect(() => inputRef.current?.focus(), [])
 
   const shown = useMemo(() => {
@@ -57,6 +61,13 @@ export function QuickPick({
   useEffect(() => {
     listRef.current?.querySelector('.qp-item.sel')?.scrollIntoView({ block: 'nearest' })
   }, [sel, shown])
+
+  // Say how many choices match, a moment after the typing stops.
+  useEffect(() => {
+    if (!query) return
+    const t = setTimeout(() => announce(shown.length === 0 ? 'No results' : `${shown.length} result${shown.length > 1 ? 's' : ''}`), 400)
+    return () => clearTimeout(t)
+  }, [query, shown.length])
 
   const moveTo = (i: number): void => {
     setSel(i)
@@ -76,11 +87,17 @@ export function QuickPick({
 
   return (
     <div className="qp-backdrop" onMouseDown={cancel}>
-      <div className="qp" onMouseDown={(e) => e.stopPropagation()}>
+      <div className="qp" ref={boxRef} role="dialog" aria-modal="true" aria-label={placeholder} onMouseDown={(e) => e.stopPropagation()}>
         <input
           ref={inputRef}
           value={query}
           placeholder={placeholder}
+          role="combobox"
+          aria-label={placeholder}
+          aria-expanded="true"
+          aria-autocomplete="list"
+          aria-controls={uid + '-list'}
+          aria-activedescendant={shown[sel] ? uid + '-opt-' + sel : undefined}
           onChange={(e) => {
             setQuery(e.target.value)
             setSel(0)
@@ -96,10 +113,13 @@ export function QuickPick({
             } else if (e.key === 'Enter') choose(shown[sel])
           }}
         />
-        <div className="qp-list" ref={listRef}>
+        <div className="qp-list" ref={listRef} id={uid + '-list'} role="listbox" aria-label="Choices">
           {shown.map((it, i) => (
             <div
               key={it.label + (it.detail ?? '')}
+              id={uid + '-opt-' + i}
+              role="option"
+              aria-selected={i === sel}
               className={'qp-item' + (i === sel ? ' sel' : '')}
               onMouseMove={() => i !== sel && moveTo(i)}
               onClick={() => choose(it)}
@@ -108,7 +128,7 @@ export function QuickPick({
               {it.detail && <span className="qp-detail">{it.detail}</span>}
             </div>
           ))}
-          {shown.length === 0 && <div className="qp-item">No results</div>}
+          {shown.length === 0 && <div className="qp-item" role="option" aria-selected="false">No results</div>}
         </div>
       </div>
     </div>

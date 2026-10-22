@@ -6,16 +6,24 @@ import { promises as fs } from 'fs'
 import Anthropic from '@anthropic-ai/sdk'
 import { loadKey } from './ai'
 import { rulesPrompt } from './rules'
+import { formatHits, searchCodebase } from './codeindex'
+import { wslCommandArgs, wslLocation } from './shellspec'
+import { isRemotePath } from './sshfs'
 
 type Param = Anthropic.Beta.Messages.BetaMessageParam
 type Tool = Anthropic.Beta.Messages.BetaTool
 
-interface RunRequest {
+export interface RunRequest {
   runId: number
   sessionId: string
   model: string
   root: string
   task: string
+  // Background runs work in their own copy of the project: edits there are applied without asking, and the
+  // result is reviewed as a whole afterwards. Commands are still approved one by one.
+  autoApproveEdits?: boolean
+  extraSystem?: string // appended to the system prompt
+  maxSteps?: number
 }
 
 export type AgentEvent =
@@ -181,6 +189,19 @@ const TOOLS: Tool[] = [
         case_sensitive: { type: 'boolean', description: 'Whether the search is case sensitive.' }
       },
       required: ['pattern', 'path', 'case_sensitive'],
+      additionalProperties: false
+    }
+  },
+  {
+    name: 'search_codebase',
+    description:
+      'Search the whole project by meaning. Describe what you are looking for in plain words (for example "where users are authenticated" or "retry logic for failed uploads"); ' +
+      'returns the most relevant excerpts as "path:lines" with code. Use it to find where something lives before reading files; use search_text for exact strings.',
+    strict: true,
+    input_schema: {
+      type: 'object',
+      properties: { query: { type: 'string', description: 'What to look for, in natural language.' } },
+      required: ['query'],
       additionalProperties: false
     }
   },
@@ -391,6 +412,11 @@ export async function runTool(root: string, name: string, input: unknown): Promi
       return searchText(root, { pattern: str('pattern'), path: str('path'), case_sensitive: i.case_sensitive === true })
     case 'find_files':
       return findFiles(root, { pattern: str('pattern') })
+    case 'search_codebase': {
+      const r = await searchCodebase([root], str('query'), { limit: 8 })
+      if (!r.ok) throw new Error(r.error ?? 'The search failed.')
+      return formatHits(r.hits, 20_000)
+    }
     default:
       throw new Error(`Unknown tool "${name}".`)
   }
@@ -537,16 +563,20 @@ export async function runCommand(ctx: CommandContext, input: unknown): Promise<s
   delete env.ELECTRON_RUN_AS_NODE
 
   const win = process.platform === 'win32'
-  const [file, args] = win
-    ? [
-        'powershell.exe',
-        ['-NoProfile', '-NonInteractive', '-Command', `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n${command}`]
-      ]
-    : ['/bin/sh', ['-c', command]]
+  // A project inside WSL: the command runs inside that distribution (bash), in that folder.
+  const wsl = win ? wslLocation(ctx.root) : null
+  const [file, args] = wsl
+    ? ['wsl.exe', wslCommandArgs(wsl, command)]
+    : win
+      ? [
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-Command', `[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n${command}`]
+        ]
+      : ['/bin/sh', ['-c', command]]
 
   try {
     return await new Promise<string>((resolve, reject) => {
-      const child = spawn(file, args, { cwd: ctx.root, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+      const child = spawn(file, args, { cwd: wsl ? (process.env.USERPROFILE ?? process.cwd()) : ctx.root, env, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
       let out = ''
       let timedOut = false
       let interrupted = false
@@ -616,12 +646,13 @@ async function runAgent(req: RunRequest, send: (e: AgentEvent) => void, signal: 
   const msgs: Param[] = [...history, { role: 'user', content: task }]
 
   try {
-    for (let step = 0; step < MAX_STEPS; step++) {
+    const maxSteps = req.maxSteps ?? MAX_STEPS
+    for (let step = 0; step < maxSteps; step++) {
       const stream = client.beta.messages.stream(
         {
           model: req.model,
           max_tokens: 32000,
-          system: SYSTEM(req.root) + rules,
+          system: SYSTEM(req.root) + rules + (req.extraSystem ?? ''),
           tools: TOOLS,
           messages: msgs,
           cache_control: { type: 'ephemeral' },
@@ -669,7 +700,7 @@ async function runAgent(req: RunRequest, send: (e: AgentEvent) => void, signal: 
                 sessionId: req.sessionId,
                 toolUseId: block.id,
                 send,
-                requestApproval: (e) => requestApproval(req.runId, signal, send, e)
+                requestApproval: req.autoApproveEdits ? async () => true : (e) => requestApproval(req.runId, signal, send, e)
               },
               block.name,
               block.input
@@ -701,7 +732,7 @@ async function runAgent(req: RunRequest, send: (e: AgentEvent) => void, signal: 
         return
       }
     }
-    send({ type: 'error', message: `Stopped after ${MAX_STEPS} steps. Ask a narrower question or say "continue".` })
+    send({ type: 'error', message: `Stopped after ${maxSteps} steps. Ask a narrower question or say "continue".` })
   } catch (err) {
     if (signal.aborted) return send({ type: 'done', stopReason: 'aborted' })
     if (err instanceof Anthropic.AuthenticationError) {
@@ -739,6 +770,20 @@ function requestApproval(
     signal.addEventListener('abort', onAbort)
     send(e)
   })
+}
+
+/** Runs the agent for a background task (see background.ts), which supplies its own event sink. */
+export function runAgentTask(req: RunRequest, send: (e: AgentEvent) => void, signal: AbortSignal): Promise<void> {
+  return runAgent(req, send, signal)
+}
+
+/** Forgets one conversation, in memory and on disk. */
+export function resetSession(sessionId: string): void {
+  sessions.delete(sessionId)
+  changes.delete(sessionId)
+  notes.delete(sessionId)
+  void fs.rm(agentFile(sessionId), { force: true })
+  void fs.rm(agentFile(sessionId, true), { force: true })
 }
 
 export function registerAgentHandlers(getWin: () => BrowserWindow | null): void {
@@ -800,6 +845,7 @@ export function registerAgentHandlers(getWin: () => BrowserWindow | null): void 
 
   ipcMain.on('agent:run', async (_e, req: RunRequest) => {
     const send = (e: AgentEvent): void => getWin()?.webContents.send('agent:event', req.runId, e)
+    if (isRemotePath(req.root)) return send({ type: 'error', message: 'The agent cannot work in a folder opened over SSH yet. Open a folder on this PC, or use the chat to ask about the files you open.' })
     const controller = new AbortController()
     running.set(req.runId, controller)
     try {
@@ -809,11 +855,5 @@ export function registerAgentHandlers(getWin: () => BrowserWindow | null): void 
     }
   })
   ipcMain.on('agent:abort', (_e, runId: number) => running.get(runId)?.abort())
-  ipcMain.on('agent:reset', (_e, sessionId: string) => {
-    sessions.delete(sessionId)
-    changes.delete(sessionId)
-    notes.delete(sessionId)
-    void fs.rm(agentFile(sessionId), { force: true })
-    void fs.rm(agentFile(sessionId, true), { force: true })
-  })
+  ipcMain.on('agent:reset', (_e, sessionId: string) => resetSession(sessionId))
 }

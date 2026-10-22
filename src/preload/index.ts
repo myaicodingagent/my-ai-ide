@@ -1,7 +1,13 @@
 import { contextBridge, ipcRenderer, webFrame } from 'electron'
 import type { AgentEvent } from '../main/agent'
 import type { UpdateState } from '../main/updater'
-import type { GitStatus } from '../main/git'
+import type { CommitEntry, CommitFile, GitStatus, StashEntry } from '../main/git'
+import type { BgTask } from '../main/background'
+import type { DbgBreakpoint, DbgEvent, DbgScope, DbgVar } from '../main/debugger'
+import type { ExtRecord, RegistryResult, SnippetSet } from '../main/extensions'
+import type { TasksInfo } from '../main/tasks'
+import type { KernelInfo, NbEvent } from '../main/notebook'
+import type { ConnectResult } from '../main/sshfs'
 
 type GitResult = { ok: true } | { ok: false; error: string }
 
@@ -34,7 +40,7 @@ const api = {
   fsTrash: (root: string, target: string): Promise<GitResult> => ipcRenderer.invoke('fs:trash', root, target),
   fsReveal: (target: string): Promise<void> => ipcRenderer.invoke('fs:reveal', target),
   copyText: (text: string): Promise<void> => ipcRenderer.invoke('app:copyText', text),
-  fsWatch: (root: string | null): Promise<void> => ipcRenderer.invoke('fs:watch', root),
+  fsWatch: (folders: string | string[] | null): Promise<void> => ipcRenderer.invoke('fs:watch', folders),
   onFsChanged: (cb: (e: { paths: string[]; git: boolean }) => void): (() => void) => {
     const h = (_e: unknown, e: { paths: string[]; git: boolean }): void => cb(e)
     ipcRenderer.on('fs:changed', h)
@@ -52,6 +58,7 @@ const api = {
     staged: boolean
   ): Promise<{ original: string; modified: string } | { error: string }> => ipcRenderer.invoke('git:diff', root, rel, staged),
   gitInit: (root: string): Promise<GitResult> => ipcRenderer.invoke('git:init', root),
+  gitTrust: (root: string): Promise<GitResult> => ipcRenderer.invoke('git:trust', root),
   gitStage: (root: string, rels: string[] | null): Promise<GitResult> => ipcRenderer.invoke('git:stage', root, rels),
   gitUnstage: (root: string, rels: string[] | null): Promise<GitResult> => ipcRenderer.invoke('git:unstage', root, rels),
   gitDiscard: (root: string, tracked: string[], untracked: string[]): Promise<GitResult> =>
@@ -65,6 +72,127 @@ const api = {
     ipcRenderer.invoke('git:remote', root, op),
   gitGenerateMessage: (root: string): Promise<{ ok: true; message: string } | { ok: false; error: string }> =>
     ipcRenderer.invoke('git:generateMessage', root),
+  gitStashList: (root: string): Promise<{ ok: boolean; error?: string; stashes: StashEntry[] }> => ipcRenderer.invoke('git:stashList', root),
+  gitStashPush: (root: string, message: string, includeUntracked: boolean): Promise<GitResult> =>
+    ipcRenderer.invoke('git:stashPush', root, message, includeUntracked),
+  gitStashApply: (root: string, n: number, pop: boolean): Promise<GitResult & { output?: string }> =>
+    ipcRenderer.invoke('git:stashApply', root, n, pop),
+  gitStashDrop: (root: string, n: number): Promise<GitResult> => ipcRenderer.invoke('git:stashDrop', root, n),
+  gitLog: (root: string, rel: string | null, skip: number, limit: number): Promise<{ ok: boolean; error?: string; commits: CommitEntry[] }> =>
+    ipcRenderer.invoke('git:log', root, rel, skip, limit),
+  gitCommitFiles: (root: string, hash: string): Promise<{ ok: boolean; error?: string; files: CommitFile[] }> =>
+    ipcRenderer.invoke('git:commitFiles', root, hash),
+  gitCommitDiff: (root: string, hash: string, rel: string, orig?: string): Promise<{ original: string; modified: string }> =>
+    ipcRenderer.invoke('git:commitDiff', root, hash, rel, orig),
+  gitMergeState: (root: string): Promise<{ merging: boolean }> => ipcRenderer.invoke('git:mergeState', root),
+  gitMergeAbort: (root: string): Promise<GitResult> => ipcRenderer.invoke('git:mergeAbort', root),
+  gitTake: (root: string, rel: string, side: 'ours' | 'theirs'): Promise<GitResult> => ipcRenderer.invoke('git:take', root, rel, side),
+  indexSearch: (
+    roots: string[],
+    query: string,
+    opts?: { limit?: number; ai?: boolean; embed?: boolean }
+  ): Promise<{
+    ok: boolean
+    error?: string
+    semantic?: { used: boolean; model: { state: 'idle' | 'loading' | 'ready' | 'error'; error?: string }; done: number; total: number; error?: string }
+    hits: { root: string; rel: string; abs: string; start: number; end: number; score: number; text: string }[]
+    indexed: { files: number; chunks: number }
+    expanded: string[] | null
+    reranked: boolean
+  }> => ipcRenderer.invoke('index:search', roots, query, opts),
+  indexReset: (root: string): Promise<void> => ipcRenderer.invoke('index:reset', root),
+  indexEmbeddings: (on: boolean): Promise<void> => ipcRenderer.invoke('index:embeddings', on),
+  dbgStart: (opts: {
+    file: string
+    args?: string[]
+    cwd?: string
+    env?: Record<string, string>
+    stopOnEntry?: boolean
+    breakpoints: Record<string, DbgBreakpoint[]>
+  }): Promise<{ ok: true } | { ok: false; error: string }> => ipcRenderer.invoke('dbg:start', opts),
+  dbgStop: (): Promise<void> => ipcRenderer.invoke('dbg:stop'),
+  dbgStep: (kind: 'continue' | 'stepOver' | 'stepInto' | 'stepOut' | 'pause'): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('dbg:' + kind),
+  dbgSetBreakpoints: (file: string, bps: DbgBreakpoint[]): Promise<void> => ipcRenderer.invoke('dbg:setBreakpoints', file, bps),
+  dbgScopes: (frame: number): Promise<DbgScope[]> => ipcRenderer.invoke('dbg:scopes', frame),
+  dbgProps: (objectId: string): Promise<DbgVar[]> => ipcRenderer.invoke('dbg:props', objectId),
+  dbgEval: (expression: string, frame: number | null): Promise<{ ok: true; value: DbgVar } | { ok: false; error: string }> =>
+    ipcRenderer.invoke('dbg:eval', expression, frame),
+  onDbgEvent: (cb: (e: DbgEvent) => void): (() => void) => {
+    const h = (_e: unknown, ev: DbgEvent): void => cb(ev)
+    ipcRenderer.on('dbg:event', h)
+    return () => ipcRenderer.removeListener('dbg:event', h)
+  },
+  nbKernels: (): Promise<KernelInfo[]> => ipcRenderer.invoke('nb:kernels'),
+  sshConnect: (address: string, secrets?: { password?: string; passphrase?: string; trust?: string }): Promise<ConnectResult> => ipcRenderer.invoke('ssh:connect', address, secrets),
+  sshEnsure: (unc: string, secrets?: { password?: string; passphrase?: string; trust?: string }): Promise<ConnectResult> => ipcRenderer.invoke('ssh:ensure', unc, secrets),
+  sshDisconnect: (name: string): Promise<void> => ipcRenderer.invoke('ssh:disconnect', name),
+  sshBrowse: (name: string, p: string): Promise<{ ok: true; path: string; parent: string | null; dirs: string[] } | { ok: false; error: string }> => ipcRenderer.invoke('ssh:browse', name, p),
+  sshToUnc: (name: string, p: string): Promise<string> => ipcRenderer.invoke('ssh:toUnc', name, p),
+  sshConnections: (): Promise<{ live: string[]; remembered: unknown[] }> => ipcRenderer.invoke('ssh:connections'),
+  nbStart: (kernel: string, cwd: string): Promise<{ ok: true; session: number } | { ok: false; error: string }> => ipcRenderer.invoke('nb:start', kernel, cwd),
+  nbExecute: (session: number, cellId: string, code: string): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke('nb:execute', session, cellId, code),
+  nbStop: (session: number): Promise<void> => ipcRenderer.invoke('nb:stop', session),
+  onNbEvent: (cb: (session: number, cell: string | null, ev: NbEvent) => void): (() => void) => {
+    const h = (_e: unknown, s: number, c: string | null, ev: NbEvent): void => cb(s, c, ev)
+    ipcRenderer.on('nb:event', h)
+    return () => ipcRenderer.removeListener('nb:event', h)
+  },
+  onNbExited: (cb: (session: number, code: number | null, err: string) => void): (() => void) => {
+    const h = (_e: unknown, s: number, code: number | null, err: string): void => cb(s, code, err)
+    ipcRenderer.on('nb:exited', h)
+    return () => ipcRenderer.removeListener('nb:exited', h)
+  },
+  tasksLoad: (root: string): Promise<TasksInfo> => ipcRenderer.invoke('tasks:load', root),
+  tasksEnsure: (root: string, kind: 'tasks' | 'launch'): Promise<string> => ipcRenderer.invoke('tasks:ensure', root, kind),
+  extList: (): Promise<ExtRecord[]> => ipcRenderer.invoke('ext:list'),
+  extSetRoot: (root: string | null): Promise<void> => ipcRenderer.invoke('ext:setRoot', root),
+  extInstallVsix: (file?: string): Promise<{ ok: true; ext: ExtRecord } | { ok: false; error: string }> => ipcRenderer.invoke('ext:installVsix', file),
+  extInstallFolder: (): Promise<{ ok: true; ext: ExtRecord } | { ok: false; error: string }> => ipcRenderer.invoke('ext:installFolder'),
+  extSearch: (query: string): Promise<{ ok: boolean; error?: string; results: RegistryResult[] }> => ipcRenderer.invoke('ext:search', query),
+  extInstallRegistry: (r: RegistryResult): Promise<{ ok: true; ext: ExtRecord } | { ok: false; error: string }> => ipcRenderer.invoke('ext:installRegistry', r),
+  extSetEnabled: (id: string, enabled: boolean): Promise<void> => ipcRenderer.invoke('ext:setEnabled', id, enabled),
+  extUninstall: (id: string): Promise<void> => ipcRenderer.invoke('ext:uninstall', id),
+  extSnippets: (): Promise<SnippetSet[]> => ipcRenderer.invoke('ext:snippets'),
+  extRun: (extId: string, command: string): Promise<{ ok: true } | { ok: false; error: string }> => ipcRenderer.invoke('ext:run', extId, command),
+  extLog: (): Promise<string[]> => ipcRenderer.invoke('ext:log'),
+  extOpenFolder: (): Promise<string | null> => ipcRenderer.invoke('ext:openFolder'),
+  extEditorState: (state: unknown): Promise<void> => ipcRenderer.invoke('ext:editorState', state),
+  extProvide: (providerId: string, kind: string, params: unknown): Promise<unknown> => ipcRenderer.invoke('ext:provide', providerId, kind, params),
+  extRespond: (reqId: number, r: { result?: unknown; error?: string }): Promise<void> => ipcRenderer.invoke('ext:respond', reqId, r),
+  onExtRequest: (cb: (req: { reqId: number; method: string; params: any }) => void): (() => void) => {
+    const h = (_e: unknown, req: { reqId: number; method: string; params: any }): void => cb(req)
+    ipcRenderer.on('ext:request', h)
+    return () => ipcRenderer.removeListener('ext:request', h)
+  },
+  onExtChanged: (cb: () => void): (() => void) => {
+    const h = (): void => cb()
+    ipcRenderer.on('ext:changed', h)
+    return () => ipcRenderer.removeListener('ext:changed', h)
+  },
+  onExtLog: (cb: (lines: string[]) => void): (() => void) => {
+    const h = (_e: unknown, lines: string[]): void => cb(lines)
+    ipcRenderer.on('ext:log', h)
+    return () => ipcRenderer.removeListener('ext:log', h)
+  },
+  bgList: (): Promise<BgTask[]> => ipcRenderer.invoke('bg:list'),
+  bgStart: (root: string, task: string, model: string): Promise<{ ok: true; task: BgTask } | { ok: false; error: string }> =>
+    ipcRenderer.invoke('bg:start', root, task, model),
+  bgStop: (id: string): Promise<void> => ipcRenderer.invoke('bg:stop', id),
+  bgFileDiff: (id: string, rel: string, orig?: string): Promise<{ original: string; modified: string; abs: string }> =>
+    ipcRenderer.invoke('bg:fileDiff', id, rel, orig),
+  bgApply: (id: string): Promise<{ ok: true; conflicts: boolean; output: string } | { ok: false; error: string }> => ipcRenderer.invoke('bg:apply', id),
+  bgDiscard: (id: string): Promise<void> => ipcRenderer.invoke('bg:discard', id),
+  onBgUpdate: (cb: (t: BgTask) => void): (() => void) => {
+    const h = (_e: unknown, t: BgTask): void => cb(t)
+    ipcRenderer.on('bg:update', h)
+    return () => ipcRenderer.removeListener('bg:update', h)
+  },
+  onBgRemoved: (cb: (id: string) => void): (() => void) => {
+    const h = (_e: unknown, id: string): void => cb(id)
+    ipcRenderer.on('bg:removed', h)
+    return () => ipcRenderer.removeListener('bg:removed', h)
+  },
   updateState: (): Promise<UpdateState> => ipcRenderer.invoke('update:state'),
   updateCheck: (): Promise<UpdateState> => ipcRenderer.invoke('update:check'),
   updateDownload: (): Promise<UpdateState> => ipcRenderer.invoke('update:download'),
@@ -158,7 +286,7 @@ const api = {
   }): Promise<{ ok: true; text: string } | { ok: false; error: string }> => ipcRenderer.invoke('ai:apply', req),
   gitDiffText: (root: string): Promise<string> => ipcRenderer.invoke('git:diffText', root),
   aiAbort: (requestId: number): void => ipcRenderer.send('ai:abort', requestId),
-  aiComplete: (req: { requestId: number; system: string; prompt: string }): Promise<string | null> =>
+  aiComplete: (req: { requestId: number; system: string; prompt: string; maxTokens?: number }): Promise<string | null> =>
     ipcRenderer.invoke('ai:complete', req),
   onAiEvent: (handlers: {
     delta: (id: number, text: string) => void

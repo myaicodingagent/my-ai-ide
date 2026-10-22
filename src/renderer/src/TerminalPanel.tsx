@@ -3,7 +3,7 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { subscribeTheme, terminalTheme } from './theme'
-import { fontStack, getSettings, subscribeSettings, useSettings } from './settings'
+import { fontStack, getSettings, prefersLessMotion, subscribeSettings, useSettings } from './settings'
 
 // --- Routing of shell output --------------------------------------------------
 // A terminal's id is only known once the create call returns, but a shell can print before that (cmd.exe
@@ -59,12 +59,14 @@ function TerminalView({
   tabKey,
   shellId,
   cwd,
+  command,
   active,
   onExit
 }: {
   tabKey: number
   shellId: string
   cwd: string | null
+  command?: string
   active: boolean // visible and selected: refit and take keyboard focus
   onExit: () => void
 }): JSX.Element {
@@ -79,7 +81,8 @@ function TerminalView({
       fontFamily: fontStack(),
       fontSize: getSettings().terminalFontSize,
       theme: terminalTheme(),
-      cursorBlink: true
+      cursorBlink: !prefersLessMotion(),
+      screenReaderMode: getSettings().screenReader
     })
     const fit = new FitAddon()
     term.loadAddon(fit)
@@ -111,6 +114,8 @@ function TerminalView({
       const s = getSettings()
       term.options.fontFamily = fontStack(s.fontFamily)
       term.options.fontSize = s.terminalFontSize
+      term.options.screenReaderMode = s.screenReader
+      term.options.cursorBlink = !prefersLessMotion(s)
       refit()
     })
 
@@ -120,6 +125,7 @@ function TerminalView({
       id = tid
       attach(tid, (d) => term.write(d), () => onExitRef.current())
       refit()
+      if (command) window.api.termWrite(tid, command + '\r') // the shell reads it when it is ready
     })
     term.onData((d) => id !== null && window.api.termWrite(id, d))
 
@@ -161,6 +167,7 @@ interface Tab {
   shellId: string
   title: string
   cwd: string | null
+  command?: string // typed into the shell once it has started (tasks)
 }
 
 const MIN_HEIGHT = 120
@@ -169,6 +176,8 @@ export function TerminalPanel({
   cwd,
   visible,
   newTabSignal,
+  newTabShell,
+  newTabExtra,
   onEmpty,
   onHide
 }: {
@@ -176,6 +185,10 @@ export function TerminalPanel({
   visible: boolean
   // Changes when something asks for one more terminal (Ctrl+Shift+`, palette).
   newTabSignal: number
+  // Which shell the requested terminal uses (a shell id, or ssh:user@host); the default one if null.
+  newTabShell: string | null
+  // A terminal that starts with a command (a task): its title, the command and the folder.
+  newTabExtra: { title: string; command: string; cwd: string | null } | null
   // Every tab was closed.
   onEmpty: () => void
   onHide: () => void
@@ -197,14 +210,15 @@ export function TerminalPanel({
     void window.api.termShells().then(setShells)
   }, [])
 
-  const addTab = useCallback(async (shellId?: string): Promise<void> => {
+  const addTab = useCallback(async (shellId?: string, extra?: { title: string; command: string; cwd: string | null } | null): Promise<void> => {
     const list = await window.api.termShells()
     const id = shellId ?? getSettings().terminalShell
-    const label = list.find((s) => s.id === id)?.label ?? list[0]?.label ?? 'Terminal'
+    const label = id.startsWith('ssh:') ? 'SSH: ' + id.slice(4) : (list.find((s) => s.id === id)?.label ?? list[0]?.label ?? 'Terminal')
     const n = (counts.current.get(id) ?? 0) + 1
     counts.current.set(id, n)
     const key = nextKey.current++
-    setTabs((t) => [...t, { key, shellId: id, title: n === 1 ? label : `${label} ${n}`, cwd: cwdRef.current }])
+    const title = extra ? extra.title : n === 1 ? label : `${label} ${n}`
+    setTabs((t) => [...t, { key, shellId: id, title, cwd: extra ? extra.cwd : cwdRef.current, command: extra?.command }])
     setActive(key)
   }, [])
 
@@ -216,16 +230,20 @@ export function TerminalPanel({
   useEffect(() => {
     if (!visible || tabsRef.current.length > 0 || creating.current) return
     creating.current = true
-    void addTab().finally(() => {
+    // If the panel was opened by a request for a particular shell (an SSH session), that is the one to start.
+    void addTab(newTabShell ?? undefined, newTabExtra).finally(() => {
       creating.current = false
     })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visible, addTab])
 
   // A request for one more terminal (shortcut or palette).
   useEffect(() => {
     if (newTabSignal === lastSignal.current) return
     lastSignal.current = newTabSignal
-    void addTab()
+    if (creating.current) return // the panel was just opened and is starting this very terminal
+    void addTab(newTabShell ?? undefined, newTabExtra)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [newTabSignal, addTab])
 
   const closeTab = useCallback((key: number): void => {
@@ -260,13 +278,25 @@ export function TerminalPanel({
   }
 
   return (
-    <div className="terminal-panel" style={{ display: visible ? 'flex' : 'none', height }}>
+    <div className="terminal-panel" role="region" aria-label="Terminal" style={{ display: visible ? 'flex' : 'none', height }}>
       <div className="term-resize" onMouseDown={startDrag} title="Drag to resize" />
-      <div className="term-tabs">
+      <div className="term-tabs" role="tablist" aria-label="Terminals">
         {tabs.map((t) => (
           <div
             key={t.key}
             className={'term-tab' + (t.key === active ? ' active' : '')}
+            role="tab"
+            aria-selected={t.key === active}
+            tabIndex={t.key === active ? 0 : -1}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') (e.preventDefault(), setActive(t.key))
+              else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+                e.preventDefault()
+                const i = tabs.findIndex((x) => x.key === t.key)
+                const n = tabs[(i + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length]
+                if (n) setActive(n.key)
+              }
+            }}
             onClick={() => setActive(t.key)}
           >
             <span className="term-tab-name">{t.title}</span>
@@ -321,6 +351,7 @@ export function TerminalPanel({
               tabKey={t.key}
               shellId={t.shellId}
               cwd={t.cwd}
+              command={t.command}
               active={visible && t.key === active}
               onExit={() => closeTab(t.key)}
             />

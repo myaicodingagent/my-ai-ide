@@ -12,6 +12,10 @@ export interface Settings {
   terminalShell: string // id of the shell new terminals start with (see term:shells in the main process)
   defaultModel: string // used by chat, agent and inline edit
   autocomplete: boolean
+  screenReader: boolean // tell the editor and terminal that a screen reader is in use (otherwise they detect it)
+  reduceMotion: boolean // no animations (the system's own setting is respected as well)
+  meaningSearch: boolean // search by meaning with a small model that runs on this PC (downloaded once, about 23 MB)
+  nextEdit: boolean // suggest the edit you are likely to make next (Tab jumps to it, Tab applies it)
   autoCheckUpdates: boolean // look for a new version at startup and every few hours
   autoSave: 'off' | 'afterDelay' | 'onBlur' // when to save edited files without being asked
   formatOnSave: boolean // format the active file first (JS, TS, JSON, CSS, HTML)
@@ -28,6 +32,10 @@ export const DEFAULT_SETTINGS: Settings = {
   terminalShell: 'powershell',
   defaultModel: DEFAULT_MODEL,
   autocomplete: true,
+  nextEdit: true,
+  meaningSearch: true,
+  screenReader: false,
+  reduceMotion: false,
   autoCheckUpdates: true,
   autoSave: 'off',
   formatOnSave: false
@@ -60,6 +68,10 @@ function sanitize(raw: Partial<Record<keyof Settings, unknown>>): Settings {
     terminalShell: typeof raw.terminalShell === 'string' && /^[a-z0-9_-]{1,30}$/i.test(raw.terminalShell) ? raw.terminalShell : d.terminalShell,
     defaultModel: MODELS.some((m) => m.id === raw.defaultModel) ? (raw.defaultModel as string) : d.defaultModel,
     autocomplete: typeof raw.autocomplete === 'boolean' ? raw.autocomplete : d.autocomplete,
+    nextEdit: typeof raw.nextEdit === 'boolean' ? raw.nextEdit : d.nextEdit,
+    meaningSearch: typeof raw.meaningSearch === 'boolean' ? raw.meaningSearch : d.meaningSearch,
+    screenReader: typeof raw.screenReader === 'boolean' ? raw.screenReader : d.screenReader,
+    reduceMotion: typeof raw.reduceMotion === 'boolean' ? raw.reduceMotion : d.reduceMotion,
     autoCheckUpdates: typeof raw.autoCheckUpdates === 'boolean' ? raw.autoCheckUpdates : d.autoCheckUpdates,
     autoSave: raw.autoSave === 'afterDelay' || raw.autoSave === 'onBlur' ? raw.autoSave : 'off',
     formatOnSave: typeof raw.formatOnSave === 'boolean' ? raw.formatOnSave : d.formatOnSave
@@ -100,17 +112,30 @@ export function editorOptions(s: Settings = current): {
   fontSize: number
   lineHeight: number
   fontLigatures: boolean
+  accessibilitySupport: 'auto' | 'on'
+  smoothScrolling: boolean
+  cursorSmoothCaretAnimation: 'on' | 'off'
 } {
+  const still = prefersLessMotion(s)
   return {
     fontFamily: fontStack(s.fontFamily),
     fontSize: s.fontSize,
     lineHeight: Math.round(s.fontSize * 1.6),
-    fontLigatures: s.ligatures
+    fontLigatures: s.ligatures,
+    accessibilitySupport: s.screenReader ? 'on' : 'auto',
+    smoothScrolling: !still,
+    cursorSmoothCaretAnimation: still ? 'off' : 'on'
   }
+}
+
+/** True when animation should be left out: asked for in Settings or by the system. */
+export function prefersLessMotion(s: Settings = current): boolean {
+  return s.reduceMotion || (typeof window !== 'undefined' && !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches)
 }
 
 function applyToPage(s: Settings): void {
   document.documentElement.style.setProperty('--font-code', fontStack(s.fontFamily))
+  document.documentElement.classList.toggle('reduce-motion', s.reduceMotion)
   window.api.setZoom(s.uiZoom)
 }
 

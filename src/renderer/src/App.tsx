@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { monaco } from './monaco-setup'
-import { FileTree, DirEntry, GitInfo } from './FileTree'
+import { FileTree, DirEntry, GitInfo, treeKeyDown } from './FileTree'
+import { LiveRegions, announce } from './a11y'
 import { ContextMenu, MenuItem } from './ContextMenu'
 import { Breadcrumbs } from './Breadcrumbs'
-import { addRecentFolder, getRecentFolders, loadSession, removeRecentFolder, saveSession } from './session'
+import { addRecentFolder, getRecentFolders, loadExtraFolders, loadSession, removeRecentFolder, saveExtraFolders, saveSession } from './session'
 import { TerminalPanel, readActiveTerminalText } from './TerminalPanel'
 import { ApprovalDialog, Approval } from './ApprovalDialog'
 import { QuickPick, PickItem } from './QuickPick'
@@ -20,8 +21,28 @@ import { editorOptions, getSettings, updateSettings, useSettings } from './setti
 import { GitPanel } from './GitPanel'
 import { DiffView, DiffViewData } from './DiffView'
 import { InputDialog, InputRequest } from './InputDialog'
-import { changeCount, refreshGit, useGit } from './gitStore'
-import type { GitFile } from '../../main/git'
+import { changeCount, refreshGit, setGitExtraRoots, useGit } from './gitStore'
+import type { CommitFile, GitFile } from '../../main/git'
+import { attachConflictDecorations, registerConflictLenses } from './conflicts'
+import { SplitPane } from './SplitPane'
+import { attachNextEdit } from './nextedit'
+import { BackgroundPanel } from './BackgroundPanel'
+import { DebugPanel } from './DebugPanel'
+import { ExtensionsPanel } from './ExtensionsPanel'
+import { ChoiceDialog } from './ChoiceDialog'
+import { applyExtEdits, attachExtEditorState, clearExtProviders, registerExtProvider, setExtDiagnostics, unregisterExtProvider } from './extBridge'
+import { MergeView } from './MergeView'
+import { NotebookView } from './NotebookView'
+import { emptyNotebook, newCell, serializeNotebook } from './notebookModel'
+import { countConflicts } from './mergeParse'
+import type { LaunchConfig, TaskDef, TasksInfo } from '../../main/tasks'
+import { expandVars, taskChain } from './tasksRun'
+import { validSshTarget, wslUnc } from '../../main/shellspec'
+import type { ConnectResult } from '../../main/sshfs'
+import { extensionCommands, initExtensions } from './extStore'
+import { attachDebugEditor, toggleBreakpointAtCaret } from './debugEditor'
+import { getDebug, initDebug, isActive as debugActive, startDebugging, stepDebug, stopDebugging, clearBreakpoints as clearAllBreakpoints } from './debugStore'
+import { initBackground, needsAttention, useBgTasks } from './bgStore'
 
 interface Tab {
   path: string
@@ -40,6 +61,9 @@ const relIfInside = (root: string, p: string): string | null =>
 
 export function App(): JSX.Element {
   const [root, setRoot] = useState<string | null>(null)
+  // More folders in the same workspace. `root` stays the main one (agent, chat rules, terminal, session).
+  const [extraRoots, setExtraRoots] = useState<string[]>([])
+  const roots = useMemo(() => (root ? [root, ...extraRoots] : []), [root, extraRoots])
   const [tabs, setTabs] = useState<Tab[]>([])
   const [active, setActive] = useState<string | null>(null)
   const [showTerminal, setShowTerminal] = useState(false)
@@ -49,19 +73,430 @@ export function App(): JSX.Element {
   useEffect(() => {
     if (showTerminal) setTerminalOpened(true)
   }, [showTerminal])
-  const newTerminal = useCallback((): void => {
+  const [newTermShell, setNewTermShell] = useState<string | null>(null)
+  const [newTermExtra, setNewTermExtra] = useState<{ title: string; command: string; cwd: string | null } | null>(null)
+  const newTerminal = useCallback((shellId?: string, extra?: { title: string; command: string; cwd: string | null }): void => {
+    setNewTermShell(typeof shellId === 'string' ? shellId : null)
+    setNewTermExtra(extra ?? null)
     setShowTerminal(true)
     setTerminalOpened(true)
     setNewTermSignal((n) => n + 1)
   }, [])
   const hideTerminal = useCallback((): void => setShowTerminal(false), [])
-  const [sidebarView, setSidebarView] = useState<'files' | 'search' | 'git'>('files')
+  useEffect(() => {
+    if (!showTerminal) {
+      setNewTermShell(null) // a shell or task asked for once is not asked for again when the panel is shown later
+      setNewTermExtra(null)
+    }
+  }, [showTerminal])
+  const [sidebarView, setSidebarView] = useState<'files' | 'search' | 'git' | 'agents' | 'debug' | 'ext'>('files')
   const [searchFocus, setSearchFocus] = useState(0)
   const showSearch = useCallback((): void => {
     setSidebarView('search')
     setSearchFocus((n) => n + 1)
   }, [])
+  const bgTasks = useBgTasks()
+  const bgAttention = bgTasks.filter((t) => root && samePath(t.root) === samePath(root) && needsAttention(t)).length
+  const [bgFocus, setBgFocus] = useState(0)
+  const [bgPrefill, setBgPrefill] = useState<{ text: string; n: number } | null>(null)
+  useEffect(() => initBackground(), [])
+  const showAgents = useCallback((): void => {
+    setShowSidebar(true)
+    setSidebarView('agents')
+    setBgFocus((n) => n + 1)
+  }, [])
+  const runInBackground = useCallback((task: string): void => {
+    setShowSidebar(true)
+    setSidebarView('agents')
+    setBgPrefill((cur) => ({ text: task, n: (cur?.n ?? 0) + 1 }))
+  }, [])
+  // ---- Extensions: what they ask of the editor, and a small message bar for them ----
+  const [toast, setToast] = useState<{ text: string; kind: string; n: number } | null>(null)
+  const showToast = useCallback((text: string, kind = 'info'): void => {
+    setToast((cur) => ({ text, kind, n: (cur?.n ?? 0) + 1 }))
+    announce(text, kind === 'error' ? 'assertive' : 'polite')
+  }, [])
+  useEffect(() => {
+    if (!toast) return
+    const t = setTimeout(() => setToast(null), 6000)
+    return () => clearTimeout(t)
+  }, [toast])
+  useEffect(() => {
+    initExtensions()
+    return window.api.onExtRequest(async (req) => {
+      const respond = (r: { result?: unknown; error?: string }): void => void window.api.extRespond(req.reqId, r)
+      try {
+        const p = req.params ?? {}
+        switch (req.method) {
+          case 'message':
+            // With buttons it is a question; without, a note that fades.
+            if (Array.isArray(p.items) && p.items.length) {
+              return setChoice({ text: String(p.text), kind: String(p.kind), choices: p.items.map(String), resolve: (c) => respond({ result: c }) })
+            }
+            showToast(String(p.text), String(p.kind))
+            return respond({ result: null })
+          case 'quickPick': {
+            const items = (p.items as { label: string; description?: string; detail?: string }[]) ?? []
+            let done = false
+            const finish = (v: unknown): void => {
+              if (done) return
+              done = true
+              respond({ result: v })
+            }
+            setPickItems(items.map((it, i) => ({ label: it.label, detail: it.description ?? it.detail, run: () => finish(p.canPickMany ? [i] : i) })))
+            setPickOpts({ initial: 0, onCancel: () => finish(null) })
+            return setPicker('commands')
+          }
+          case 'setDiagnostics':
+            return setExtDiagnostics(String(p.owner), String(p.path), Array.isArray(p.items) ? p.items : [])
+          case 'registerProvider':
+            return registerExtProvider(p as Parameters<typeof registerExtProvider>[0])
+          case 'unregisterProvider':
+            return unregisterExtProvider(String(p.id))
+          case 'reset':
+            clearExtProviders()
+            return setExtStatus({})
+          case 'statusBar':
+            return setExtStatus((cur) => {
+              const next = { ...cur }
+              if (p.visible && p.text) next[String(p.id)] = { text: String(p.text), tooltip: String(p.tooltip ?? ''), command: p.command ? String(p.command) : undefined, extId: String(p.extId) }
+              else delete next[String(p.id)]
+              return next
+            })
+          case 'applyEdits': {
+            const file = String(p.path)
+            const ed = focusedEditor()
+            if (!applyExtEdits(file, Array.isArray(p.edits) ? p.edits : [], p.snippet === true, ed)) {
+              await openFileRef.current(file)
+              await new Promise((r) => setTimeout(r, 120))
+              if (!applyExtEdits(file, Array.isArray(p.edits) ? p.edits : [], p.snippet === true, focusedEditor())) return respond({ error: 'That file could not be opened.' })
+            }
+            return respond({ result: null })
+          }
+          case 'editorAction':
+            if (p.id === 'save') await saveRef.current()
+            else void focusedEditor()?.getAction(String(p.id))?.run()
+            return respond({ result: null })
+          case 'input':
+            pendingInput.current = (v) => respond({ result: v ?? null })
+            return setInputRequest({
+              title: String(p.prompt ?? 'Enter a value'),
+              value: typeof p.value === 'string' ? p.value : '',
+              placeholder: typeof p.placeholder === 'string' ? p.placeholder : undefined,
+              onSubmit: (v) => {
+                const done = pendingInput.current
+                pendingInput.current = null
+                done?.(v)
+              }
+            })
+          case 'getEditor': {
+            const c = getEditorContext()
+            return respond({ result: c ? { path: c.path, language: c.language, text: c.text, selection: c.selection } : null })
+          }
+          case 'replaceSelection':
+          case 'insert': {
+            const ed = focusedEditor()
+            const sel = ed?.getSelection()
+            if (!ed || !sel) return respond({ error: 'No editor is open.' })
+            const range = req.method === 'insert' ? new monaco.Range(sel.endLineNumber, sel.endColumn, sel.endLineNumber, sel.endColumn) : sel
+            ed.executeEdits('extension', [{ range, text: String(p.text), forceMoveMarkers: true }])
+            return respond({ result: null })
+          }
+          case 'openFile':
+            await openFileRef.current(String(p.file), typeof p.line === 'number' ? p.line : undefined)
+            return respond({ result: null })
+          case 'fileChanged':
+            return void onWorkspaceTouched()
+          default:
+            return respond({ error: 'Unknown request: ' + req.method })
+        }
+      } catch (e) {
+        respond({ error: e instanceof Error ? e.message : String(e) })
+      }
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  const runExtCommand = useCallback(async (c: { extId: string; id: string }): Promise<void> => {
+    const r = await window.api.extRun(c.extId, c.id)
+    if (!r.ok) showToast(r.error, 'error')
+  }, [showToast])
+  useEffect(() => void window.api.extSetRoot(root), [root])
+
+  // ---- WSL: open a folder inside a Linux distribution ----
+  const openWslFolderPicker = useCallback(async (): Promise<void> => {
+    const shells = await window.api.termShells()
+    const distros = shells.filter((s) => s.id.startsWith('wsl:')).map((s) => s.id.slice(4))
+    if (distros.length === 0) return void window.alert('No WSL distribution was found. Install one by running "wsl --install" in a terminal.')
+    const openHome = async (distro: string): Promise<void> => {
+      let homes: { name: string; path: string; isDir: boolean }[] = []
+      try {
+        homes = (await window.api.readDir(wslUnc(distro, '/home'))).filter((e: { isDir: boolean }) => e.isDir)
+      } catch {
+        // The distribution may be stopped or have no /home; fall back to its root.
+      }
+      if (homes.length === 1) return void openFolderPathRef.current(homes[0].path)
+      if (homes.length > 1) {
+        setPickItems(homes.map((h) => ({ label: h.name, detail: h.path, run: () => void openFolderPathRef.current(h.path) })))
+        setPickOpts({ initial: 0 })
+        return setPicker('commands')
+      }
+      void openFolderPathRef.current(wslUnc(distro, '/'))
+    }
+    setPickItems(distros.map((d) => ({ label: d, detail: 'Open a folder in this Linux distribution', run: () => void openHome(d) })))
+    setPickOpts({ initial: 0 })
+    setPicker('commands')
+  }, [])
+
+  // ---- SSH: open a folder on another computer ----
+  // Runs a connect attempt and, whenever the computer needs something (to trust its key, a password, a passphrase), asks and tries again.
+  const sshAttempt = useCallback(async (attempt: (secrets: { password?: string; passphrase?: string; trust?: string }) => Promise<ConnectResult>, secrets: { password?: string; passphrase?: string; trust?: string } = {}): Promise<{ name: string; home: string } | null> => {
+    const r = await attempt(secrets)
+    if (r.ok) return { name: r.name, home: r.home }
+    if (!r.need) {
+      showToast(r.error, 'error')
+      return null
+    }
+    return new Promise((resolve) => {
+      const next = (more: { password?: string; passphrase?: string; trust?: string }): void => void sshAttempt(attempt, { ...secrets, ...more }).then(resolve)
+      if (r.need === 'trust') {
+        setChoice({
+          text: 'This computer is not known yet. Its key fingerprint is ' + (r.fingerprint ?? '') + '. Only continue if that is what you expect.',
+          kind: 'warning',
+          choices: ['Trust and connect'],
+          resolve: (c) => (c ? next({ trust: r.fingerprint }) : resolve(null))
+        })
+        return
+      }
+      setInputRequest({
+        title: r.need === 'password' ? 'Password for the remote computer' : 'Passphrase for your SSH key',
+        secret: true,
+        confirmLabel: 'Connect',
+        validate: (v) => (v ? null : 'Type it, or press Escape to cancel.'),
+        onSubmit: (v) => next(r.need === 'password' ? { password: v } : { passphrase: v })
+      })
+    })
+  }, [showToast])
+
+  const browseRemote = useCallback(async (name: string, from: string): Promise<void> => {
+    const b = await window.api.sshBrowse(name, from)
+    if (!b.ok) return void showToast(b.error, 'error')
+    const open = async (p: string): Promise<void> => void openFolderPathRef.current(await window.api.sshToUnc(name, p))
+    const items = [
+      { label: '✓ Open this folder', detail: b.path, run: () => void open(b.path) },
+      ...(b.parent !== null ? [{ label: '..', detail: b.parent, run: () => void browseRemote(name, b.parent as string) }] : []),
+      ...b.dirs.map((d) => ({ label: d, detail: 'Go into this folder', run: () => void browseRemote(name, (b.path === '/' ? '' : b.path) + '/' + d) }))
+    ]
+    setPickItems(items)
+    setPickOpts({ initial: 0 })
+    setPicker('commands')
+  }, [showToast])
+
+  const openSshFolderPicker = useCallback((): void => {
+    setInputRequest({
+      title: 'Connect to a computer over SSH (user@host, host:port, or a name from your ssh config)',
+      placeholder: 'user@host',
+      confirmLabel: 'Connect',
+      validate: (v) => (validSshTarget(v.trim().replace(/:\d+$/, '')) ? null : 'Use a host name, an address, user@host or a name from your ssh config.'),
+      onSubmit: (v) => {
+        void sshAttempt((s) => window.api.sshConnect(v.trim(), s)).then((c) => {
+          if (c) void browseRemote(c.name, c.home)
+        })
+      }
+    })
+  }, [sshAttempt, browseRemote])
+
+  // ---- Moving between the parts of the window with the keyboard (F6 / Shift+F6, or the "Focus" commands) ----
+  type Region = 'explorer' | 'editor' | 'terminal' | 'chat'
+  const regionOf = (el: Element | null): Region | null =>
+    !el ? null : el.closest('.sidebar') ? 'explorer' : el.closest('.terminal-panel') ? 'terminal' : el.closest('aside.chat') ? 'chat' : el.closest('.groups') ? 'editor' : null
+  const focusRegion = (name: Region): void => {
+    if (name === 'explorer') {
+      setShowSidebar(true)
+      setSidebarView((v) => (v === 'files' ? v : v))
+      requestAnimationFrame(() => {
+        const row = document.querySelector<HTMLElement>('.sidebar .tree-row[tabindex="0"], .sidebar .tree-row')
+        const tab = document.querySelector<HTMLElement>('.sidebar-views [aria-selected="true"]')
+        ;(sidebarViewRef.current === 'files' ? (row ?? tab) : tab)?.focus()
+      })
+    } else if (name === 'editor') {
+      const ed = focusedEditor()
+      if (ed?.getModel()) ed.focus()
+      else document.querySelector<HTMLElement>('.tabs [tabindex="0"], .tabs [role="tab"]')?.focus()
+    } else if (name === 'terminal') {
+      setShowTerminal(true)
+      setTerminalOpened(true)
+      setTimeout(() => document.querySelector<HTMLElement>('.terminal-panel .xterm-helper-textarea')?.focus(), 80)
+    } else {
+      setShowChat(true)
+      setTimeout(() => document.querySelector<HTMLElement>('aside.chat textarea')?.focus(), 50)
+    }
+    announce({ explorer: 'Side bar', editor: 'Editor', terminal: 'Terminal', chat: 'AI panel' }[name])
+  }
+  const cycleRegion = (dir: number): void => {
+    const order: Region[] = ['explorer', 'editor', ...(showTerminalRef.current ? (['terminal'] as Region[]) : []), ...(showChatRef.current ? (['chat'] as Region[]) : [])]
+    const at = order.indexOf(regionOf(document.activeElement) ?? 'editor')
+    focusRegion(order[(at + dir + order.length) % order.length])
+  }
+  const cycleRegionRef = useRef(cycleRegion)
+  cycleRegionRef.current = cycleRegion
+  const sidebarViewRef = useRef(sidebarView)
+  sidebarViewRef.current = sidebarView
+  const showTerminalRef = useRef(showTerminal)
+  showTerminalRef.current = showTerminal
+
+  // ---- Debugger ----
+  const openFileRef = useRef<(path: string, line?: number) => Promise<void>>(async () => undefined)
+  const openFolderPathRef = useRef<(dir: string) => Promise<void>>(async () => undefined)
+  const sshAttemptRef = useRef<(attempt: (s: { password?: string; passphrase?: string; trust?: string }) => Promise<ConnectResult>) => Promise<{ name: string; home: string } | null>>(async () => null)
+  useEffect(() => initDebug((f) => void openFileRef.current(f.file as string, f.line)), [])
+  // ---- Notebooks: .ipynb files open as cells; "Open as text" shows the JSON instead ----
+  const [nbAsText, setNbAsText] = useState<Set<string>>(new Set())
+  const createNotebook = useCallback((): void => {
+    const r = rootRef.current
+    if (!r) return void window.alert('Open a folder first.')
+    setInputRequest({
+      title: 'New notebook name',
+      value: 'Untitled.ipynb',
+      selectEnd: 8,
+      confirmLabel: 'Create',
+      validate: (v) => (/^[^\\/:*?"<>|]+$/.test(v.trim()) ? null : 'Use a file name without slashes or special characters.'),
+      onSubmit: async (v) => {
+        const name = v.trim().toLowerCase().endsWith('.ipynb') ? v.trim() : v.trim() + '.ipynb'
+        const target = r.replace(/[\\/]+$/, '') + '\\' + name
+        const nb = emptyNotebook('python')
+        nb.cells.push(newCell('code'))
+        const res = await window.api.fsCreateFile(r, target)
+        if (!res.ok) return void window.alert(res.error)
+        await window.api.writeFile(target, serializeNotebook(nb))
+        setTreeVersion((n) => n + 1)
+        await openFileRef.current(target)
+      }
+    })
+  }, [])
+
+  // ---- Three-way merge editor ----
+  const [mergeView, setMergeView] = useState<{ path: string; text: string; repo: string | null } | null>(null)
+  const openMerge = useCallback(async (abs: string, repo?: string): Promise<void> => {
+    const tab = tabsRef.current.find((t) => samePath(t.path) === samePath(abs))
+    let text: string
+    try {
+      text = tab ? tab.model.getValue() : await window.api.readFile(abs)
+    } catch {
+      return void window.alert('That file could not be read.')
+    }
+    if (countConflicts(text) === 0) return void window.alert('This file has no merge conflicts.')
+    const owner = repo ?? rootsRef.current.find((r) => relIfInside(r, abs)) ?? rootRef.current
+    setDiffView(null)
+    setMergeView({ path: abs, text, repo: owner })
+  }, [])
+  useEffect(() => {
+    const onOpen = (e: Event): void => {
+      const uri = (e as CustomEvent<string>).detail
+      const model = monaco.editor.getModel(monaco.Uri.parse(uri))
+      if (model && model.uri.scheme === 'file') void openMerge(model.uri.fsPath)
+    }
+    window.addEventListener('myaiide-open-merge', onOpen)
+    return () => window.removeEventListener('myaiide-open-merge', onOpen)
+  }, [openMerge])
+  const completeMerge = useCallback(async (resolved: string): Promise<void> => {
+    const mv = mergeViewRef.current
+    if (!mv) return
+    await window.api.writeFile(mv.path, resolved)
+    const tab = tabsRef.current.find((t) => samePath(t.path) === samePath(mv.path))
+    if (tab) applyDiskContent(tab, resolved)
+    setMergeView(null)
+    // Mark the file resolved (stage it) when no conflict markers are left in it.
+    if (mv.repo && countConflicts(resolved) === 0) {
+      const rel = relIfInside(mv.repo, mv.path)
+      if (rel) await window.api.gitStage(mv.repo, [rel])
+    }
+    void refreshGit(rootRef.current)
+  }, [])
+
+  // ---- Tasks and launch configurations (.ai-ide/tasks.json, launch.json; VS Code's files work too) ----
+  const [tasksInfo, setTasksInfo] = useState<TasksInfo | null>(null)
+  const [launchSel, setLaunchSel] = useState('') // '' = the file open in the editor
+  const reloadTasks = useCallback(async (): Promise<TasksInfo | null> => {
+    const r = rootRef.current
+    if (!r) return setTasksInfo(null), null
+    const info = await window.api.tasksLoad(r)
+    setTasksInfo(info)
+    setLaunchSel((cur) => (cur && !info.launch.some((l) => l.name === cur) ? '' : cur))
+    return info
+  }, [])
+  useEffect(() => void reloadTasks(), [root, reloadTasks])
+  const showDebug = useCallback((): void => {
+    setShowSidebar(true)
+    setSidebarView('debug')
+    void reloadTasks()
+  }, [reloadTasks])
+  const runTask = useCallback(async (task: TaskDef, all: TaskDef[]): Promise<void> => {
+    const r = rootRef.current
+    if (!r) return
+    const { commands, missing } = taskChain(all, task.label)
+    if (missing.length) return void window.alert('This task depends on tasks that do not exist: ' + missing.join(', '))
+    if (commands.length === 0) return void window.alert('This task has nothing to run.')
+    announce('Running task ' + task.label)
+    const ctx = { root: r, file: focusedPath() }
+    const cwd = task.cwd ? expandVars(task.cwd, ctx) : r
+    newTerminal(undefined, { title: 'Task: ' + task.label, command: expandVars(commands.join('; '), ctx), cwd })
+  }, [])
+  const openTasksPicker = useCallback(async (only?: string): Promise<void> => {
+    const info = await reloadTasks()
+    if (!info) return
+    let list = info.tasks
+    if (only) list = list.filter((t) => t.group === only)
+    if (info.errors.length) window.alert('Problems in the tasks files:\n' + info.errors.join('\n'))
+    if (list.length === 0) {
+      const file = await window.api.tasksEnsure(rootRef.current as string, 'tasks')
+      await openFileRef.current(file)
+      return void window.alert(only ? 'No "' + only + '" task is defined. The tasks file is open: add "group": "' + only + '" to one.' : 'No tasks yet. A starter tasks file is open.')
+    }
+    if (only && list.length === 1) return void runTask(list[0], info.tasks)
+    setPickItems(list.map((t) => ({ label: t.label, detail: (t.group ? '[' + t.group + '] ' : '') + (t.detail ?? t.command), run: () => void runTask(t, info.tasks) })))
+    setPickOpts({ initial: 0 })
+    setPicker('commands')
+  }, [])
+  const openConfigFile = useCallback(async (kind: 'tasks' | 'launch'): Promise<void> => {
+    const r = rootRef.current
+    if (!r) return
+    const file = await window.api.tasksEnsure(r, kind)
+    await openFileRef.current(file)
+    void reloadTasks()
+  }, [])
+  // Files the debugger can run: JavaScript and TypeScript (Node), Python.
+  const isRunnable = (p: string | null): p is string => !!p && /[.]((c|m)?(j|t)sx?|pyw?)$/i.test(p)
+  // Saves the file first (the program runs from disk), then starts it under the debugger.
+  const startDebug = useCallback(async (): Promise<string | null> => {
+    const file = focusedPath()
+    const r = rootRef.current
+    const cfg = tasksInfoRef.current?.launch.find((l) => l.name === launchSelRef.current)
+    // A launch configuration names its own program; only the plain "Current file" choice needs an open file.
+    if (!(cfg && r) && !isRunnable(file)) return 'Open a .js, .ts or .py file to debug it.'
+    const tab = tabsRef.current.find((t) => t.path === file)
+    if (tab?.dirty) await saveTab(tab)
+    showDebug()
+    if (!cfg || !r) return startDebugging(file as string, r ?? undefined)
+    // A launch configuration: its own program, arguments, folder and environment.
+    const ctx = { root: r, file: file ?? '' }
+    let program = expandVars(cfg.program, ctx)
+    if (!/^([A-Za-z]:)?[\\/]/.test(program)) program = r + '/' + program
+    const cfgTab = tabsRef.current.find((t) => samePath(t.path) === samePath(program))
+    if (cfgTab?.dirty) await saveTab(cfgTab)
+    return startDebugging(program, cfg.cwd ? expandVars(cfg.cwd, ctx) : r, cfg.stopOnEntry, {
+      args: cfg.args.map((a) => expandVars(a, ctx)),
+      env: Object.fromEntries(Object.entries(cfg.env).map(([k, v]) => [k, expandVars(v, ctx)]))
+    })
+  }, [showDebug])
+  const mergeViewRef = useRef(mergeView)
+  mergeViewRef.current = mergeView
+  const tasksInfoRef = useRef<TasksInfo | null>(null)
+  const launchSelRef = useRef('')
+  tasksInfoRef.current = tasksInfo
+  launchSelRef.current = launchSel
   const [showChat, setShowChat] = useState(true)
+  const showChatRef = useRef(showChat)
+  showChatRef.current = showChat
   const [panelMode, setPanelMode] = useState<'chat' | 'agent'>('chat')
   const [picker, setPicker] = useState<'files' | 'commands' | 'themes' | 'branches' | 'problems' | null>(null)
   const [pickItems, setPickItems] = useState<PickItem[]>([])
@@ -69,6 +504,16 @@ export function App(): JSX.Element {
   const [themeLabel, setThemeLabel] = useState(getTheme().label)
   const [cursor, setCursor] = useState<{ line: number; col: number } | null>(null)
   const [inputRequest, setInputRequest] = useState<InputRequest | null>(null)
+  const pendingInput = useRef<((v: string | undefined) => void) | null>(null)
+  const [choice, setChoice] = useState<{ text: string; kind: string; choices: string[]; resolve: (c: string | null) => void } | null>(null)
+  const [extStatus, setExtStatus] = useState<Record<string, { text: string; tooltip: string; command?: string; extId: string }>>({})
+  const saveRef = useRef<() => Promise<void>>(async () => undefined)
+  useEffect(() => {
+    if (!inputRequest && pendingInput.current) {
+      pendingInput.current(undefined) // the box was closed without an answer
+      pendingInput.current = null
+    }
+  }, [inputRequest])
   const [diffView, setDiffView] = useState<DiffViewData | null>(null)
   const git = useGit()
   const [showSidebar, setShowSidebar] = useState(true)
@@ -83,6 +528,10 @@ export function App(): JSX.Element {
   const gitDecorations = useRef<monaco.editor.IEditorDecorationsCollection | null>(null)
   const rootRef = useRef(root)
   rootRef.current = root
+  const extraRootsRef = useRef(extraRoots)
+  extraRootsRef.current = extraRoots
+  const rootsRef = useRef(roots)
+  rootsRef.current = roots
   const sessionReadyFor = useRef<string | null>(null) // the folder whose saved tabs have been restored
   const shownModel = useRef<monaco.editor.ITextModel | null>(null)
   const [modelTick, setModelTick] = useState(0)
@@ -106,6 +555,7 @@ export function App(): JSX.Element {
   }, [])
   const [inlineTarget, setInlineTarget] = useState<InlineTarget | null>(null)
   const settings = useSettings()
+  useEffect(() => void window.api.indexEmbeddings(settings.meaningSearch), [settings.meaningSearch])
   const update = useUpdateState()
 
   // Look for a new version shortly after startup and then every few hours (unless switched off in Settings).
@@ -162,12 +612,29 @@ export function App(): JSX.Element {
   }, [])
   const containerRef = useRef<HTMLDivElement>(null)
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null)
+  // Second editor group (split view). Both groups share the open files' text models.
+  const splitEditorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null)
+  const focusRef = useRef<'main' | 'split'>('main') // which group the user was last working in
+  const [split, setSplit] = useState<{ paths: string[]; active: string | null; dir: 'right' | 'down'; size: number } | null>(null)
+  const splitRef = useRef(split)
+  splitRef.current = split
+  const groupsRef = useRef<HTMLDivElement>(null)
+  // Commands (save, format, inline edit, chat context...) act on the group that was last used.
+  const focusedEditor = (): monaco.editor.IStandaloneCodeEditor | null =>
+    focusRef.current === 'split' && splitEditorRef.current?.getModel() ? splitEditorRef.current : editorRef.current
+  // Closes a model: the editors let go of it first, because Monaco's own code throws if a model is disposed while one still shows it.
+  const disposeModel = (m: monaco.editor.ITextModel): void => {
+    for (const ed of [editorRef.current, splitEditorRef.current]) if (ed && ed.getModel() === m) ed.setModel(null)
+    m.dispose()
+  }
+  const focusedPath = (): string | null =>
+    focusRef.current === 'split' && splitRef.current?.active ? splitRef.current.active : activeRef.current
   const tabsRef = useRef<Tab[]>([])
   const startInlineRef = useRef<() => void>(() => {})
   tabsRef.current = tabs
 
   startInlineRef.current = (): void => {
-    const ed = editorRef.current
+    const ed = focusedEditor()
     const model = ed?.getModel()
     const sel = ed?.getSelection()
     if (!ed || !model || !sel) return
@@ -191,28 +658,46 @@ export function App(): JSX.Element {
       // The colour theme is global and set by applyTheme().
       automaticLayout: true,
       model: null,
+      glyphMargin: true, // breakpoints
       ...editorOptions(),
       padding: { top: 12, bottom: 12 },
       minimap: { enabled: getSettings().minimap, renderCharacters: false },
       wordWrap: getSettings().wordWrap ? 'on' : 'off',
       scrollBeyondLastLine: false,
-      smoothScrolling: true,
-      cursorBlinking: 'smooth',
-      cursorSmoothCaretAnimation: 'on',
+      cursorBlinking: getSettings().reduceMotion ? 'solid' : 'smooth',
       bracketPairColorization: { enabled: true },
       renderLineHighlight: 'all',
       guides: { bracketPairs: true, indentation: true }
     })
     ed.onDidChangeCursorPosition((e) => setCursor({ line: e.position.lineNumber, col: e.position.column }))
+    ed.onDidFocusEditorText(() => {
+      focusRef.current = 'main'
+    })
     // Overrides Monaco's Ctrl+K chord prefix.
     ed.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyK, () => startInlineRef.current())
+    registerConflictLenses()
+    const conflictDecos = attachConflictDecorations(ed)
+    const nextEdit = attachNextEdit(ed, () => getSettings().nextEdit)
+    const debugDecos = attachDebugEditor(ed)
+    const extState = attachExtEditorState(ed, () => focusRef.current === 'main')
     editorRef.current = ed
-    return () => ed.dispose()
+    return () => {
+      extState.dispose()
+      debugDecos.dispose()
+      nextEdit.dispose()
+      conflictDecos.dispose()
+      ed.dispose()
+    }
   }, [])
 
   // Switches to another folder: asks about unsaved work, closes the old folder's tabs, then opens the new one.
   const openFolderPath = useCallback(async (dir: string): Promise<void> => {
     if (rootRef.current && samePath(dir) === samePath(rootRef.current)) return
+    if (/^\\\\ssh\./i.test(dir)) {
+      // A folder on another computer: connect again if the link was lost (for example after restarting the app).
+      const c = await sshAttemptRef.current((s) => window.api.sshEnsure(dir, s))
+      if (!c) return
+    }
     if (!(await window.api.fsIsDir(dir))) {
       removeRecentFolder(dir)
       setRecent(getRecentFolders())
@@ -220,14 +705,56 @@ export function App(): JSX.Element {
     }
     const dirty = tabsRef.current.filter((t) => t.dirty)
     if (dirty.length && !window.confirm(`${dirty.length} open file(s) have unsaved changes that will be lost. Open another folder anyway?`)) return
-    for (const t of tabsRef.current) t.model.dispose()
+    // Let go of the models in the editors first: a model that is disposed while shown makes Monaco's own code throw.
+    editorRef.current?.setModel(null)
+    splitEditorRef.current?.setModel(null)
+    for (const t of tabsRef.current) disposeModel(t.model)
     diskText.current.clear()
     setTabs([])
     setActive(null)
     setDiffView(null)
     setSelected(null)
     sessionReadyFor.current = null // the new folder's saved tabs are restored before saving starts again
+    setExtraRoots([])
     setRoot(dir)
+  }, [])
+  openFolderPathRef.current = openFolderPath
+  sshAttemptRef.current = sshAttempt
+
+  // ---- Workspace folders: more than one project folder in the same window ----
+  const extrasLoadedFor = useRef<string | null>(null)
+  useEffect(() => {
+    extrasLoadedFor.current = null
+    if (!root) return setExtraRoots([])
+    let cancelled = false
+    void (async () => {
+      const saved = loadExtraFolders(root)
+      const alive: string[] = []
+      for (const d of saved) if (await window.api.fsIsDir(d)) alive.push(d)
+      if (cancelled) return
+      setExtraRoots(alive)
+      extrasLoadedFor.current = root
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [root])
+  useEffect(() => {
+    if (root && extrasLoadedFor.current === root) saveExtraFolders(root, extraRoots)
+    setGitExtraRoots(extraRoots)
+    void refreshGit(root)
+  }, [extraRoots, root])
+
+  const addWorkspaceFolder = useCallback(async (): Promise<void> => {
+    const dir = await window.api.openFolder()
+    const r = rootRef.current
+    if (!dir || !r) return
+    if ([r, ...extraRootsRef.current].some((x) => samePath(x) === samePath(dir))) return void window.alert('That folder is already in the workspace.')
+    extrasLoadedFor.current = r // a manual change counts as loaded
+    setExtraRoots((cur) => [...cur, dir])
+  }, [])
+  const removeWorkspaceFolder = useCallback((dir: string): void => {
+    setExtraRoots((cur) => cur.filter((x) => x !== dir))
   }, [])
 
   const openFolder = async (): Promise<void> => {
@@ -267,6 +794,7 @@ export function App(): JSX.Element {
   }, [])
 
   const openFile = useCallback(async (path: string, line?: number): Promise<void> => {
+
     if (line) pendingReveal.current = { path, line }
     setDiffView(null) // opening a file leaves any diff that was covering the editor
     // The same file can arrive spelled differently (c:\ from the editor's markers, C:\ from the tree), so
@@ -291,9 +819,25 @@ export function App(): JSX.Element {
       }
       target = await pending
     }
+    if (focusRef.current === 'split' && splitRef.current) {
+      const p = target
+      setSplit((sp) => (sp ? { ...sp, paths: sp.paths.includes(p) ? sp.paths : [...sp.paths, p], active: p } : sp))
+      if (line) {
+        pendingReveal.current = null
+        setTimeout(() => {
+          const ed = splitEditorRef.current
+          if (!ed) return
+          ed.revealLineInCenter(line)
+          ed.setPosition({ lineNumber: line, column: 1 })
+          ed.focus()
+        }, 60)
+      }
+      return
+    }
     setActive(target)
     revealPending() // works now if the file was already showing; otherwise the effect below does it
   }, [revealPending])
+  openFileRef.current = openFile
 
   // Writes one tab to disk. If something else changed the file since we last read or wrote it, an explicit
   // save asks before overwriting, and an automatic save leaves the file alone.
@@ -316,11 +860,11 @@ export function App(): JSX.Element {
   }, [])
 
   const save = useCallback(async (): Promise<void> => {
-    const tab = tabsRef.current.find((t) => t.path === activeRef.current)
+    const tab = tabsRef.current.find((t) => t.path === focusedPath())
     if (!tab) return
     if (getSettings().formatOnSave) {
       try {
-        await editorRef.current?.getAction('editor.action.formatDocument')?.run() // only formats languages Monaco knows
+        await focusedEditor()?.getAction('editor.action.formatDocument')?.run() // only formats languages Monaco knows
       } catch {
         // A formatter that fails must not stop the save.
       }
@@ -328,12 +872,14 @@ export function App(): JSX.Element {
     await saveTab(tab)
   }, [saveTab])
 
+  saveRef.current = save
+
   const saveAll = useCallback(async (): Promise<void> => {
     for (const t of tabsRef.current.filter((x) => x.dirty)) await saveTab(t)
   }, [saveTab])
 
   const getEditorContext = useCallback((): EditorContext | null => {
-    const ed = editorRef.current
+    const ed = focusedEditor()
     const model = ed?.getModel()
     if (!ed || !model) return null
     const sel = ed.getSelection()
@@ -364,7 +910,7 @@ export function App(): JSX.Element {
     if (!tab) return
     if (content === null) {
       const rest = tabsRef.current.filter((t) => t !== tab)
-      tab.model.dispose()
+      disposeModel(tab.model)
       setTabs(rest)
       setActive((a) => (a === tab.path ? (rest.length ? rest[rest.length - 1].path : null) : a))
       return
@@ -412,7 +958,7 @@ export function App(): JSX.Element {
 
   // Asks Claude to merge a chat code block into the open file, then shows the result as a diff to accept.
   const applyCode = useCallback(async (code: string): Promise<void> => {
-    const model = editorRef.current?.getModel()
+    const model = focusedEditor()?.getModel()
     if (!model || model.uri.scheme !== 'file') return void window.alert('Open the file you want to change first.')
     const original = model.getValue()
     setApplying(true)
@@ -441,11 +987,11 @@ export function App(): JSX.Element {
       return void window.alert('The file changed while Claude was working, so the change was not applied. Try Apply again.')
     }
     s.model.pushEditOperations([], [{ range: s.model.getFullModelRange(), text: s.approval.after }], () => null)
-    editorRef.current?.focus() // the file is now modified (not saved), so Ctrl+Z undoes it
+    focusedEditor()?.focus() // the file is now modified (not saved), so Ctrl+Z undoes it
   }
 
   const insertIntoEditor = useCallback((code: string): void => {
-    const ed = editorRef.current
+    const ed = focusedEditor()
     const sel = ed?.getSelection()
     if (!ed || !sel) return
     ed.executeEdits('ai-chat', [{ range: sel, text: code, forceMoveMarkers: true }])
@@ -471,13 +1017,15 @@ export function App(): JSX.Element {
     if (!ed) return
     gitDecorations.current ??= ed.createDecorationsCollection()
     const model = ed.getModel()
-    const rel = root && model && model.uri.scheme === 'file' ? relIfInside(root, model.uri.fsPath) : null
-    if (!root || !model || !rel || git.status.state !== 'ok') {
+    // The file belongs to whichever workspace folder contains it, and that folder's repository.
+    const owner = model && model.uri.scheme === 'file' ? rootsRef.current.find((r) => relIfInside(r, model.uri.fsPath)) : undefined
+    const rel = owner && model ? relIfInside(owner, model.uri.fsPath) : null
+    if (!owner || !model || !rel || git.byRoot[owner]?.state !== 'ok') {
       gitDecorations.current.clear()
       return
     }
     let cancelled = false
-    void window.api.gitLineChanges(root, rel).then((res) => {
+    void window.api.gitLineChanges(owner, rel).then((res) => {
       if (cancelled || model.isDisposed()) return
       const count = model.getLineCount()
       const whole = (cls: string): monaco.editor.IModelDeltaDecoration => ({
@@ -496,22 +1044,37 @@ export function App(): JSX.Element {
     return () => {
       cancelled = true
     }
-  }, [active, modelTick, root, git.version, git.status.state])
+  }, [active, modelTick, root, roots, git.version, git.byRoot])
 
-  const openDiff = useCallback(
-    async (f: GitFile, staged: boolean): Promise<void> => {
-      if (!root) return
-      const r = await window.api.gitDiff(root, f.rel, staged)
-      if ('error' in r) return void window.alert(r.error)
-      setDiffView({
-        title: `${baseName(f.rel)} (${staged ? 'Staged Changes' : 'Working Tree'})`,
-        path: f.abs,
-        original: r.original,
-        modified: r.modified
-      })
-    },
-    [root]
-  )
+  // `repo` is the workspace folder whose repository the file belongs to.
+  const openDiff = useCallback(async (f: GitFile, staged: boolean, repo: string): Promise<void> => {
+    const r = await window.api.gitDiff(repo, f.rel, staged)
+    if ('error' in r) return void window.alert(r.error)
+    setDiffView({
+      title: `${baseName(f.rel)} (${staged ? 'Staged Changes' : 'Working Tree'})`,
+      path: f.abs,
+      original: r.original,
+      modified: r.modified
+    })
+  }, [])
+
+  // A file as it was changed by one commit (opened from the History view).
+  const openCommitDiff = useCallback(async (hash: string, short: string, file: CommitFile, repo: string): Promise<void> => {
+    const r = await window.api.gitCommitDiff(repo, hash, file.rel, file.orig)
+    setDiffView({
+      title: `${baseName(file.rel)} (${short})`,
+      path: joinPath(repo, file.rel),
+      original: r.original,
+      modified: r.modified
+    })
+  }, [])
+
+  const [historyFor, setHistoryFor] = useState<{ abs: string; n: number } | null>(null)
+  const showFileHistory = useCallback((abs: string): void => {
+    if (!rootsRef.current.some((r) => relIfInside(r, abs))) return
+    setSidebarView('git')
+    setHistoryFor((cur) => ({ abs, n: (cur?.n ?? 0) + 1 }))
+  }, [])
 
   const gitCheckout = useCallback(
     async (name: string, create: boolean): Promise<void> => {
@@ -554,7 +1117,7 @@ export function App(): JSX.Element {
     const tab = tabs.find((t) => t.path === path)
     if (tab?.dirty && !window.confirm(`${baseName(path)} has unsaved changes. Close anyway?`)) return
     if (tab) closedStack.current = [...closedStack.current.filter((p) => p !== path), path].slice(-20)
-    tab?.model.dispose()
+    if (tab) disposeModel(tab.model)
     diskText.current.delete(path)
     const rest = tabs.filter((t) => t.path !== path)
     setTabs(rest)
@@ -568,12 +1131,64 @@ export function App(): JSX.Element {
     if (dirty.length && !window.confirm(`${dirty.length} of these files have unsaved changes. Close anyway?`)) return
     closedStack.current = [...closedStack.current.filter((p) => !paths.includes(p)), ...doomed.map((t) => t.path)].slice(-20)
     for (const t of doomed) {
-      t.model.dispose()
+      disposeModel(t.model)
       diskText.current.delete(t.path)
     }
     const rest = tabsRef.current.filter((t) => !paths.includes(t.path))
     setTabs(rest)
     setActive((a) => (a && paths.includes(a) ? (rest.length ? rest[rest.length - 1].path : null) : a))
+  }
+
+  // ---- Split editor ----
+  const openSplit = (path: string | null, dir: 'right' | 'down'): void => {
+    const p = path ?? focusedPath()
+    if (!p) return
+    focusRef.current = 'split'
+    setSplit((sp) => (sp ? { ...sp, dir, paths: sp.paths.includes(p) ? sp.paths : [...sp.paths, p], active: p } : { paths: [p], active: p, dir, size: 50 }))
+  }
+  const closeSplit = (): void => {
+    focusRef.current = 'main'
+    setSplit(null)
+    editorRef.current?.focus()
+  }
+  const closeSplitTab = (path: string): void => {
+    setSplit((sp) => {
+      if (!sp) return sp
+      const paths = sp.paths.filter((x) => x !== path)
+      if (paths.length === 0) return null
+      return { ...sp, paths, active: sp.active === path ? paths[paths.length - 1] : sp.active }
+    })
+  }
+  const toggleSplit = (): void => (split ? closeSplit() : openSplit(null, 'right'))
+  // Files closed in the main group disappear from the split group too; with none left the split closes.
+  useEffect(() => {
+    setSplit((sp) => {
+      if (!sp) return sp
+      const paths = sp.paths.filter((p) => tabs.some((t) => t.path === p))
+      if (paths.length === sp.paths.length) return sp
+      if (paths.length === 0) {
+        focusRef.current = 'main'
+        return null
+      }
+      return { ...sp, paths, active: sp.active && paths.includes(sp.active) ? sp.active : paths[paths.length - 1] }
+    })
+  }, [tabs])
+  const startResizeSplit = (e: React.MouseEvent): void => {
+    e.preventDefault()
+    const box = groupsRef.current?.getBoundingClientRect()
+    if (!box) return
+    const down = splitRef.current?.dir === 'down'
+    const onMove = (ev: MouseEvent): void => {
+      const frac = down ? (ev.clientY - box.top) / box.height : (ev.clientX - box.left) / box.width
+      const size = Math.min(85, Math.max(15, Math.round((1 - frac) * 100)))
+      setSplit((sp) => (sp ? { ...sp, size } : sp))
+    }
+    const onUp = (): void => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
   }
 
   const reopenClosedTab = (): void => {
@@ -591,6 +1206,25 @@ export function App(): JSX.Element {
     setReveal((v) => ({ path: abs, n: (v?.n ?? 0) + 1 }))
   }
 
+  // Keys on a tab: Left/Right/Home/End move to and open another tab, Enter or Space opens it, Delete closes it.
+  const onTabKey = (e: React.KeyboardEvent, path: string): void => {
+    const list = tabsRef.current
+    const i = list.findIndex((t) => t.path === path)
+    const to = (n: number): void => {
+      const t = list[(n + list.length) % list.length]
+      if (!t) return
+      setActive(t.path)
+      setDiffView(null)
+      requestAnimationFrame(() => document.querySelector<HTMLElement>(`.tabs [data-tab-path="${CSS.escape(t.path)}"]`)?.focus())
+    }
+    if (e.key === 'ArrowRight') (e.preventDefault(), to(i + 1))
+    else if (e.key === 'ArrowLeft') (e.preventDefault(), to(i - 1))
+    else if (e.key === 'Home') (e.preventDefault(), to(0))
+    else if (e.key === 'End') (e.preventDefault(), to(list.length - 1))
+    else if (e.key === 'Enter' || e.key === ' ') (e.preventDefault(), setActive(path), setDiffView(null))
+    else if (e.key === 'Delete') (e.preventDefault(), closeTab(path))
+  }
+
   const switchTab = (delta: number): void => {
     const list = tabsRef.current
     if (list.length < 2) return
@@ -603,7 +1237,7 @@ export function App(): JSX.Element {
   const gitInfo = useMemo<GitInfo>(() => {
     const letters = new Map<string, string>()
     const dirtyDirs = new Set<string>()
-    for (const f of git.status.files) {
+    for (const f of Object.values(git.byRoot).flatMap((s) => s.files)) {
       const k = samePath(f.abs)
       const unmerged = f.index === 'U' || f.work === 'U' || (f.index === 'A' && f.work === 'A') || (f.index === 'D' && f.work === 'D')
       letters.set(k, unmerged ? '!' : f.index === '?' ? 'U' : f.work !== ' ' ? f.work : f.index)
@@ -613,7 +1247,7 @@ export function App(): JSX.Element {
       }
     }
     return { letters, dirtyDirs }
-  }, [git.status])
+  }, [git.byRoot])
 
   const activeRef = useRef(active)
   activeRef.current = active
@@ -634,7 +1268,7 @@ export function App(): JSX.Element {
   const dropTab = useCallback((path: string): void => {
     const tab = tabsRef.current.find((t) => t.path === path)
     if (!tab) return
-    tab.model.dispose()
+    disposeModel(tab.model)
     const rest = tabsRef.current.filter((t) => t !== tab)
     setTabs(rest)
     setActive((a) => (a === path ? (rest.length ? rest[rest.length - 1].path : null) : a))
@@ -732,7 +1366,17 @@ export function App(): JSX.Element {
       { label: 'Copy Path', run: () => void window.api.copyText(path), separator: true },
       { label: 'Copy Relative Path', run: () => void window.api.copyText((r && relIfInside(r, path)) || baseName(path)) },
       { label: 'Reveal in File Explorer', run: () => void window.api.fsReveal(path) },
-      { label: 'Reveal in Side Bar', run: () => revealInExplorer(path) }
+      { label: 'Reveal in Side Bar', run: () => revealInExplorer(path) },
+      { label: 'Split Right', run: () => openSplit(path, 'right'), separator: true },
+      { label: 'Split Down', run: () => openSplit(path, 'down') },
+      {
+        label: 'Git: Open Merge Editor',
+        run: () => {
+          const p = focusedPath()
+          if (p) void openMerge(p)
+        }
+      },
+      { label: 'Git: File History', run: () => showFileHistory(path), separator: true, disabled: !rootsRef.current.some((x) => relIfInside(x, path) && git.byRoot[x]?.state === 'ok') }
     ]
   }
 
@@ -774,8 +1418,8 @@ export function App(): JSX.Element {
   }, [selected, sidebarView, renameEntry, deleteEntry])
 
   // The newest versions of the tab actions, for the keyboard handler (which is registered only once).
-  const actionsRef = useRef({ closeTab, reopenClosedTab, switchTab, saveAll })
-  actionsRef.current = { closeTab, reopenClosedTab, switchTab, saveAll }
+  const actionsRef = useRef({ closeTab, reopenClosedTab, switchTab, saveAll, toggleSplit, closeSplitTab })
+  actionsRef.current = { closeTab, reopenClosedTab, switchTab, saveAll, toggleSplit, closeSplitTab }
 
   // ---- Remember the folder and its open files; auto save; problems count ----
   useEffect(() => {
@@ -859,18 +1503,19 @@ export function App(): JSX.Element {
 
   // Files changed outside the app (another program, a terminal, git): refresh the tree, git status and open tabs.
   useEffect(() => {
-    void window.api.fsWatch(root)
+    void window.api.fsWatch(roots.length ? roots : null)
     if (!root) return
     const off = window.api.onFsChanged(() => void onWorkspaceTouched())
     return () => {
       off()
       void window.api.fsWatch(null)
     }
-  }, [root, onWorkspaceTouched])
+  }, [root, roots, onWorkspaceTouched])
 
   useEffect(() => {
     const model = tabs.find((t) => t.path === active)?.model ?? null
     editorRef.current?.setModel(model)
+    editorRef.current?.updateOptions({ ariaLabel: model ? `Editor, ${baseName(model.uri.fsPath || model.uri.path)}` : 'Editor' })
     // Tell the Git margin effect that the editor now shows a different file (it runs before this effect does).
     if (shownModel.current !== model) {
       shownModel.current = model
@@ -881,13 +1526,17 @@ export function App(): JSX.Element {
 
   const openFileSearch = useCallback(async (): Promise<void> => {
     if (!root) return
-    const files = await window.api.listFiles(root)
+    const folders = rootsRef.current
+    const lists = await Promise.all(folders.map((r) => window.api.listFiles(r).catch(() => [] as string[])))
     setPickItems(
-      files.map((f) => ({
-        label: baseName(f),
-        detail: f.slice(root.length + 1),
-        run: () => void openFile(f)
-      }))
+      lists.flatMap((files, i) =>
+        files.map((f) => ({
+          label: baseName(f),
+          // With several folders the detail starts with the folder the file is in.
+          detail: (folders.length > 1 ? baseName(folders[i]) + '/' : '') + f.slice(folders[i].length + 1),
+          run: () => void openFile(f)
+        }))
+      )
     )
     setPickOpts({ initial: 0 })
     setPicker('files')
@@ -897,7 +1546,7 @@ export function App(): JSX.Element {
   const runEditorAction =
     (id: string) =>
     (): void => {
-      const ed = editorRef.current
+      const ed = focusedEditor()
       if (!ed || !ed.getModel()) return
       // Wait for the palette to finish closing: Monaco's own boxes (go to line...) close when focus moves,
       // and closing the palette moves it.
@@ -915,6 +1564,49 @@ export function App(): JSX.Element {
     setPickItems([
       { label: 'File: Open Folder', run: () => void openFolder() },
       { label: 'File: Save', run: () => void save() },
+      { label: 'Agent: Run a Task in the Background…', run: () => showAgents() },
+      { label: 'Extensions: Show Installed Extensions', run: () => { setShowSidebar(true); setSidebarView('ext') } },
+      ...extensionCommands().map((c) => ({ label: c.ext + ': ' + c.title, run: () => void runExtCommand(c) })),
+      { label: 'Notebook: Create New Notebook…', run: () => createNotebook() },
+      {
+        label: 'Notebook: Open as Notebook / as Text',
+        run: () => {
+          const p = focusedPath()
+          if (p && /\.ipynb$/i.test(p)) setNbAsText((s) => (s.has(p) ? (s.delete(p), new Set(s)) : new Set(s).add(p)))
+        }
+      },
+      { label: 'Tasks: Run Task…', run: () => void openTasksPicker() },
+      { label: 'Tasks: Run Build Task', run: () => void openTasksPicker('build') },
+      { label: 'Tasks: Run Test Task', run: () => void openTasksPicker('test') },
+      { label: 'Tasks: Open Tasks File', run: () => void openConfigFile('tasks') },
+      { label: 'Debug: Open Launch Configurations', run: () => void openConfigFile('launch') },
+      { label: 'View: Focus Side Bar', run: () => focusRegion('explorer') },
+      { label: 'View: Focus Editor', run: () => focusRegion('editor') },
+      { label: 'View: Focus Terminal', run: () => focusRegion('terminal') },
+      { label: 'View: Focus AI Panel', run: () => focusRegion('chat') },
+      { label: 'Debug: Start Debugging (F5)', run: () => void startDebug() },
+      {
+        label: 'Debug: Install the Python Debugger (debugpy)',
+        run: () => newTerminal(undefined, { title: 'Install debugpy', command: 'python -m pip install --user debugpy', cwd: rootRef.current })
+      },
+      { label: 'Debug: Stop (Shift+F5)', run: () => void stopDebugging() },
+      { label: 'Debug: Toggle Breakpoint (F9)', run: () => toggleBreakpointAtCaret(focusedEditor()) },
+      { label: 'Debug: Step Over (F10)', run: () => void stepDebug('stepOver') },
+      { label: 'Debug: Step Into (F11)', run: () => void stepDebug('stepInto') },
+      { label: 'Debug: Step Out (Shift+F11)', run: () => void stepDebug('stepOut') },
+      { label: 'Debug: Remove All Breakpoints', run: () => clearAllBreakpoints() },
+      { label: 'Debug: Show Run and Debug', run: () => showDebug() },
+      { label: 'File: Add Folder to Workspace…', run: () => void addWorkspaceFolder() },
+      {
+        label: 'File: Remove Folder from Workspace…',
+        run: () => {
+          const extra = extraRootsRef.current
+          if (extra.length === 0) return void window.alert('The workspace has only one folder.')
+          setPickItems(extra.map((d) => ({ label: baseName(d), detail: d, run: () => removeWorkspaceFolder(d) })))
+          setPickOpts({ initial: 0 })
+          setPicker('commands')
+        }
+      },
       { label: 'File: Save All (Ctrl+Alt+S)', run: () => void saveAll() },
       {
         label: 'File: Open Recent…',
@@ -933,6 +1625,10 @@ export function App(): JSX.Element {
       { label: 'View: Zoom In (Ctrl+=)', run: () => updateSettings({ uiZoom: getSettings().uiZoom + 0.1 }) },
       { label: 'View: Zoom Out (Ctrl+-)', run: () => updateSettings({ uiZoom: getSettings().uiZoom - 0.1 }) },
       { label: 'View: Reset Zoom (Ctrl+0)', run: () => updateSettings({ uiZoom: 1 }) },
+      { label: 'View: Split Editor Right (Ctrl+\\)', run: () => openSplit(null, 'right') },
+      { label: 'View: Split Editor Down', run: () => openSplit(null, 'down') },
+      { label: 'View: Close Split Editor', run: () => closeSplit() },
+      { label: 'AI: Toggle Next Edit Suggestions', run: () => updateSettings({ nextEdit: !getSettings().nextEdit }) },
       { label: 'View: Toggle Word Wrap', run: () => updateSettings({ wordWrap: !getSettings().wordWrap }) },
       { label: 'View: Show Problems', run: openProblemsPicker },
       { label: 'Editor: Format Document', run: runEditorAction('editor.action.formatDocument') },
@@ -950,7 +1646,33 @@ export function App(): JSX.Element {
       { label: 'File: New Folder…', run: () => rootRef.current && createEntry(selected ? (selected.isDir ? selected.path : parentOf(selected.path)) : rootRef.current, 'folder') },
       { label: 'Search: Find in Files (Ctrl+Shift+F)', run: showSearch },
       { label: 'View: Toggle Terminal', run: () => setShowTerminal((v) => !v) },
-      { label: 'Terminal: New Terminal (Ctrl+Shift+`)', run: newTerminal },
+      { label: 'Terminal: New Terminal (Ctrl+Shift+`)', run: () => newTerminal() },
+      {
+        label: 'Terminal: New SSH Terminal…',
+        run: () =>
+          setInputRequest({
+            title: 'SSH address: user@host, or a name from your ~/.ssh/config',
+            placeholder: 'me@example.com',
+            confirmLabel: 'Connect',
+            validate: (v) => (validSshTarget(v.trim()) ? null : 'Use a host name, an address, user@host or a name from your ssh config.'),
+            onSubmit: (v) => newTerminal('ssh:' + v.trim())
+          })
+      },
+      {
+        label: 'Git: Open Merge Editor',
+        run: () => {
+          const p = focusedPath()
+          if (p) void openMerge(p)
+        }
+      },
+      {
+        label: 'File: Open Folder over SSH…',
+        run: () => openSshFolderPicker()
+      },
+      {
+        label: 'File: Open WSL Folder…',
+        run: () => void openWslFolderPicker()
+      },
       { label: 'View: Toggle AI Chat', run: () => setShowChat((v) => !v) },
       { label: 'AI: Edit Selection (Ctrl+K)', run: () => startInlineRef.current() },
       { label: 'AI: Toggle Autocomplete', run: toggleAutocomplete },
@@ -963,6 +1685,25 @@ export function App(): JSX.Element {
       },
       { label: 'Git: Show Source Control (Ctrl+Shift+G)', run: () => setSidebarView('git') },
       { label: 'Git: Refresh', run: () => void refreshGit(rootRef.current) },
+      {
+        label: 'Git: File History',
+        run: () => {
+          const p = activeRef.current
+          if (p) showFileHistory(p)
+        }
+      },
+      {
+        label: 'Git: Stash Changes',
+        run: () => {
+          const r = rootRef.current
+          if (r)
+            void window.api.gitStashPush(r, '', true).then((res) => {
+              if (!res.ok) window.alert(res.error)
+              else void onWorkspaceTouched()
+              void refreshGit(r)
+            })
+        }
+      },
       { label: 'Git: Checkout to…', run: () => void openBranchPicker() },
       { label: 'Git: Pull', run: () => void window.api.gitRemote(rootRef.current ?? '', 'pull').then((r) => (r.ok ? refreshGit(rootRef.current) : window.alert(r.error))) },
       { label: 'Git: Push', run: () => void window.api.gitRemote(rootRef.current ?? '', 'push').then((r) => (r.ok ? refreshGit(rootRef.current) : window.alert(r.error))) },
@@ -972,6 +1713,38 @@ export function App(): JSX.Element {
     setPickOpts({ initial: 0 })
     setPicker('commands')
   }, [save, saveAll, openFileSearch, toggleAutocomplete, showSearch, openThemePicker, newTerminal, openBranchPicker, createEntry, selected, openFolderPath, openProblemsPicker, openFile])
+
+  // Debugger keys: F5 start / continue, Shift+F5 stop, F9 breakpoint, F10 / F11 / Shift+F11 step.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return
+      const paused = getDebug().status === 'paused'
+      if (e.key === 'F6') {
+        e.preventDefault()
+        cycleRegionRef.current(e.shiftKey ? -1 : 1)
+        return
+      }
+      if (e.key === 'F5' && e.shiftKey) {
+        e.preventDefault()
+        void stopDebugging()
+      } else if (e.key === 'F5') {
+        e.preventDefault()
+        if (debugActive()) void stepDebug('continue')
+        else void startDebug()
+      } else if (e.key === 'F9') {
+        e.preventDefault()
+        toggleBreakpointAtCaret(focusedEditor())
+      } else if (e.key === 'F10' && paused) {
+        e.preventDefault()
+        void stepDebug('stepOver')
+      } else if (e.key === 'F11' && paused) {
+        e.preventDefault()
+        void stepDebug(e.shiftKey ? 'stepOut' : 'stepInto')
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [startDebug])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
@@ -986,7 +1759,11 @@ export function App(): JSX.Element {
         void save()
       } else if (k === 'w' && !e.shiftKey) {
         e.preventDefault()
-        if (activeRef.current) a.closeTab(activeRef.current)
+        if (focusRef.current === 'split' && splitRef.current?.active) a.closeSplitTab(splitRef.current.active)
+        else if (activeRef.current) a.closeTab(activeRef.current)
+      } else if (e.key === '\\') {
+        e.preventDefault()
+        a.toggleSplit()
       } else if (k === 't' && e.shiftKey) {
         e.preventDefault()
         a.reopenClosedTab()
@@ -1046,16 +1823,26 @@ export function App(): JSX.Element {
   return (
     <div className="app">
       <div className="workbench">
-      <aside className={'sidebar' + (showSidebar ? '' : ' hidden')}>
+      <aside className={'sidebar' + (showSidebar ? '' : ' hidden')} aria-label="Side bar">
         <div className="sidebar-header">
-          <span className="sidebar-views">
-            <button className={sidebarView === 'files' ? 'on' : ''} onClick={() => setSidebarView('files')}>
+          <span className="sidebar-views" role="tablist" aria-label="Side bar views">
+            <button role="tab" aria-selected={sidebarView === 'files'} className={sidebarView === 'files' ? 'on' : ''} onClick={() => setSidebarView('files')}>
               Explorer
             </button>
-            <button className={sidebarView === 'search' ? 'on' : ''} onClick={showSearch}>
+            <button role="tab" aria-selected={sidebarView === 'search'} className={sidebarView === 'search' ? 'on' : ''} onClick={showSearch}>
               Search
             </button>
-            <button className={sidebarView === 'git' ? 'on' : ''} data-view="git" onClick={() => setSidebarView('git')}>
+            <button role="tab" aria-selected={sidebarView === 'agents'} className={sidebarView === 'agents' ? 'on' : ''} data-view="agents" onClick={showAgents}>
+              Agents
+              {bgAttention > 0 && <span className="badge" data-bg-badge>{bgAttention}</span>}
+            </button>
+            <button role="tab" aria-selected={sidebarView === 'debug'} className={sidebarView === 'debug' ? 'on' : ''} data-view="debug" onClick={showDebug}>
+              Run
+            </button>
+            <button role="tab" aria-selected={sidebarView === 'ext'} className={sidebarView === 'ext' ? 'on' : ''} data-view="ext" onClick={() => setSidebarView('ext')}>
+              Ext
+            </button>
+            <button role="tab" aria-selected={sidebarView === 'git'} className={sidebarView === 'git' ? 'on' : ''} data-view="git" onClick={() => setSidebarView('git')}>
               Git
               {git.status.state === 'ok' && changeCount(git.status) > 0 && (
                 <span className="badge">{changeCount(git.status)}</span>
@@ -1068,6 +1855,9 @@ export function App(): JSX.Element {
         </div>
         <div
           className="tree"
+          role="tree"
+          aria-label="Files"
+          onKeyDown={treeKeyDown}
           style={{ display: sidebarView === 'files' ? 'block' : 'none' }}
           onContextMenu={(e) => {
             if (!root) return
@@ -1077,19 +1867,28 @@ export function App(): JSX.Element {
         >
           {root ? (
             <>
-              <div className="tree-root" title={root}>
-                {baseName(root)}
-              </div>
-              <FileTree
-                root={root}
-                version={treeVersion}
-                selected={selected?.path ?? null}
-                reveal={reveal}
-                git={gitInfo}
-                onOpen={openFile}
-                onSelect={setSelected}
-                onMenu={(entry, x, y) => setTreeMenu({ x, y, entry })}
-              />
+              {roots.map((r, i) => (
+                <div key={r} data-workspace-folder={r}>
+                  <div className="tree-root" title={r}>
+                    <span>{baseName(r)}</span>
+                    {i > 0 && (
+                      <button className="tree-root-x" data-remove-folder title="Remove this folder from the workspace" onClick={() => removeWorkspaceFolder(r)}>
+                        ×
+                      </button>
+                    )}
+                  </div>
+                  <FileTree
+                    root={r}
+                    version={treeVersion}
+                    selected={selected?.path ?? null}
+                    reveal={reveal}
+                    git={gitInfo}
+                    onOpen={openFile}
+                    onSelect={setSelected}
+                    onMenu={(entry, x, y) => setTreeMenu({ x, y, entry })}
+                  />
+                </div>
+              ))}
             </>
           ) : (
             <div className="empty">
@@ -1103,30 +1902,71 @@ export function App(): JSX.Element {
         {/* Kept mounted so results survive switching back to the explorer. */}
         <div className="tree" style={{ display: sidebarView === 'search' ? 'block' : 'none' }}>
           <SearchPanel
-            root={root}
+            roots={roots}
             focusSignal={searchFocus}
             onOpen={(p, l) => void openFile(p, l)}
             isDirty={(abs) => tabsRef.current.some((t) => t.dirty && samePath(t.path) === samePath(abs))}
             onReplaced={() => void onWorkspaceTouched()}
           />
         </div>
+        <div className="tree" style={{ display: sidebarView === 'ext' ? 'block' : 'none' }}>
+          <ExtensionsPanel />
+        </div>
+        <div className="tree" style={{ display: sidebarView === 'debug' ? 'block' : 'none' }}>
+          <DebugPanel
+            root={root}
+            activeFile={isRunnable(focusedPath()) ? focusedPath() : null}
+            onStart={startDebug}
+            configs={tasksInfo?.launch ?? []}
+            selected={launchSel}
+            onSelect={setLaunchSel}
+            onEditConfigs={() => void openConfigFile('launch')}
+            problems={tasksInfo?.errors ?? []}
+            onOpenFile={(p, line) => void openFile(p, line)}
+          />
+        </div>
+        <div className="tree" style={{ display: sidebarView === 'agents' ? 'block' : 'none' }}>
+          <BackgroundPanel
+            root={root}
+            focusSignal={bgFocus}
+            prefill={bgPrefill}
+            onOpenDiff={(title, abs, original, modified) => setDiffView({ title, path: abs, original, modified })}
+            onApplied={() => void onWorkspaceTouched()}
+          />
+        </div>
         <div className="tree" style={{ display: sidebarView === 'git' ? 'block' : 'none' }}>
           <GitPanel
             root={root}
-            onOpenDiff={(f, staged) => void openDiff(f, staged)}
+            roots={roots}
+            onOpenDiff={(f, staged, repo) => void openDiff(f, staged, repo)}
             onOpenFile={(abs) => void openFile(abs)}
             onChanged={() => void onWorkspaceTouched()}
+            onOpenCommitDiff={(h, sh, file, repo) => void openCommitDiff(h, sh, file, repo)}
+            onOpenMerge={(abs, repo) => void openMerge(abs, repo)}
+            historyFor={historyFor}
           />
         </div>
       </aside>
-      <main className="main">
-        <div className="tabs">
+      <main className="main" aria-label="Editor">
+        <div ref={groupsRef} className={'groups' + (split?.dir === 'down' ? ' down' : '')}>
+        <div
+          className="group group-main"
+          style={split ? { flex: `0 0 ${100 - split.size}%` } : undefined}
+          onMouseDownCapture={() => {
+            focusRef.current = 'main'
+          }}
+        >
+        <div className="tabs" role="tablist" aria-label="Open files">
           {tabs.map((t) => (
             <div
               key={t.path}
               className={'tab' + (t.path === active ? ' active' : '')}
               data-tab-path={t.path}
               title={t.path}
+              role="tab"
+              aria-selected={t.path === active}
+              tabIndex={t.path === active ? 0 : -1}
+              onKeyDown={(e) => onTabKey(e, t.path)}
               onClick={() => {
                 setActive(t.path)
                 setDiffView(null)
@@ -1143,9 +1983,11 @@ export function App(): JSX.Element {
               }}
             >
               <span className="tab-name">{baseName(t.path)}</span>
-              {t.dirty && <span className="tab-dot" title="Unsaved changes" />}
+              {t.dirty && <span className="tab-dot" title="Unsaved changes" role="img" aria-label="unsaved changes" />}
               <span
                 className="close"
+                role="button"
+                aria-label={`Close ${baseName(t.path)}`}
                 title="Close"
                 onClick={(e) => {
                   e.stopPropagation()
@@ -1157,7 +1999,7 @@ export function App(): JSX.Element {
             </div>
           ))}
         </div>
-        {active && tabs.length > 0 && <Breadcrumbs root={root} path={active} onReveal={revealInExplorer} />}
+        {active && tabs.length > 0 && <Breadcrumbs root={roots.find((r) => relIfInside(r, active)) ?? root} path={active} onReveal={revealInExplorer} />}
         <div className="editor-wrap">
           <div ref={containerRef} className="editor" />
           {tabs.length === 0 && (
@@ -1169,6 +2011,15 @@ export function App(): JSX.Element {
               onThemes={openThemePicker}
             />
           )}
+          {active && /\.ipynb$/i.test(active) && !nbAsText.has(active) && tabs.find((t) => t.path === active) && !diffView && !mergeView && (
+            <NotebookView
+              key={active}
+              path={active}
+              model={tabs.find((t) => t.path === active)!.model}
+              onOpenAsText={() => setNbAsText((s) => new Set(s).add(active))}
+            />
+          )}
+          {mergeView && <MergeView path={mergeView.path} text={mergeView.text} onComplete={(t) => void completeMerge(t)} onClose={() => setMergeView(null)} />}
           {diffView && (
             <DiffView
               data={diffView}
@@ -1177,11 +2028,39 @@ export function App(): JSX.Element {
             />
           )}
         </div>
+        </div>
+        {split && (
+          <>
+            <div className="split-handle" data-split-handle onMouseDown={startResizeSplit} />
+            <SplitPane
+              tabs={tabs}
+              paths={split.paths}
+              active={split.active}
+              onActivate={(p) => {
+                focusRef.current = 'split'
+                setSplit((sp) => (sp ? { ...sp, active: p } : sp))
+              }}
+              onCloseTab={closeSplitTab}
+              onClose={closeSplit}
+              onFocus={() => {
+                focusRef.current = 'split'
+              }}
+              onEditor={(ed) => {
+                splitEditorRef.current = ed
+              }}
+              onCursor={setCursor}
+              onStartInline={() => startInlineRef.current()}
+            />
+          </>
+        )}
+        </div>
         {terminalOpened && (
           <TerminalPanel
             cwd={root}
             visible={showTerminal}
             newTabSignal={newTermSignal}
+            newTabShell={newTermShell}
+            newTabExtra={newTermExtra}
             onEmpty={hideTerminal}
             onHide={hideTerminal}
           />
@@ -1205,6 +2084,7 @@ export function App(): JSX.Element {
           root={root}
           onOpenFile={(p) => void openFile(p)}
           onSwitch={() => setPanelMode('chat')}
+          onRunInBackground={runInBackground}
           isDirty={isDirtyRel}
           onFileChanged={onAgentFileChanged}
           onWorkspaceTouched={() => void onWorkspaceTouched()}
@@ -1215,10 +2095,21 @@ export function App(): JSX.Element {
         />
       </div>
       </div>
-      <footer className="statusbar">
+      <LiveRegions />
+      <footer className="statusbar" aria-label="Status bar">
         <span className="sb-item" title={root ?? 'No folder open'}>
           {root ? baseName(root) : 'No folder'}
         </span>
+        {root && /^\\\\ssh\./i.test(root) && (
+          <span className="sb-item" data-sb="ssh" title="This folder is on another computer, opened over SSH">
+            ⇄ SSH: {root.split('\\')[2]?.slice(4)}
+          </span>
+        )}
+        {Object.entries(extStatus).map(([id, it]) => (
+          <button key={id} className="sb-item sb-btn" data-sb-ext={id} title={it.tooltip || it.text} disabled={!it.command} onClick={() => it.command && void window.api.extRun(it.extId, it.command)}>
+            {it.text}
+          </button>
+        ))}
         {git.status.state === 'ok' && (
           <button
             className="sb-item sb-btn"
@@ -1285,6 +2176,23 @@ export function App(): JSX.Element {
       </footer>
       {showSettings && <SettingsDialog onClose={() => setShowSettings(false)} />}
       {applying && <div className="apply-toast" data-apply-busy>Claude is applying the change…</div>}
+      {choice && (
+        <ChoiceDialog
+          text={choice.text}
+          kind={choice.kind}
+          choices={choice.choices}
+          onChoose={(c) => {
+            const done = choice.resolve
+            setChoice(null)
+            done(c)
+          }}
+        />
+      )}
+      {toast && (
+        <div className={'apply-toast ext-toast' + (toast.kind === 'error' ? ' error' : '')} data-toast role="presentation" onClick={() => setToast(null)}>
+          {toast.text}
+        </div>
+      )}
       {applyState && <ApprovalDialog approval={applyState.approval} unsavedWarning={false} onDecide={decideApply} />}
       {tabMenu && <ContextMenu x={tabMenu.x} y={tabMenu.y} items={tabMenuItems(tabMenu.path)} onClose={() => setTabMenu(null)} />}
       {treeMenu && (

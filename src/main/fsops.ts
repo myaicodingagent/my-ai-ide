@@ -1,6 +1,7 @@
 import { BrowserWindow, clipboard, ipcMain, shell } from 'electron'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'path'
 import { promises as fs, watch, FSWatcher, realpathSync } from 'fs'
+import * as ssh from './sshfs'
 
 // File operations for the explorer (create, rename, delete, reveal) and a watcher that tells the UI when
 // files change outside the app. Every path coming from the UI must stay inside the open project folder.
@@ -33,6 +34,16 @@ function checkNew(root: string, target: string): string | null {
   return null
 }
 
+// Paths on a remote computer are judged by their text (they have no local real path), and the same name rules apply.
+const remoteCheck = (root: string, target: string): string | null => {
+  const name = target.split('\\').pop() ?? ''
+  if (!name || name === '.' || name === '..' || BAD_NAME.test(name) || /[. ]$/.test(name) || name.length > 255) return `"${name}" is not a valid name.`
+  const a = ssh.parseRemote(root)
+  const b = ssh.parseRemote(target)
+  if (!a || !b || a.name !== b.name || !(b.path === a.path || b.path.startsWith(a.path.replace(/\/$/, '') + '/'))) return 'That location is outside the project folder.'
+  return null
+}
+
 const fail = (e: unknown): { ok: false; error: string } => {
   const err = e as NodeJS.ErrnoException
   if (err.code === 'EEXIST') return { ok: false, error: 'A file or folder with that name already exists.' }
@@ -43,6 +54,11 @@ const fail = (e: unknown): { ok: false; error: string } => {
 
 export function registerFsOps(getWin: () => BrowserWindow | null): void {
   ipcMain.handle('fs:createFile', async (_e, root: string, target: string): Promise<Result> => {
+    if (ssh.isRemotePath(target)) {
+      const bad = remoteCheck(root, target)
+      if (bad) return { ok: false, error: bad }
+      return ssh.writeFile(target, '', true).then(() => ({ ok: true as const }), fail)
+    }
     const problem = checkNew(root, target)
     if (problem) return { ok: false, error: problem }
     try {
@@ -54,6 +70,11 @@ export function registerFsOps(getWin: () => BrowserWindow | null): void {
   })
 
   ipcMain.handle('fs:createDir', async (_e, root: string, target: string): Promise<Result> => {
+    if (ssh.isRemotePath(target)) {
+      const bad = remoteCheck(root, target)
+      if (bad) return { ok: false, error: bad }
+      return ssh.mkdir(target).then(() => ({ ok: true as const }), fail)
+    }
     const problem = checkNew(root, target)
     if (problem) return { ok: false, error: problem }
     try {
@@ -65,6 +86,11 @@ export function registerFsOps(getWin: () => BrowserWindow | null): void {
   })
 
   ipcMain.handle('fs:rename', async (_e, root: string, from: string, to: string): Promise<Result> => {
+    if (ssh.isRemotePath(from) || ssh.isRemotePath(to)) {
+      const bad = remoteCheck(root, to) ?? (ssh.isRemotePath(from) ? null : 'Files cannot be moved between computers.')
+      if (bad) return { ok: false, error: bad }
+      return ssh.rename(from, to).then(() => ({ ok: true as const }), fail)
+    }
     if (!isInside(root, from)) return { ok: false, error: 'That item is outside the project folder.' }
     const problem = checkNew(root, to)
     if (problem) return { ok: false, error: problem }
@@ -83,6 +109,11 @@ export function registerFsOps(getWin: () => BrowserWindow | null): void {
 
   // To the Recycle Bin, so a mistake can be undone from Windows.
   ipcMain.handle('fs:trash', async (_e, root: string, target: string): Promise<Result> => {
+    // A server has no Recycle Bin: the item is deleted for good (the editor asks first).
+    if (ssh.isRemotePath(target)) {
+      if (remoteCheck(root, target)) return { ok: false, error: 'That item is outside the project folder.' }
+      return ssh.remove(target).then(() => ({ ok: true as const }), fail)
+    }
     if (!isInside(root, target)) return { ok: false, error: 'That item is outside the project folder.' }
     try {
       // MY_AI_IDE_NO_TRASH is for automated tests only, so they do not fill the real Recycle Bin.
@@ -135,17 +166,18 @@ export function registerFsOps(getWin: () => BrowserWindow | null): void {
       let files = 0
       const skipped: string[] = []
       for (const t of targets.slice(0, 5000)) {
-        if (!isInside(root, t.path)) {
+        const remote = ssh.isRemotePath(t.path)
+        if (remote ? remoteCheck(root, t.path) : !isInside(root, t.path)) {
           skipped.push(`${basename(t.path)}: outside the project`)
           continue
         }
         try {
-          const stat = await fs.stat(t.path)
-          if (stat.size > 1_000_000) {
+          const size = remote ? await ssh.statSize(t.path) : (await fs.stat(t.path)).size
+          if (size > 1_000_000) {
             skipped.push(`${basename(t.path)}: too large`)
             continue
           }
-          const text = await fs.readFile(t.path, 'utf-8')
+          const text = remote ? await ssh.readFile(t.path) : await fs.readFile(t.path, 'utf-8')
           if (text.slice(0, 1000).includes('\u0000')) {
             skipped.push(`${basename(t.path)}: binary file`)
             continue
@@ -171,7 +203,8 @@ export function registerFsOps(getWin: () => BrowserWindow | null): void {
             return result + line.slice(last) + cr
           })
           if (count === 0) continue
-          await fs.writeFile(t.path, out.join('\n'), 'utf-8')
+          if (remote) await ssh.writeFile(t.path, out.join('\n'))
+          else await fs.writeFile(t.path, out.join('\n'), 'utf-8')
           replaced += count
           files++
         } catch (e) {
@@ -191,8 +224,7 @@ export function registerFsOps(getWin: () => BrowserWindow | null): void {
   })
 
   // ---- watcher ----
-  let watcher: FSWatcher | null = null
-  let watched = ''
+  let watchers: FSWatcher[] = []
   let timer: NodeJS.Timeout | null = null
   const pending = new Set<string>()
   let gitChanged = false
@@ -206,16 +238,24 @@ export function registerFsOps(getWin: () => BrowserWindow | null): void {
     if (paths.length || git) getWin()?.webContents.send('fs:changed', { paths: paths.slice(0, 200), git })
   }
 
-  ipcMain.handle('fs:watch', (_e, root: string | null) => {
-    watcher?.close()
-    watcher = null
+  // One watcher per workspace folder (a single folder, a list of them, or null to stop).
+  ipcMain.handle('fs:watch', (_e, folders: string | string[] | null) => {
+    for (const w of watchers) w.close()
+    watchers = []
     pending.clear()
     if (timer) clearTimeout(timer)
     timer = null
-    watched = root ?? ''
-    if (!root) return
-    try {
-      watcher = watch(root, { recursive: true }, (_event, filename) => {
+    for (const root of folders === null ? [] : Array.isArray(folders) ? folders : [folders]) {
+      if (!root || ssh.isRemotePath(root)) continue // nothing to watch on another computer; the tree refreshes when you come back to the window
+      try {
+        // Watch the real (long-name) spelling of the folder: with a short 8.3 name such as ABDULB~1 some Node/libuv versions abort the whole process.
+        let watchRoot = root
+        try {
+          watchRoot = realpathSync.native(root)
+        } catch {
+          // Watch it as given.
+        }
+        const watcher = watch(watchRoot, { recursive: true }, (_event, filename) => {
         if (!filename) return
         const name = filename.toString()
         const parts = name.split(/[\\/]/)
@@ -226,13 +266,15 @@ export function registerFsOps(getWin: () => BrowserWindow | null): void {
         } else if (parts.some((p) => IGNORED_DIRS.has(p))) {
           return
         } else {
-          pending.add(join(watched, name))
+          pending.add(join(root, name))
         }
         if (!timer) timer = setTimeout(flush, 300)
       })
-      watcher.on('error', () => undefined) // the folder was deleted or became unavailable
-    } catch {
-      // Watching is a convenience; the app still works without it.
+        watcher.on('error', () => undefined) // the folder was deleted or became unavailable
+        watchers.push(watcher)
+      } catch {
+        // Watching is a convenience; the app still works without it.
+      }
     }
   })
 }

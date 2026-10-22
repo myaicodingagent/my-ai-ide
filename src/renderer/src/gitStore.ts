@@ -7,12 +7,20 @@ import type { GitStatus } from '../../main/git'
 
 interface Snapshot {
   status: GitStatus
+  // The status of every workspace folder (the first one is the same object as `status`).
+  byRoot: Record<string, GitStatus>
   root: string | null
   // Changes on every refresh, so the editor margin knows to look again.
   version: number
 }
 
-let snap: Snapshot = { status: { state: 'norepo', files: [] }, root: null, version: 0 }
+let snap: Snapshot = { status: { state: 'norepo', files: [] }, byRoot: {}, root: null, version: 0 }
+let extraRoots: string[] = []
+
+/** The workspace's other folders, so their repositories are tracked as well. */
+export function setGitExtraRoots(roots: string[]): void {
+  extraRoots = roots
+}
 const listeners = new Set<() => void>()
 let inflight = 0
 
@@ -34,13 +42,17 @@ export const useGit = (): Snapshot => useSyncExternalStore(subscribeGit, getGit)
 const same = (a: GitStatus, b: GitStatus): boolean => JSON.stringify(a) === JSON.stringify(b)
 
 export async function refreshGit(root: string | null): Promise<void> {
-  if (!root) return emit({ status: { state: 'norepo', files: [] }, root: null, version: snap.version + 1 })
+  if (!root) return emit({ status: { state: 'norepo', files: [] }, byRoot: {}, root: null, version: snap.version + 1 })
   const ticket = ++inflight
-  const status = await window.api.gitStatus(root)
+  const roots = [root, ...extraRoots]
+  const statuses = await Promise.all(roots.map((r) => window.api.gitStatus(r)))
   if (ticket !== inflight) return // a newer refresh is on its way
+  const byRoot: Record<string, GitStatus> = {}
+  roots.forEach((r, i) => (byRoot[r] = statuses[i]))
+  const status = statuses[0]
   // Keep the same object when nothing changed, so React does not re-render for no reason.
-  if (snap.root === root && same(snap.status, status)) return emit({ ...snap, version: snap.version + 1 })
-  emit({ status, root, version: snap.version + 1 })
+  if (snap.root === root && same(snap.status, status) && JSON.stringify(snap.byRoot) === JSON.stringify(byRoot)) return emit({ ...snap, version: snap.version + 1 })
+  emit({ status, byRoot, root, version: snap.version + 1 })
 }
 
 /** Counts used for badges: files with any change. */

@@ -28,6 +28,7 @@ async function readIfSmall(path: string): Promise<string | null> {
 
 /** The rule files found in a project and their combined text, ready to put in a prompt. */
 export async function loadRules(root: string): Promise<{ files: RuleFile[]; text: string }> {
+  if (isRemotePath(root)) return { files: [], text: '' } // rules files on another computer are not read yet
   const found: { file: RuleFile; text: string }[] = []
   const add = async (abs: string): Promise<void> => {
     const text = await readIfSmall(abs)
@@ -74,6 +75,8 @@ Instructions for AI assistants working in this project. Edit freely; every chat,
 ## Things to avoid
 - (for example: do not edit files in src/generated)
 `
+
+import { isRemotePath } from './sshfs'
 
 export function registerRulesHandlers(): void {
   ipcMain.handle('rules:load', async (_e, root: string) => {

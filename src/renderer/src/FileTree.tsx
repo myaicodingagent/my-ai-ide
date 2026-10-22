@@ -59,7 +59,7 @@ interface TreeProps {
   onMenu: (entry: DirEntry, x: number, y: number) => void
 }
 
-function Node({ entry, depth, ...tree }: { entry: DirEntry; depth: number } & TreeProps): JSX.Element {
+function Node({ entry, depth, tabStop, ...tree }: { entry: DirEntry; depth: number; tabStop?: boolean } & TreeProps): JSX.Element {
   const { version, selected, reveal, git, onOpen, onSelect, onMenu } = tree
   const [open, setOpen] = useState(false)
   const [children, setChildren] = useState<DirEntry[] | null>(null)
@@ -102,6 +102,11 @@ function Node({ entry, depth, ...tree }: { entry: DirEntry; depth: number } & Tr
         className={'tree-row' + (selected !== null && key(selected) === key(entry.path) ? ' selected' : '')}
         style={{ paddingLeft: 10 + depth * 14 }}
         data-tree-path={entry.path}
+        role="treeitem"
+        aria-level={depth + 1}
+        aria-expanded={entry.isDir ? open : undefined}
+        aria-selected={selected !== null && key(selected) === key(entry.path)}
+        tabIndex={tabStop || (selected !== null && key(selected) === key(entry.path)) ? 0 : -1}
         onClick={toggle}
         onContextMenu={(e) => {
           e.preventDefault()
@@ -119,9 +124,76 @@ function Node({ entry, depth, ...tree }: { entry: DirEntry; depth: number } & Tr
         {letter && <span className={`tree-git gs-${letter}`}>{letter}</span>}
         {dirty && !open && <span className="tree-dot" />}
       </div>
-      {open && children?.map((c) => <Node key={c.path} entry={c} depth={depth + 1} {...tree} />)}
+      {open && (
+        <div role="group">
+          {children?.map((c) => (
+            <Node key={c.path} entry={c} depth={depth + 1} {...tree} />
+          ))}
+        </div>
+      )}
     </div>
   )
+}
+
+/**
+ * Keys for the explorer, put on the element that contains the rows: arrows move (Left/Right also fold and unfold
+ * folders), Home/End jump, Enter or Space opens, Shift+F10 or the menu key opens the context menu.
+ */
+export function treeKeyDown(e: React.KeyboardEvent<HTMLElement>): void {
+  const target = e.target as HTMLElement
+  const row = target.closest<HTMLElement>('.tree-row')
+  if (!row || !e.currentTarget.contains(row)) return
+  const rows = [...e.currentTarget.querySelectorAll<HTMLElement>('.tree-row')]
+  const at = rows.indexOf(row)
+  const go = (i: number): void => {
+    const next = rows[Math.max(0, Math.min(rows.length - 1, i))]
+    next?.focus()
+    next?.scrollIntoView({ block: 'nearest' })
+  }
+  const level = Number(row.getAttribute('aria-level') ?? '1')
+  const expanded = row.getAttribute('aria-expanded')
+  switch (e.key) {
+    case 'ArrowDown':
+      e.preventDefault()
+      return go(at + 1)
+    case 'ArrowUp':
+      e.preventDefault()
+      return go(at - 1)
+    case 'Home':
+      e.preventDefault()
+      return go(0)
+    case 'End':
+      e.preventDefault()
+      return go(rows.length - 1)
+    case 'ArrowRight':
+      e.preventDefault()
+      if (expanded === 'false') row.click()
+      else if (expanded === 'true') go(at + 1)
+      return
+    case 'ArrowLeft':
+      e.preventDefault()
+      if (expanded === 'true') row.click()
+      else {
+        // the folder this row is in: the nearest row above with a smaller level
+        for (let i = at - 1; i >= 0; i--) {
+          if (Number(rows[i].getAttribute('aria-level') ?? '1') < level) return go(i)
+        }
+      }
+      return
+    case 'Enter':
+    case ' ':
+      e.preventDefault()
+      row.click()
+      return
+    case 'ContextMenu':
+    case 'F10': {
+      if (e.key === 'F10' && !e.shiftKey) return
+      e.preventDefault()
+      const r = row.getBoundingClientRect()
+      row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: r.left + 24, clientY: r.bottom }))
+      return
+    }
+  }
 }
 
 export function FileTree({ root, ...tree }: { root: string } & TreeProps): JSX.Element {
@@ -131,8 +203,8 @@ export function FileTree({ root, ...tree }: { root: string } & TreeProps): JSX.E
   }, [root, tree.version])
   return (
     <>
-      {entries.map((e) => (
-        <Node key={e.path} entry={e} depth={0} {...tree} />
+      {entries.map((e, i) => (
+        <Node key={e.path} entry={e} depth={0} tabStop={i === 0} {...tree} />
       ))}
     </>
   )

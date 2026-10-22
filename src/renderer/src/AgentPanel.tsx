@@ -61,6 +61,7 @@ export function AgentPanel({
   root,
   onSwitch,
   onOpenFile,
+  onRunInBackground,
   isDirty,
   onFileChanged,
   onWorkspaceTouched,
@@ -69,6 +70,8 @@ export function AgentPanel({
   root: string | null
   onSwitch: () => void
   onOpenFile: (path: string) => void
+  // Hands the typed task to a background agent instead of running it here.
+  onRunInBackground: (task: string) => void
   // A command ran, so files may have changed anywhere in the project.
   onWorkspaceTouched: () => void
   // Called when the agent is waiting for the user, so the panel can be brought to the front.
@@ -241,7 +244,7 @@ export function AgentPanel({
   }
 
   return (
-    <aside className="chat">
+    <aside className="chat" aria-label="AI agent">
       <div className="chat-header">
         <span>AGENT</span>
         <span>
@@ -322,6 +325,17 @@ export function AgentPanel({
           }}
         />
         {busy ? <button onClick={stop}>Stop</button> : <button onClick={send}>Send</button>}
+        <button
+          data-agent-background
+          title="Run this task in the background, on a separate copy of the project"
+          disabled={!input.trim() || !root}
+          onClick={() => {
+            onRunInBackground(input.trim())
+            setInput('')
+          }}
+        >
+          ⤴ Background
+        </button>
       </div>
       {pendingCmd && <CommandDialog request={pendingCmd.request} onDecide={decideCommand} />}
       {pending && (

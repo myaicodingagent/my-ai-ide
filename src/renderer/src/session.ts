@@ -43,6 +43,16 @@ export function removeRecentFolder(root: string): void {
   write(RECENT_KEY, getRecentFolders().filter((f) => !sameFolder(f, root)))
 }
 
+/** The additional folders of a workspace whose first folder is `root`. */
+export function loadExtraFolders(root: string): string[] {
+  const v = read('workspace:' + root.replace(/\\/g, '/').toLowerCase())
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').slice(0, 20) : []
+}
+
+export function saveExtraFolders(root: string, folders: string[]): void {
+  write('workspace:' + root.replace(/\\/g, '/').toLowerCase(), folders)
+}
+
 export function saveSession(root: string, session: SavedSession): void {
   write(SESSION_PREFIX + root.replace(/\\/g, '/').toLowerCase(), session)
 }

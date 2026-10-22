@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { useFocusTrap } from './a11y'
 import { monaco } from './monaco-setup'
 import { acquireDiffEditor, releaseDiffEditor } from './diffPool'
 import { MODELS } from './models'
@@ -52,6 +53,8 @@ export function InlineEdit({
   const reqRef = useRef<number | null>(null)
   const bufRef = useRef('')
   const diffHost = useRef<HTMLDivElement>(null)
+  const boxRef = useRef<HTMLDivElement>(null)
+  useFocusTrap(boxRef)
   const inputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => inputRef.current?.focus(), [])
@@ -155,7 +158,7 @@ export function InlineEdit({
 
   return (
     <div className="qp-backdrop" onMouseDown={cancel}>
-      <div className="qp ie" onMouseDown={(e) => e.stopPropagation()}>
+      <div className="qp ie" ref={boxRef} role="dialog" aria-modal="true" aria-label="Edit the selection with Claude" onMouseDown={(e) => e.stopPropagation()}>
         {phase !== 'review' && (
           <div className="ie-bar">
             <input

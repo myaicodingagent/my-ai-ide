@@ -4,6 +4,7 @@ import { promises as fs, realpathSync } from 'fs'
 import { spawn } from 'child_process'
 import Anthropic from '@anthropic-ai/sdk'
 import { loadKey } from './ai'
+import { isRemotePath } from './sshfs'
 
 // Everything here shells out to the user's own `git`, so it behaves exactly like git in a terminal.
 
@@ -16,7 +17,8 @@ interface GitResult {
 const MAX_OUTPUT = 8_000_000
 const MAX_DIFF_FILE = 1_000_000
 
-function runGit(cwd: string, args: string[], opts: { input?: string; timeout?: number } = {}): Promise<GitResult> {
+export function runGit(cwd: string, args: string[], opts: { input?: string; timeout?: number } = {}): Promise<GitResult> {
+  if (isRemotePath(cwd)) return Promise.resolve({ code: -2, stdout: '', stderr: 'Git is not available for folders opened over SSH yet.' })
   return new Promise((resolveResult) => {
     let child
     try {
@@ -70,9 +72,33 @@ export interface GitFile {
   orig?: string // old path for renames
 }
 
+export interface StashEntry {
+  index: number
+  date: number
+  message: string
+}
+
+export interface CommitEntry {
+  hash: string
+  short: string
+  author: string
+  date: number
+  subject: string
+  refs: string[]
+}
+
+export interface CommitFile {
+  status: string // A, M, D, R, C...
+  rel: string
+  orig?: string
+}
+
 export interface GitStatus {
-  state: 'nogit' | 'norepo' | 'ok'
+  state: 'nogit' | 'norepo' | 'ok' | 'remote'
   error?: string
+  // Git refused to work in this repository because it belongs to another user (typical for folders inside WSL):
+  // the repository path git named. `git:trust` can mark it safe.
+  unsafe?: string
   branch?: string
   upstream?: string
   ahead?: number
@@ -89,8 +115,12 @@ async function topLevel(root: string): Promise<{ top: string } | { error: string
 }
 
 async function status(root: string): Promise<GitStatus> {
+  if (isRemotePath(root)) return { state: 'remote', error: 'Git is not available for folders opened over SSH yet.', files: [] }
   const t = await topLevel(root)
-  if ('error' in t) return { state: t.nogit ? 'nogit' : 'norepo', error: t.error, files: [] }
+  if ('error' in t) {
+    const unsafe = /dubious ownership in repository at '([^']+)'/.exec(t.error)?.[1]
+    return { state: t.nogit ? 'nogit' : 'norepo', error: t.error, unsafe, files: [] }
+  }
   const r = await runGit(root, ['status', '--porcelain=v1', '-z', '--branch', '--untracked-files=all'])
   if (r.code !== 0) return { state: 'ok', error: r.stderr.trim(), files: [] }
 
@@ -199,6 +229,15 @@ export function registerGitHandlers(): void {
   ipcMain.handle('git:lineChanges', (_e, root: string, rel: string) => lineChanges(root, rel))
   ipcMain.handle('git:diff', (_e, root: string, rel: string, staged: boolean) => diffSides(root, rel, staged))
 
+  // Marks a repository that git calls unsafe as safe (a line in the user's global git config), but only the one git named.
+  ipcMain.handle('git:trust', async (_e, root: string) => {
+    const probe = await runGit(root, ['rev-parse', '--show-toplevel'])
+    const path = /dubious ownership in repository at '([^']+)'/.exec(probe.stderr)?.[1]
+    if (!path) return { ok: false as const, error: 'Git does not object to this folder.' }
+    const r = await runGit(root, ['config', '--global', '--add', 'safe.directory', path])
+    return r.code === 0 ? { ok: true as const } : fail(r)
+  })
+
   ipcMain.handle('git:init', async (_e, root: string) => {
     const r = await runGit(root, ['init'])
     return r.code === 0 ? { ok: true as const } : fail(r)
@@ -263,6 +302,120 @@ export function registerGitHandlers(): void {
       r = await runGit(root, ['push', '--set-upstream', 'origin', 'HEAD'], opts)
     }
     return r.code === 0 ? { ok: true as const, output: (r.stdout + r.stderr).trim() } : fail(r)
+  })
+
+  // ---- Stash ----
+  const stashRef = (n: unknown): string => {
+    if (!Number.isInteger(n) || (n as number) < 0) throw new Error('Bad stash number.')
+    return `stash@{${n}}`
+  }
+
+  ipcMain.handle('git:stashList', async (_e, root: string) => {
+    const r = await runGit(root, ['stash', 'list', '--format=%gd%x1f%ct%x1f%s'])
+    if (r.code !== 0) return { ok: false as const, error: (r.stderr || r.stdout).trim(), stashes: [] as StashEntry[] }
+    const stashes: StashEntry[] = r.stdout
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => {
+        const [ref, ct, subject] = l.split('\x1f')
+        return { index: Number(/\{(\d+)\}/.exec(ref)?.[1] ?? 0), date: Number(ct) * 1000, message: subject }
+      })
+    return { ok: true as const, stashes }
+  })
+
+  ipcMain.handle('git:stashPush', async (_e, root: string, message: string, includeUntracked: boolean) => {
+    const args = ['stash', 'push']
+    if (includeUntracked) args.push('--include-untracked')
+    if (message.trim()) args.push('-m', message.trim())
+    const r = await runGit(root, args)
+    if (r.code !== 0) return fail(r)
+    if (/No local changes to save/i.test(r.stdout + r.stderr)) return { ok: false as const, error: 'There are no changes to stash.' }
+    return { ok: true as const }
+  })
+
+  // apply keeps the stash; pop removes it once it applied cleanly (git itself keeps it when there are conflicts).
+  ipcMain.handle('git:stashApply', async (_e, root: string, n: number, pop: boolean) => {
+    const r = await runGit(root, ['stash', pop ? 'pop' : 'apply', stashRef(n)])
+    const out = (r.stdout + r.stderr).trim()
+    if (r.code === 0) return { ok: true as const, output: out }
+    return { ok: false as const, error: /CONFLICT/.test(out) ? 'Applied with merge conflicts. Resolve them in the files marked !; the stash was kept.' : out || `git exited with code ${r.code}` }
+  })
+
+  ipcMain.handle('git:stashDrop', async (_e, root: string, n: number) => {
+    const r = await runGit(root, ['stash', 'drop', stashRef(n)])
+    return r.code === 0 ? { ok: true as const } : fail(r)
+  })
+
+  // ---- History ----
+  const HASH = /^[0-9a-f]{7,40}$/
+  const goodHash = (h: string): string => {
+    if (!HASH.test(h)) throw new Error('Bad commit id.')
+    return h
+  }
+
+  // Commits of the current branch, newest first; `rel` limits it to one file (following renames).
+  ipcMain.handle('git:log', async (_e, root: string, rel: string | null, skip: number, limit: number) => {
+    const args = ['log', '--format=%H%x1f%an%x1f%ct%x1f%s%x1f%D%x1e', `--skip=${Math.max(0, skip | 0)}`, `-n${Math.min(200, Math.max(1, limit | 0))}`]
+    if (rel) args.push('--follow', '--', ...safeRels(root, [rel]))
+    const r = await runGit(root, args)
+    if (r.code !== 0) {
+      if (/does not have any commits|unknown revision|bad default revision/i.test(r.stderr)) return { ok: true as const, commits: [] as CommitEntry[] }
+      return { ok: false as const, error: r.stderr.trim(), commits: [] as CommitEntry[] }
+    }
+    const commits: CommitEntry[] = r.stdout
+      .split('\x1e')
+      .map((s) => s.replace(/^\n/, ''))
+      .filter(Boolean)
+      .map((rec) => {
+        const [hash, author, ct, subject, refs] = rec.split('\x1f')
+        return { hash, short: hash.slice(0, 7), author, date: Number(ct) * 1000, subject, refs: refs ? refs.split(', ').filter(Boolean) : [] }
+      })
+    return { ok: true as const, commits }
+  })
+
+  ipcMain.handle('git:commitFiles', async (_e, root: string, hash: string) => {
+    const r = await runGit(root, ['diff-tree', '--no-commit-id', '--name-status', '-r', '-z', '-M', '--root', '-m', '--first-parent', '--relative', goodHash(hash)])
+    if (r.code !== 0) return { ok: false as const, error: r.stderr.trim(), files: [] as CommitFile[] }
+    const parts = r.stdout.split('\0').filter((s, i, a) => s !== '' || i < a.length - 1)
+    const files: CommitFile[] = []
+    for (let i = 0; i < parts.length; ) {
+      const status = parts[i++]
+      if (!status) continue
+      if (status[0] === 'R' || status[0] === 'C') {
+        const orig = parts[i++]
+        files.push({ status: status[0], rel: parts[i++], orig })
+      } else files.push({ status: status[0], rel: parts[i++] })
+    }
+    return { ok: true as const, files }
+  })
+
+  // Before and after text of one file in one commit (for the diff view).
+  ipcMain.handle('git:commitDiff', async (_e, root: string, hash: string, rel: string, orig?: string) => {
+    goodHash(hash)
+    safeRels(root, orig ? [rel, orig] : [rel])
+    const [original, modified] = await Promise.all([fileAt(root, `${hash}^:./${orig ?? rel}`), fileAt(root, `${hash}:./${rel}`)])
+    return { original, modified }
+  })
+
+  // ---- Merge conflicts ----
+  ipcMain.handle('git:mergeState', async (_e, root: string) => {
+    const merge = await runGit(root, ['rev-parse', '-q', '--verify', 'MERGE_HEAD'])
+    return { merging: merge.code === 0 }
+  })
+
+  ipcMain.handle('git:mergeAbort', async (_e, root: string) => {
+    const r = await runGit(root, ['merge', '--abort'])
+    return r.code === 0 ? { ok: true as const } : fail(r)
+  })
+
+  // Resolves a whole conflicted file in favour of one side and stages it.
+  ipcMain.handle('git:take', async (_e, root: string, rel: string, side: 'ours' | 'theirs') => {
+    safeRels(root, [rel])
+    if (side !== 'ours' && side !== 'theirs') return { ok: false as const, error: 'Bad side.' }
+    const r = await runGit(root, ['checkout', `--${side}`, '--', rel])
+    if (r.code !== 0) return fail(r)
+    const a = await runGit(root, ['add', '--', rel])
+    return a.code === 0 ? { ok: true as const } : fail(a)
   })
 
   // A commit message for what is staged, written by Claude (Haiku: this should be quick and cheap).

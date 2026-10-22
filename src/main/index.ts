@@ -8,6 +8,15 @@ import { registerUpdater } from './updater'
 import { registerGitHandlers } from './git'
 import { registerFsOps } from './fsops'
 import { registerRulesHandlers } from './rules'
+import { registerCodeIndexHandlers } from './codeindex'
+import { registerBackgroundHandlers, stopAllBackground } from './background'
+import { registerDebugHandlers, stopDebugging } from './debugger'
+import { extensionThemes, registerExtensionHandlers, stopExtensions } from './extensions'
+import { registerTaskHandlers } from './tasks'
+import { registerNotebookHandlers, stopAllKernels } from './notebook'
+import * as ssh from './sshfs'
+import { execFile } from 'child_process'
+import { parseWslList, sshArgs, validSshTarget, wslLocation, wslShellArgs } from './shellspec'
 
 interface DirEntry {
   name: string
@@ -85,6 +94,7 @@ function createWindow(): void {
 ipcMain.handle('app:initialFolder', () => folderFromArgs())
 
 ipcMain.handle('fs:isDir', (_e, p: string) => {
+  if (ssh.isRemotePath(p)) return ssh.isDir(p)
   try {
     return statSync(p).isDirectory()
   } catch {
@@ -141,6 +151,8 @@ ipcMain.handle('themes:list', async () => {
     if (stat.size > MAX_THEME_BYTES) out.push({ file, text: '' }) // reported as an error by the renderer
     else out.push({ file, text: await fs.readFile(full, 'utf-8') })
   }
+  // Themes that installed extensions bring along.
+  out.push(...(await extensionThemes().catch(() => [])))
   return out
 })
 
@@ -189,6 +201,7 @@ ipcMain.handle('dialog:openFolder', async () => {
 })
 
 ipcMain.handle('fs:readDir', async (_e, dir: string): Promise<DirEntry[]> => {
+  if (ssh.isRemotePath(dir)) return ssh.readDir(dir)
   const entries = await fs.readdir(dir, { withFileTypes: true })
   return entries
     .filter((d) => d.name !== '.git' && d.name !== 'node_modules')
@@ -196,13 +209,14 @@ ipcMain.handle('fs:readDir', async (_e, dir: string): Promise<DirEntry[]> => {
     .sort((a, b) => Number(b.isDir) - Number(a.isDir) || a.name.localeCompare(b.name))
 })
 
-ipcMain.handle('fs:readFile', (_e, file: string) => fs.readFile(file, 'utf-8'))
+ipcMain.handle('fs:readFile', (_e, file: string) => (ssh.isRemotePath(file) ? ssh.readFile(file) : fs.readFile(file, 'utf-8')))
 
 ipcMain.handle('fs:writeFile', (_e, file: string, content: string) =>
-  fs.writeFile(file, content, 'utf-8')
+  ssh.isRemotePath(file) ? ssh.writeFile(file, content) : fs.writeFile(file, content, 'utf-8')
 )
 
 ipcMain.handle('fs:listFiles', async (_e, root: string): Promise<string[]> => {
+  if (ssh.isRemotePath(root)) return ssh.listFiles(root)
   const out: string[] = []
   const walk = async (dir: string): Promise<void> => {
     if (out.length >= 10000) return
@@ -237,6 +251,7 @@ ipcMain.handle(
     opts: { caseSensitive: boolean; regex: boolean }
   ): Promise<{ matches: SearchMatch[]; truncated: boolean; error?: string }> => {
     if (!query) return { matches: [], truncated: false }
+    if (ssh.isRemotePath(root)) return ssh.search(root, query, opts)
     let re: RegExp
     try {
       const source = opts.regex ? query : query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -323,7 +338,14 @@ async function detectShells(): Promise<ShellInfo[]> {
         break
       }
     }
-    if (await exists('C:\\Windows\\System32\\wsl.exe')) shells.push({ id: 'wsl', label: 'WSL', file: 'wsl.exe', args: [] })
+    if (await exists('C:\\Windows\\System32\\wsl.exe')) {
+      shells.push({ id: 'wsl', label: 'WSL', file: 'wsl.exe', args: [] })
+      // One entry per installed distribution.
+      const raw = await new Promise<Buffer | null>((resolveList) => {
+        execFile('wsl.exe', ['-l', '-q'], { encoding: 'buffer', timeout: 8000, windowsHide: true }, (err, stdout) => resolveList(err ? null : stdout))
+      })
+      for (const distro of raw ? parseWslList(raw) : []) shells.push({ id: 'wsl:' + distro, label: 'WSL: ' + distro, file: 'wsl.exe', args: ['-d', distro] })
+    }
   } else {
     shells.push({ id: 'default', label: 'Shell', file: process.env.SHELL || '/bin/bash', args: [] })
   }
@@ -335,7 +357,41 @@ ipcMain.handle('term:shells', async () => (await detectShells()).map(({ id, labe
 
 ipcMain.handle('term:create', async (_e, shellId: string, cwd: string | null, cols: number, rows: number) => {
   const shells = await detectShells()
-  const shell = shells.find((s) => s.id === shellId) ?? shells[0] // unknown id: the first (PowerShell)
+  let shell = shells.find((s) => s.id === shellId) ?? shells[0] // unknown id: the first (PowerShell)
+  let startIn = cwd ?? process.env.USERPROFILE ?? process.cwd()
+  if (typeof shellId === 'string' && shellId.startsWith('ssh:')) {
+    // An SSH session with the OpenSSH client that comes with Windows 10 and 11.
+    const target = shellId.slice(4)
+    if (!validSshTarget(target)) throw new Error('That is not a valid SSH address.')
+    const candidates = ['C:\\Windows\\System32\\OpenSSH\\ssh.exe', (await findOnPath('ssh.exe')) ?? '']
+    let file = 'ssh'
+    for (const c of candidates) if (c && (await exists(c))) { file = c; break }
+    shell = { id: shellId, label: 'SSH: ' + target, file, args: sshArgs(target) }
+    startIn = process.env.USERPROFILE ?? process.cwd()
+  } else if (ssh.isRemotePath(cwd)) {
+    // A folder on another computer: ssh logs in and starts a shell in that folder (the password prompt, if any, shows in the terminal).
+    const r = ssh.parseRemote(cwd as string)
+    const h = r ? ssh.hostOf(r.name) : undefined
+    if (!r || !h) throw new Error('Not connected to that computer. Open the folder again to reconnect.')
+    const candidates = ['C:\\Windows\\System32\\OpenSSH\\ssh.exe', (await findOnPath('ssh.exe')) ?? '']
+    let exe = 'ssh'
+    for (const c of candidates) if (c && (await exists(c))) { exe = c; break }
+    const quoted = "'" + r.path.replace(/'/g, "'\\''") + "'"
+    shell = {
+      id: 'ssh-folder',
+      label: 'SSH: ' + h.host,
+      file: exe,
+      args: ['-t', '-p', String(h.port), ...(h.identityFile ? ['-i', h.identityFile] : []), '--', h.username + '@' + h.host, 'cd ' + quoted + ' && exec "$SHELL" -l']
+    }
+    startIn = process.env.USERPROFILE ?? process.cwd()
+  } else {
+    // A folder inside WSL: open the shell of that distribution in that folder (the Windows side cannot start in a \\wsl$ path).
+    const loc = wslLocation(cwd)
+    if (loc && process.platform === 'win32') {
+      shell = { id: 'wsl:' + loc.distro, label: 'WSL: ' + loc.distro, file: 'wsl.exe', args: wslShellArgs(loc) }
+      startIn = process.env.USERPROFILE ?? process.cwd()
+    }
+  }
   const id = nextTermId++
   const env = { ...process.env } as Record<string, string>
   delete env.ELECTRON_RUN_AS_NODE // would make `node` in the terminal behave like Electron
@@ -343,7 +399,7 @@ ipcMain.handle('term:create', async (_e, shellId: string, cwd: string | null, co
     name: 'xterm-256color',
     cols,
     rows,
-    cwd: cwd ?? process.env.USERPROFILE ?? process.cwd(),
+    cwd: startIn,
     env
   })
   term.onData((data) => mainWin?.webContents.send('term:data', id, data))
@@ -373,6 +429,13 @@ app.whenReady().then(() => {
   registerGitHandlers()
   registerFsOps(() => mainWin)
   registerRulesHandlers()
+  registerCodeIndexHandlers()
+  registerBackgroundHandlers(() => mainWin)
+  registerDebugHandlers(() => mainWin)
+  registerExtensionHandlers(() => mainWin)
+  registerTaskHandlers()
+  registerNotebookHandlers(() => mainWin)
+  ssh.registerSshHandlers()
   createWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -381,4 +444,12 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
+})
+
+app.on('before-quit', () => {
+  stopAllBackground()
+  stopDebugging()
+  stopExtensions()
+  stopAllKernels()
+  ssh.disconnectAll()
 })

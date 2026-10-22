@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { useFocusTrap } from './a11y'
 import { MODELS } from './models'
 import { LIMITS, Settings, resetSettings, updateSettings, useSettings } from './settings'
 import { describeUpdate, useUpdateState } from './update'
@@ -68,6 +69,8 @@ function Check({ setting, keyName, s }: { setting: string; keyName: keyof Settin
 
 export function SettingsDialog({ onClose }: { onClose: () => void }): JSX.Element {
   const s = useSettings()
+  const boxRef = useRef<HTMLDivElement>(null)
+  useFocusTrap(boxRef)
   const update = useUpdateState()
   const [themeId, setThemeId] = useState(getTheme().id)
   const [shells, setShells] = useState<{ id: string; label: string }[]>([])
@@ -120,7 +123,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }): JSX.Elemen
 
   return (
     <div className="qp-backdrop" onMouseDown={onClose}>
-      <div className="qp settings" onMouseDown={(e) => e.stopPropagation()}>
+      <div className="qp settings" ref={boxRef} role="dialog" aria-modal="true" aria-label="Settings" onMouseDown={(e) => e.stopPropagation()}>
         <div className="set-header">
           <span>Settings</span>
           <button className="set-close" title="Close (Esc)" onClick={onClose}>
@@ -280,6 +283,20 @@ export function SettingsDialog({ onClose }: { onClose: () => void }): JSX.Elemen
           </Row>
           <Row label="Autocomplete" hint="Ghost-text suggestions as you type (Haiku 5.5, uses API credits)">
             <Check setting="autocomplete" keyName="autocomplete" s={s} />
+          </Row>
+          <div className="set-group">Accessibility</div>
+          <Row label="Screen reader support" hint="Makes the editor and terminal work with a screen reader (they normally detect one by themselves)">
+            <Check setting="screenReader" keyName="screenReader" s={s} />
+          </Row>
+          <Row label="Reduce motion" hint="No smooth scrolling or caret animation. Your system's own setting is respected as well">
+            <Check setting="reduceMotion" keyName="reduceMotion" s={s} />
+          </Row>
+          <Row label="Next edit suggestions" hint="After you edit, suggest the change you will probably make next; Tab jumps to it, Tab applies it (Haiku 5.5, uses API credits)">
+            <Check setting="nextEdit" keyName="nextEdit" s={s} />
+          </Row>
+
+          <Row label="Search by meaning on this PC" hint="Find code by what it does, not only by its words. Downloads a small model (about 23 MB) the first time; your code never leaves this PC">
+            <Check setting="meaningSearch" keyName="meaningSearch" s={s} />
           </Row>
 
           <div className="set-group">Updates</div>

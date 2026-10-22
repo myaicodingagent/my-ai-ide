@@ -4,8 +4,18 @@ directories:
   output: release
 asarUnpack:
   - node_modules/@lydell/**
+  - node_modules/@esbuild/**
+  - node_modules/esbuild/**
+  - node_modules/onnxruntime-node/**
+  - node_modules/sharp/**
+  - node_modules/@img/**
 files:
   - out/**/*
+  # Only the Windows x64 build of the search model's runtime is needed; the rest would add well over 300 MB.
+  - '!node_modules/onnxruntime-web/**'
+  - '!node_modules/onnxruntime-node/bin/napi-v6/darwin/**'
+  - '!node_modules/onnxruntime-node/bin/napi-v6/linux/**'
+  - '!node_modules/onnxruntime-node/bin/napi-v6/win32/arm64/**'
 afterPack: build/afterPack.js
 # Where the app looks for updates (GitHub Releases). Set owner to your account or
 # organisation name (and the repo if it is not called my-ai-ide); until then updates stay switched off.

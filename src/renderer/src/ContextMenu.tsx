@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useFocusTrap } from './a11y'
 
 export interface MenuItem {
   label: string
@@ -23,6 +24,9 @@ export function ContextMenu({
 }): JSX.Element {
   const ref = useRef<HTMLDivElement>(null)
   const [pos, setPos] = useState({ x, y })
+  const [hi, setHi] = useState(-1) // the item the keyboard is on
+  const enabled = items.map((it, i) => (it.disabled ? -1 : i)).filter((i) => i >= 0)
+  useFocusTrap(ref)
 
   // Keep the menu on screen: flip it up or left when it would run past the window edge.
   useLayoutEffect(() => {
@@ -37,25 +41,51 @@ export function ContextMenu({
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') onClose()
+      if (e.key === 'Escape') {
+        e.stopPropagation() // not for the editor underneath
+        return onClose()
+      }
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Home' || e.key === 'End') {
+        e.preventDefault()
+        e.stopPropagation()
+        setHi((cur) => {
+          if (enabled.length === 0) return -1
+          const at = enabled.indexOf(cur)
+          if (e.key === 'Home') return enabled[0]
+          if (e.key === 'End') return enabled[enabled.length - 1]
+          const next = e.key === 'ArrowDown' ? (at + 1) % enabled.length : (at - 1 + enabled.length) % enabled.length
+          return enabled[at < 0 ? (e.key === 'ArrowDown' ? 0 : enabled.length - 1) : next]
+        })
+      } else if ((e.key === 'Enter' || e.key === ' ') && hi >= 0 && items[hi] && !items[hi].disabled) {
+        e.preventDefault()
+        e.stopPropagation()
+        const it = items[hi]
+        onClose()
+        it.run()
+      }
     }
-    window.addEventListener('keydown', onKey)
+    // Capturing, so the keys reach the menu before the editor that still has focus.
+    window.addEventListener('keydown', onKey, true)
     window.addEventListener('blur', onClose)
     return () => {
-      window.removeEventListener('keydown', onKey)
+      window.removeEventListener('keydown', onKey, true)
       window.removeEventListener('blur', onClose)
     }
-  }, [onClose])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [onClose, hi, items])
 
   return (
     <>
       <div className="ctx-backdrop" onMouseDown={onClose} onContextMenu={(e) => { e.preventDefault(); onClose() }} />
-      <div ref={ref} className="ctx-menu" style={{ left: pos.x, top: pos.y }} data-context-menu>
+      <div ref={ref} className="ctx-menu" style={{ left: pos.x, top: pos.y }} data-context-menu role="menu" tabIndex={-1} aria-activedescendant={hi >= 0 ? 'ctx-item-' + hi : undefined}>
         {items.map((it, i) => (
           <div key={i}>
             {it.separator && <div className="ctx-sep" />}
             <div
-              className={'ctx-item' + (it.danger ? ' danger' : '') + (it.disabled ? ' disabled' : '')}
+              id={'ctx-item-' + i}
+              role="menuitem"
+              aria-disabled={it.disabled ? true : undefined}
+              className={'ctx-item' + (it.danger ? ' danger' : '') + (it.disabled ? ' disabled' : '') + (i === hi ? ' hi' : '')}
               onClick={() => {
                 if (it.disabled) return
                 onClose()
