@@ -1,4 +1,5 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, net, protocol, shell } from 'electron'
+import { pathToFileURL } from 'url'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import { promises as fs, statSync } from 'fs'
 import * as pty from '@lydell/node-pty'
@@ -15,6 +16,7 @@ import { registerDebugHandlers, stopDebugging } from './debugger'
 import { extensionThemes, registerExtensionHandlers, stopExtensions } from './extensions'
 import { registerTaskHandlers } from './tasks'
 import { registerNotebookHandlers, stopAllKernels } from './notebook'
+import { webviewMayRead, webviewPage } from './extensions'
 import { registerLspHandlers, stopAllLanguageServers } from './lsp'
 import * as ssh from './sshfs'
 import { parseJsonc } from './jsonc'
@@ -457,7 +459,28 @@ ipcMain.on('term:kill', (_e, id: number) => {
   terminals.delete(id)
 })
 
+// Extensions' web pages (webviews) load their own files through this address, which only serves what they may read.
+protocol.registerSchemesAsPrivileged([{ scheme: 'vscode-webview-resource', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } }])
+
 app.whenReady().then(() => {
+  protocol.handle('vscode-webview-resource', async (req) => {
+    try {
+      const parts = new URL(req.url).pathname.split('/')
+      const seg = parts[1] ?? ''
+      if (seg === 'page') {
+        const html = webviewPage(decodeURIComponent(parts[2] ?? ''))
+        return html === null ? new Response('Not found', { status: 404 }) : new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' } })
+      }
+      const file = Buffer.from(seg, 'base64url').toString('utf-8')
+      if (!webviewMayRead(file)) return new Response('Not allowed', { status: 403 })
+      const res = await net.fetch(pathToFileURL(file).href)
+      const headers = new Headers(res.headers)
+      headers.set('access-control-allow-origin', '*') // the page has no origin of its own to be matched against
+      return new Response(res.body, { status: res.status, headers })
+    } catch {
+      return new Response('Not found', { status: 404 })
+    }
+  })
   // No default menu: its accelerators (Ctrl+W closes the window, Ctrl+R reloads) would fight the editor's own shortcuts.
   Menu.setApplicationMenu(null)
   registerAiHandlers(() => mainWin)

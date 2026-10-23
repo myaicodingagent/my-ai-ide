@@ -34,6 +34,9 @@ export interface ExtRecord {
   themes: number
   snippets: number
   commands: { id: string; title: string }[]
+  // Tree views the extension adds (their container is "explorer", another built-in one, or one of `containers`).
+  views: { container: string; id: string; name: string; webview?: boolean }[]
+  containers: { id: string; title: string }[] // extra activity bar entries
   unsupported: string[] // contributions that are ignored (grammars, languages, debuggers...)
   codeIgnored: boolean // a VS Code extension with code (main) that cannot run here
   source: 'vsix' | 'registry' | 'folder'
@@ -75,7 +78,7 @@ interface Pkg {
   contributes?: Record<string, unknown>
 }
 
-const SUPPORTED = new Set(['themes', 'snippets', 'commands', 'configuration', 'colors', 'iconThemes', 'productIconThemes'])
+const SUPPORTED = new Set(['themes', 'snippets', 'commands', 'configuration', 'colors', 'iconThemes', 'productIconThemes', 'views', 'viewsContainers'])
 
 async function readExtension(dir: string, source: ExtRecord['source']): Promise<ExtRecord> {
   const pkg = parseJsonc(await fs.readFile(join(dir, 'package.json'), 'utf-8')) as Pkg
@@ -98,6 +101,19 @@ async function readExtension(dir: string, source: ExtRecord['source']): Promise<
           })
       : []
   const unsupported = Object.keys(c).filter((k) => !SUPPORTED.has(k))
+  const views: ExtRecord['views'] = []
+  if (vscode && c.views && typeof c.views === 'object') {
+    for (const [container, arr] of Object.entries(c.views as Record<string, unknown>)) {
+      if (!Array.isArray(arr)) continue
+      for (const v of arr as { id?: unknown; name?: unknown; type?: unknown }[]) {
+        if (v && typeof v.id === 'string') views.push({ container, id: v.id, name: label(v.name, v.id), ...(v.type === 'webview' ? { webview: true } : {}) })
+      }
+    }
+  }
+  const bar = (c.viewsContainers as { activitybar?: unknown } | undefined)?.activitybar
+  const containers: ExtRecord['containers'] = vscode && Array.isArray(bar)
+    ? (bar as { id?: unknown; title?: unknown }[]).filter((x) => x && typeof x.id === 'string').map((x) => ({ id: x.id as string, title: label(x.title, x.id as string) }))
+    : []
   return {
     id: `${publisher}.${pkg.name}`,
     name: pkg.name,
@@ -112,6 +128,8 @@ async function readExtension(dir: string, source: ExtRecord['source']): Promise<
     themes: list('themes').length,
     snippets: list('snippets').length,
     commands,
+    views,
+    containers,
     unsupported,
     codeIgnored: false,
     source
@@ -428,6 +446,37 @@ interface Host {
 let host: Host | null = null
 let hostLog: string[] = []
 let currentRoot: string | null = null
+
+// Folders a webview may read files from (through the vscode-webview-resource protocol): the extension's own folder, the
+// folders it names in localResourceRoots, and the open project.
+const webviewRoots = new Set<string>()
+// The HTML each webview panel was given; the editor shows it in a frame that loads it from the vscode-webview-resource
+// protocol (so it has an address and security rules of its own, not the editor's).
+const webviewPages = new Map<string, string>()
+
+// What the page needs to talk to its extension: acquireVsCodeApi(), as VS Code's own webviews have.
+const WEBVIEW_API = `const __state = { v: undefined }
+window.acquireVsCodeApi = () => ({
+  postMessage: (message) => parent.postMessage({ __vscodeWebview: true, message }, '*'),
+  getState: () => __state.v,
+  setState: (s) => { __state.v = s; return s }
+})`
+
+export function webviewPage(id: string): string | null {
+  const html = webviewPages.get(id)
+  if (html === undefined) return null
+  // A page with a Content-Security-Policy that allows scripts only by nonce would block ours: give it the same nonce.
+  const nonce = /nonce-([A-Za-z0-9+/=_-]+)/.exec(html)?.[1]
+  const tag = `<script${nonce ? ` nonce="${nonce}"` : ''}>${WEBVIEW_API}</script>`
+  return /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, (m) => m + tag) : tag + html
+}
+
+export function webviewMayRead(file: string): boolean {
+  const norm = (p: string): string => p.split('\\').join('/').toLowerCase().replace(/\/+$/, '')
+  const f = norm(file)
+  const roots = [...records.filter((r) => r.enabled).map((r) => r.dir), ...webviewRoots, ...(currentRoot ? [currentRoot] : [])]
+  return !f.includes('/../') && roots.some((r) => f.startsWith(norm(r) + '/'))
+}
 let nextRun = 1
 let nextReq = 1_000_000
 const provideWaiting = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>()
@@ -583,6 +632,9 @@ async function doStartHost(gen: number): Promise<Host | null> {
       if (p) m.error ? p.reject(new Error(m.error)) : p.resolve(m.result)
     } else if (m.type === 'request' && m.reqId === 0) {
       // Something that needs no answer (a status bar item, a diagnostic, registering a provider...).
+      if (m.method === 'webviewHtml') webviewPages.set(String(m.params?.id), String(m.params?.html ?? ''))
+      if (m.method === 'webviewDispose') webviewPages.delete(String(m.params?.id))
+      if (m.method === 'webviewCreate') for (const r of Array.isArray(m.params?.roots) ? m.params.roots : []) webviewRoots.add(String(r))
       if (m.method === 'clipboardWrite') clipboard?.writeText?.(String(m.params?.text ?? ''))
       else getWinRef()?.webContents.send('ext:request', { reqId: 0, method: m.method, params: m.params })
     } else if (m.type === 'request') {

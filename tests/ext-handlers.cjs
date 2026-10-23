@@ -228,7 +228,7 @@ exports.activate = (context) => {
   vscode.commands.registerCommand('vsc.cfg', () => vscode.window.showInformationMessage('cfg ' + cfg.get('greeting') + ' ' + cfg.get('size') + ' ' + cfg.get('missing', 'dflt') + ' ' + cfg.has('size')))
   context.globalState.update('count', context.globalState.get('count', 0) + 1)
   vscode.commands.registerCommand('vsc.count', () => vscode.window.showInformationMessage('count ' + context.globalState.get('count')))
-  vscode.commands.registerCommand('vsc.web', () => vscode.window.createWebviewPanel('x', 'y', 1, {}))
+  vscode.commands.registerCommand('vsc.web', () => vscode.window.createTerminal('x'))
   vscode.commands.registerCommand('vsc.find', async () => { const files = await vscode.workspace.findFiles('**/*.txt'); vscode.window.showInformationMessage('found ' + files.map((f) => vscode.workspace.asRelativePath(f)).sort().join(',') + ' in ' + vscode.workspace.workspaceFolders[0].name) })
   vscode.commands.registerCommand('vsc.uri', () => { const u = vscode.Uri.file('/a/b c.txt'); vscode.window.showInformationMessage(u.scheme + '|' + u.path + '|' + vscode.Uri.joinPath(u, '..', 'd.txt').path + '|' + vscode.Uri.parse('https://x.org/p?q=1#f').query) })
   vscode.commands.registerCommand('vsc.pos', () => {
@@ -310,7 +310,7 @@ exports.deactivate = () => {}
   run = await runC('dev.vsc', 'vsc.exec')
   check('executeCommand runs other extension commands, and an unknown one is an error', run.ok === false && /no\.such\.command/.test(run.error) && msgs().some((m) => /^cfg /.test(m)), JSON.stringify([run, msgs()]))
   run = await runC('dev.vsc', 'vsc.web')
-  check('something that cannot be provided says so by name instead of failing silently', run.ok === false && /createWebviewPanel is not supported/.test(run.error), JSON.stringify(run))
+  check('something that cannot be provided says so by name instead of failing silently', run.ok === false && /createTerminal is not supported/.test(run.error), JSON.stringify(run))
   const logs = await call('ext:log')
   check('nothing went wrong while the extension started', !logs.some((l) => /failed to start/.test(l)), JSON.stringify(logs.slice(-3)))
   await call('ext:uninstall', 'dev.vsc')

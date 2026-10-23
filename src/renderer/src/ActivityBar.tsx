@@ -50,6 +50,12 @@ export const Icons = {
       <path d="M19 16.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z" />
     </>
   ),
+  views: svg(
+    <>
+      <rect x="3.5" y="4.5" width="17" height="15" rx="1.5" />
+      <path d="M9.5 4.5v15M13 9h4.5M13 13h4.5" />
+    </>
+  ),
   account: svg(
     <>
       <circle cx="12" cy="8.5" r="3.7" />

@@ -8,6 +8,10 @@ import { addRecentFolder, getRecentFolders, loadExtraFolders, loadSession, remov
 import { TerminalPanel, PanelTab, readActiveTerminalText } from './TerminalPanel'
 import { DebugConsoleView, OutputView, ProblemsView } from './PanelViews'
 import { OpenEditors, Outline, Timeline } from './ExplorerSections'
+import { ExtTreeView, ExtWebviewView, treeEvent, treeReset } from './ExtTreeView'
+import { WebviewFrame } from './WebviewFrame'
+import { closeWebview, getActiveWebview, setActiveWebview, useActiveWebview, useWebviewPanels, webviewEvent, webviewReset } from './webviewStore'
+import { useExtensions } from './extStore'
 import { initLanguageServers, notifySaved, releaseGhost, restartLanguageServers, useLspServers } from './lspClient'
 import { APP_CHANNEL, TASKS_CHANNEL, appendOutput as logOutput } from './outputStore'
 import { ApprovalDialog, Approval } from './ApprovalDialog'
@@ -121,7 +125,7 @@ export function App(): JSX.Element {
       setNewTermExtra(null)
     }
   }, [showTerminal])
-  const [sidebarView, setSidebarView] = useState<'files' | 'search' | 'git' | 'agents' | 'debug' | 'ext'>('files')
+  const [sidebarView, setSidebarView] = useState<string>('files') // 'files', 'search', 'git', 'agents', 'debug', 'ext', or xc:<container> for a view container an extension adds
   const [searchFocus, setSearchFocus] = useState(0)
   const showSearch = useCallback((): void => {
     setSidebarView('search')
@@ -186,8 +190,21 @@ export function App(): JSX.Element {
             return registerExtProvider(p as Parameters<typeof registerExtProvider>[0])
           case 'unregisterProvider':
             return unregisterExtProvider(String(p.id))
+          case 'treeView':
+          case 'treeViewGone':
+          case 'treeChanged':
+            return treeEvent(req.method, String(p.viewId), typeof p.handle === 'number' ? p.handle : null)
+          case 'webviewCreate':
+          case 'webviewHtml':
+          case 'webviewTitle':
+          case 'webviewReveal':
+          case 'webviewDispose':
+          case 'webviewPost':
+            return webviewEvent(req.method, p)
           case 'reset':
             clearExtProviders()
+            treeReset()
+            webviewReset()
             return setExtStatus({})
           case 'statusBar':
             return setExtStatus((cur) => {
@@ -567,6 +584,14 @@ export function App(): JSX.Element {
   extraRootsRef.current = extraRoots
   const rootsRef = useRef(roots)
   const lspServers = useLspServers()
+  const webviewPanels = useWebviewPanels()
+  const activeWebview = useActiveWebview()
+  useEffect(() => setActiveWebview(null), [active]) // opening a file leaves an extension's page
+  // Tree views and view containers that extensions add.
+  const extRecords = useExtensions()
+  const extViews = useMemo(() => extRecords.filter((r) => r.enabled).flatMap((r) => r.views.map((v) => ({ ...v, ext: r.id }))), [extRecords])
+  const extContainers = useMemo(() => extRecords.filter((r) => r.enabled).flatMap((r) => r.containers.map((c) => ({ ...c, ext: r.id }))), [extRecords])
+  const customContainerIds = useMemo(() => new Set(extContainers.map((c) => c.id)), [extContainers])
   rootsRef.current = roots
   // Language servers (Go, Python, Rust, C/C++): started when a file of that language is open.
   useEffect(() => {
@@ -2030,6 +2055,9 @@ export function App(): JSX.Element {
       } else if (k === 's') {
         e.preventDefault()
         void save()
+      } else if (k === 'w' && !e.shiftKey && getActiveWebview()) {
+        e.preventDefault()
+        closeWebview(getActiveWebview() as string)
       } else if (k === 'w' && !e.shiftKey) {
         e.preventDefault()
         if (focusRef.current === 'split' && splitRef.current?.active) a.closeSplitTab(splitRef.current.active)
@@ -2111,8 +2139,9 @@ export function App(): JSX.Element {
               { id: 'git', label: 'Source Control', key: 'Ctrl+Shift+G', icon: Icons.git, go: () => { setShowSidebar(true); setSidebarView('git') } },
               { id: 'debug', label: 'Run', key: 'F5', icon: Icons.debug, go: showDebug },
               { id: 'ext', label: 'Extensions', key: '', icon: Icons.ext, go: () => { setShowSidebar(true); setSidebarView('ext') } },
-              { id: 'agents', label: 'Agents', key: '', icon: Icons.agents, go: showAgents }
-            ] as const
+              { id: 'agents', label: 'Agents', key: '', icon: Icons.agents, go: showAgents },
+              ...extContainers.map((c) => ({ id: 'xc:' + c.id, label: c.title, key: '', icon: Icons.views, go: () => { setShowSidebar(true); setSidebarView('xc:' + c.id) } }))
+            ] as { id: string; label: string; key: string; icon: JSX.Element; go: () => void }[]
           ).map((v) => {
             const count = v.id === 'git' ? (git.status.state === 'ok' ? changeCount(git.status) : 0) : v.id === 'agents' ? bgAttention : 0
             const on = sidebarView === v.id && showSidebar
@@ -2145,7 +2174,7 @@ export function App(): JSX.Element {
       <aside className={'sidebar' + (showSidebar ? '' : ' hidden')} aria-label="Side bar">
         <div className="sidebar-header">
           <span className="sidebar-title">
-            {{ files: 'Explorer', search: 'Search', git: 'Source Control', debug: 'Run and Debug', ext: 'Extensions', agents: 'Agents' }[sidebarView]}
+            {({ files: 'Explorer', search: 'Search', git: 'Source Control', debug: 'Run and Debug', ext: 'Extensions', agents: 'Agents' } as Record<string, string>)[sidebarView] ?? extContainers.find((c) => 'xc:' + c.id === sidebarView)?.title ?? ''}
           </span>
           <button className="ghost icon-btn" title="Open Folder…" aria-label="Open Folder" onClick={openFolder}>
             {Icons.folder}
@@ -2211,6 +2240,11 @@ export function App(): JSX.Element {
         {root && (
           <>
             <Outline model={tabs.find((t) => t.path === active)?.model ?? null} onReveal={(line) => active && void openFile(active, line)} />
+            {extViews.filter((v) => !customContainerIds.has(v.container)).map((v) => v.webview ? (
+              <ExtWebviewView key={v.id} viewId={v.id} name={v.name} />
+            ) : (
+              <ExtTreeView key={v.id} viewId={v.id} name={v.name} onOpenFile={(p) => void openFile(p)} />
+            ))}
             <Timeline roots={roots} file={active} refreshKey={`${git.status.branch ?? ''}:${git.status.state === 'ok' ? changeCount(git.status) : 0}:${git.status.ahead ?? 0}`} onOpen={showFileHistory} />
           </>
         )}
@@ -2225,6 +2259,15 @@ export function App(): JSX.Element {
             onReplaced={() => void onWorkspaceTouched()}
           />
         </div>
+        {extContainers.map((c) => (
+          <div key={c.id} className="tree" style={{ display: sidebarView === 'xc:' + c.id ? 'block' : 'none' }} data-ext-container={c.id}>
+            {extViews.filter((v) => v.container === c.id).map((v) => v.webview ? (
+              <ExtWebviewView key={v.id} viewId={v.id} name={v.name} />
+            ) : (
+              <ExtTreeView key={v.id} viewId={v.id} name={v.name} onOpenFile={(p) => void openFile(p)} />
+            ))}
+          </div>
+        ))}
         <div className="tree" style={{ display: sidebarView === 'ext' ? 'block' : 'none' }}>
           <ExtensionsPanel />
         </div>
@@ -2286,6 +2329,7 @@ export function App(): JSX.Element {
               onClick={() => {
                 setActive(t.path)
                 setDiffView(null)
+                setActiveWebview(null)
               }}
               onAuxClick={(e) => {
                 if (e.button === 1) {
@@ -2315,6 +2359,29 @@ export function App(): JSX.Element {
             </div>
           ))}
         </div>
+        {webviewPanels.some((w) => !w.view) && (
+          <div className="tabs webview-tabs" role="tablist" aria-label="Extension pages">
+            {webviewPanels.filter((w) => !w.view).map((w) => (
+              <div
+                key={w.id}
+                className={'tab webview-tab' + (w.id === activeWebview ? ' active' : '')}
+                data-webview-tab={w.id}
+                title={w.title}
+                role="tab"
+                aria-selected={w.id === activeWebview}
+                tabIndex={0}
+                onClick={() => setActiveWebview(w.id)}
+                onKeyDown={(e) => e.key === 'Enter' && setActiveWebview(w.id)}
+                onAuxClick={(e) => e.button === 1 && closeWebview(w.id)}
+              >
+                <span className="tab-name">{w.title}</span>
+                <span className="close" role="button" aria-label={`Close ${w.title}`} title="Close" onClick={(e) => { e.stopPropagation(); closeWebview(w.id) }}>
+                  ×
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
         {active && tabs.length > 0 && <Breadcrumbs root={roots.find((r) => relIfInside(r, active)) ?? root} path={active} onReveal={revealInExplorer} />}
         <div className="editor-wrap">
           <div ref={containerRef} className="editor" />
@@ -2334,6 +2401,13 @@ export function App(): JSX.Element {
               model={tabs.find((t) => t.path === active)!.model}
               onOpenAsText={() => setNbAsText((s) => new Set(s).add(active))}
             />
+          )}
+          {webviewPanels.some((w) => !w.view) && (
+            <div className={'webview-host' + (activeWebview ? ' on' : '')} style={{ visibility: activeWebview ? 'visible' : 'hidden' }}>
+              {webviewPanels.filter((w) => !w.view).map((w) => (
+                <WebviewFrame key={w.id} panel={w} visible={w.id === activeWebview} />
+              ))}
+            </div>
           )}
           {mergeView && <MergeView path={mergeView.path} text={mergeView.text} onComplete={(t) => void completeMerge(t)} onClose={() => setMergeView(null)} />}
           {diffView && (

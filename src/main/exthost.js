@@ -148,6 +148,93 @@ class Hover { constructor(contents, range) { this.contents = Array.isArray(conte
 class CompletionItem { constructor(label, kind) { this.label = label; this.kind = kind } }
 class ThemeColor { constructor(id) { this.id = id } }
 class ThemeIcon { constructor(id) { this.id = id } }
+const TreeItemCollapsibleState = { None: 0, Collapsed: 1, Expanded: 2 }
+class TreeItem {
+  constructor(labelOrUri, collapsibleState) {
+    if (typeof labelOrUri === 'string' || (labelOrUri && typeof labelOrUri === 'object' && 'label' in labelOrUri)) this.label = labelOrUri
+    else { this.resourceUri = labelOrUri; this.label = labelOrUri && labelOrUri.path ? String(labelOrUri.path).split('/').pop() : '' }
+    this.collapsibleState = collapsibleState === undefined ? 0 : collapsibleState
+  }
+}
+
+// ---- tree views: the editor asks for the children of a node, and what to do when one is clicked ----
+// A node keeps its number (its "handle") across refreshes: it is found by the item's id, or by its label below the same parent.
+const treeViews = new Map() // view id -> { provider, byKey: Map<string, number>, keys: Map<number, string>, nodes: Map<number, element>, items: Map<number, TreeItem>, byElement: Map<element, number>, next }
+let vscodeApi = null
+
+// ---- webview panels: an extension's own HTML page, shown as a tab ----
+const webviews = new Map() // id -> { panel, messages: EventEmitter, disposed: EventEmitter, closed }
+let webviewCounter = 1
+const webviewViewProviders = new Map() // view id -> provider (registerWebviewViewProvider)
+const handleFor = (st, key, element) => {
+  let h = st.byKey.get(key)
+  if (h === undefined) { h = st.next++; st.byKey.set(key, h); st.keys.set(h, key) }
+  st.nodes.set(h, element)
+  st.byElement.set(element, h)
+  return h
+}
+const plain = (v) => (v === undefined || v === null ? undefined : typeof v === 'string' ? v : v.value !== undefined ? String(v.value) : v.label !== undefined ? String(v.label) : String(v))
+function serializeItem(item, handle) {
+  const label = item.label && typeof item.label === 'object' ? item.label.label : item.label
+  const icon = item.iconPath
+  return {
+    handle,
+    label: String(label !== undefined ? label : item.resourceUri ? String(item.resourceUri.path).split('/').pop() : ''),
+    description: item.description === true ? '' : plain(item.description),
+    tooltip: plain(item.tooltip),
+    collapsible: item.collapsibleState || 0,
+    codicon: icon && icon.id ? icon.id : undefined,
+    resource: item.resourceUri ? item.resourceUri.fsPath || String(item.resourceUri.path) : undefined,
+    contextValue: item.contextValue,
+    hasCommand: !!(item.command && item.command.command)
+  }
+}
+async function webviewProvide(msg) {
+  if (msg.kind === 'webviewViewResolve') {
+    // The editor shows a sidebar view that an extension fills with a web page: ask the extension for its page.
+    const rec = webviewViewProviders.get(msg.params.viewId)
+    if (!rec) return null
+    const provider = rec.provider
+    const { id, panel } = rec.make(msg.params.viewId, '', {}, msg.params.viewId)
+    let visible = true
+    const view = {
+      webview: panel.webview, viewType: msg.params.viewId, title: undefined, description: undefined, badge: undefined,
+      get visible() { return visible }, show() {}, onDidDispose: panel.onDidDispose, onDidChangeVisibility: panel.onDidChangeViewState
+    }
+    await provider.resolveWebviewView(view, { state: undefined }, new CancellationTokenSource().token)
+    return id
+  }
+  const w = webviews.get(msg.params.id)
+  if (!w) return null
+  if (msg.kind === 'webviewMessage') { w.messages.fire(msg.params.message); return true }
+  if (msg.kind === 'webviewClosed') { w.closed = true; w.panel.dispose(); return true }
+  return null
+}
+async function treeProvide(msg) {
+  const st = treeViews.get(msg.params.viewId)
+  if (!st) return null
+  if (msg.kind === 'treeChildren') {
+    const parent = msg.params.handle == null ? undefined : st.nodes.get(msg.params.handle)
+    if (msg.params.handle != null && parent === undefined) return []
+    const kids = (await st.provider.getChildren(parent)) || []
+    const parentKey = msg.params.handle == null ? '' : st.keys.get(msg.params.handle) || ''
+    const out = []
+    for (const k of kids.slice(0, 2000)) {
+      const item = await st.provider.getTreeItem(k)
+      const label = item.label && typeof item.label === 'object' ? item.label.label : item.label
+      const h = handleFor(st, item.id ? 'id:' + item.id : parentKey + '/' + String(label), k)
+      st.items.set(h, item)
+      out.push(serializeItem(item, h))
+    }
+    return out
+  }
+  if (msg.kind === 'treeAction') {
+    const item = st.items.get(msg.params.handle)
+    if (item && item.command && item.command.command) await vscodeApi.commands.executeCommand(item.command.command, ...(item.command.arguments || []))
+    return true
+  }
+  return null
+}
 
 const lineStarts = (text) => { const s = [0]; for (let i = 0; i < text.length; i++) if (text[i] === '\n') s.push(i + 1); return s }
 
@@ -235,7 +322,7 @@ function makeVscode(ext) {
   const diagnosticsCollections = []
   const vscode = {
     version: '1.85.0',
-    Position, Range, Selection, Uri, Disposable, EventEmitter, CancellationTokenSource, MarkdownString, SnippetString, TextEdit, WorkspaceEdit, Diagnostic, Hover, CompletionItem, ThemeColor, ThemeIcon,
+    Position, Range, Selection, Uri, Disposable, EventEmitter, CancellationTokenSource, MarkdownString, SnippetString, TextEdit, WorkspaceEdit, Diagnostic, Hover, CompletionItem, ThemeColor, ThemeIcon, TreeItem, TreeItemCollapsibleState,
     DiagnosticSeverity: { Error: 0, Warning: 1, Information: 2, Hint: 3 },
     CompletionItemKind: { Text: 0, Method: 1, Function: 2, Constructor: 3, Field: 4, Variable: 5, Class: 6, Interface: 7, Module: 8, Property: 9, Unit: 10, Value: 11, Enum: 12, Keyword: 13, Snippet: 14, Color: 15, File: 16, Reference: 17, Folder: 18, EnumMember: 19, Constant: 20, Struct: 21, Event: 22, Operator: 23, TypeParameter: 24 },
     StatusBarAlignment: { Left: 1, Right: 2 },
@@ -299,10 +386,10 @@ function makeVscode(ext) {
       onDidChangeActiveColorTheme: () => new Disposable(() => {}),
       onDidChangeWindowState: () => new Disposable(() => {}),
       createTextEditorDecorationType: () => ({ key: 'decoration', dispose() {} }),
-      registerTreeDataProvider: () => new Disposable(() => {}),
-      createTreeView: () => ({ dispose() {}, reveal: () => Promise.resolve(), onDidChangeSelection: () => new Disposable(() => {}) }),
-      registerWebviewViewProvider: unsupported('window.registerWebviewViewProvider'),
-      createWebviewPanel: unsupported('window.createWebviewPanel'),
+      registerTreeDataProvider: (viewId, provider) => makeTreeView(viewId, provider, {}).disposable,
+      createTreeView: (viewId, options) => makeTreeView(viewId, options.treeDataProvider, options).view,
+      registerWebviewViewProvider: (viewId, provider) => { webviewViewProviders.set(viewId, { provider, make: makeWebviewPanel }); tell('treeView', { viewId, extId: ext.id }); return new Disposable(() => webviewViewProviders.delete(viewId)) },
+      createWebviewPanel: (viewType, title, showOptions, options) => makeWebviewPanel(viewType, title, options || {}).panel,
       createTerminal: unsupported('window.createTerminal'),
       showOpenDialog: () => Promise.resolve(undefined),
       showSaveDialog: () => Promise.resolve(undefined)
@@ -406,6 +493,71 @@ function makeVscode(ext) {
     tasks: stub('tasks'), debug: stub('debug'), scm: stub('scm'), notebooks: stub('notebooks'), authentication: stub('authentication'), chat: stub('chat'), lm: stub('lm'), l10n: { t: (s) => String(s) }
   }
 
+  vscodeApi = vscode
+  function makeTreeView(viewId, provider, options) {
+    const st = { provider, byKey: new Map(), keys: new Map(), nodes: new Map(), items: new Map(), byElement: new Map(), next: 1 }
+    treeViews.set(viewId, st)
+    const changed = new EventEmitter()
+    let sub = null
+    if (provider.onDidChangeTreeData) {
+      sub = provider.onDidChangeTreeData((el) => {
+        const h = el === undefined || el === null ? null : st.byElement.get(el)
+        tell('treeChanged', { viewId, handle: h === undefined ? null : h })
+      })
+    }
+    tell('treeView', { viewId, extId: ext.id })
+    const disposable = new Disposable(() => {
+      if (sub && sub.dispose) sub.dispose()
+      treeViews.delete(viewId)
+      tell('treeViewGone', { viewId })
+    })
+    const view = {
+      onDidExpandElement: changed.event, onDidCollapseElement: changed.event, onDidChangeSelection: changed.event, onDidChangeVisibility: changed.event,
+      visible: true, selection: [], title: options && options.title, description: undefined, message: undefined,
+      reveal: () => Promise.resolve(), dispose: () => disposable.dispose()
+    }
+    return { view, disposable }
+  }
+
+  function makeWebviewPanel(viewType, title, options, viewId) {
+    const id = ext.id + ':wv:' + webviewCounter++
+    const messages = new EventEmitter()
+    const disposedEvent = new EventEmitter()
+    const stateEvent = new EventEmitter()
+    let html = ''
+    let currentTitle = String(title)
+    let isDisposed = false
+    const roots = [ext.dir, ...((options.localResourceRoots || []).map((u) => u.fsPath || String(u)))]
+    const panel = {
+      viewType, options, viewColumn: 1, active: true, visible: true,
+      get title() { return currentTitle },
+      set title(v) { currentTitle = String(v); tell('webviewTitle', { id, title: currentTitle }) },
+      webview: {
+        get html() { return html },
+        set html(v) { html = String(v); tell('webviewHtml', { id, html }) },
+        options,
+        cspSource: 'vscode-webview-resource:',
+        onDidReceiveMessage: (cb, thisArg, disposables) => messages.event(cb, thisArg, disposables),
+        postMessage: (message) => { tell('webviewPost', { id, message }); return Promise.resolve(true) },
+        asWebviewUri: (uri) => Uri.parse('vscode-webview-resource://w/' + Buffer.from(uri.fsPath || String(uri.path)).toString('base64url') + '/' + path.basename(uri.fsPath || String(uri.path)))
+      },
+      onDidDispose: (cb, thisArg, disposables) => disposedEvent.event(cb, thisArg, disposables),
+      onDidChangeViewState: (cb, thisArg, disposables) => stateEvent.event(cb, thisArg, disposables),
+      reveal() { tell('webviewReveal', { id }) },
+      dispose() {
+        if (isDisposed) return
+        isDisposed = true
+        webviews.delete(id)
+        if (!w.closed) tell('webviewDispose', { id })
+        disposedEvent.fire()
+      }
+    }
+    const w = { panel, messages, closed: false }
+    webviews.set(id, w)
+    tell('webviewCreate', { id, viewType, title: currentTitle, extId: ext.id, roots, view: !!viewId })
+    return { id, panel }
+  }
+
   function showMessage(kind, message, rest) {
     const items = rest.filter((x) => typeof x === 'string' || (x && typeof x === 'object' && typeof x.title === 'string'))
     const labels = items.map((i) => (typeof i === 'string' ? i : i.title))
@@ -441,6 +593,8 @@ function globToRegex(glob) {
 function mapKind(k) { return typeof k === 'number' ? k : 0 }
 
 async function provide(msg) {
+  if (typeof msg.kind === 'string' && msg.kind.startsWith('webview')) return webviewProvide(msg)
+  if (typeof msg.kind === 'string' && msg.kind.startsWith('tree')) return treeProvide(msg)
   const rec = providers.get(msg.providerId)
   if (!rec) return null
   const doc = makeDocument(msg.params.path, msg.params.language, msg.params.text)
