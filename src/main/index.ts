@@ -15,6 +15,7 @@ import { registerDebugHandlers, stopDebugging } from './debugger'
 import { extensionThemes, registerExtensionHandlers, stopExtensions } from './extensions'
 import { registerTaskHandlers } from './tasks'
 import { registerNotebookHandlers, stopAllKernels } from './notebook'
+import { registerLspHandlers, stopAllLanguageServers } from './lsp'
 import * as ssh from './sshfs'
 import { parseJsonc } from './jsonc'
 import { execFile } from 'child_process'
@@ -472,6 +473,7 @@ app.whenReady().then(() => {
   registerExtensionHandlers(() => mainWin)
   registerTaskHandlers()
   registerNotebookHandlers(() => mainWin)
+  registerLspHandlers(() => mainWin)
   ssh.registerSshHandlers()
   createWindow()
   app.on('activate', () => {
@@ -488,5 +490,6 @@ app.on('before-quit', () => {
   stopDebugging()
   stopExtensions()
   stopAllKernels()
+  stopAllLanguageServers()
   ssh.disconnectAll()
 })

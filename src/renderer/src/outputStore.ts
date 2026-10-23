@@ -6,7 +6,7 @@ export const APP_CHANNEL = 'My AI IDE'
 export const TASKS_CHANNEL = 'Tasks'
 
 const MAX_CHARS = 200_000
-let channels: Record<string, string> = { [APP_CHANNEL]: '', [TASKS_CHANNEL]: '' }
+let channels: Record<string, string> = { [APP_CHANNEL]: '', [TASKS_CHANNEL]: '', 'Language Servers': '' }
 const listeners = new Set<() => void>()
 const emit = (): void => {
   channels = { ...channels }

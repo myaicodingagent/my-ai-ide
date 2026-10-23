@@ -142,6 +142,22 @@ const api = {
   sshConnections: (): Promise<{ live: string[]; remembered: unknown[] }> => ipcRenderer.invoke('ssh:connections'),
   nbStart: (kernel: string, cwd: string): Promise<{ ok: true; session: number } | { ok: false; error: string }> => ipcRenderer.invoke('nb:start', kernel, cwd),
   nbExecute: (session: number, cellId: string, code: string): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke('nb:execute', session, cellId, code),
+  lspLanguages: (): Promise<{ language: string; languages: string[]; label: string }[]> => ipcRenderer.invoke('lsp:languages'),
+  lspAvailable: (language: string): Promise<{ ok: true; label: string } | { ok: false; error: string }> => ipcRenderer.invoke('lsp:available', language),
+  lspStart: (language: string, root: string): Promise<{ ok: true; server: string; capabilities: Record<string, unknown>; label: string; realRoot: string } | { ok: false; error: string }> => ipcRenderer.invoke('lsp:start', language, root),
+  lspRequest: (server: string, method: string, params: unknown): Promise<{ ok: true; result: unknown } | { ok: false; error: string }> => ipcRenderer.invoke('lsp:request', server, method, params),
+  lspNotify: (server: string, method: string, params: unknown): Promise<void> => ipcRenderer.invoke('lsp:notify', server, method, params),
+  lspStop: (server: string): Promise<void> => ipcRenderer.invoke('lsp:stop', server),
+  onLspMessage: (cb: (m: { server: string; method: string; params: unknown }) => void): (() => void) => {
+    const h = (_e: unknown, m: { server: string; method: string; params: unknown }): void => cb(m)
+    ipcRenderer.on('lsp:message', h)
+    return () => ipcRenderer.removeListener('lsp:message', h)
+  },
+  onLspExited: (cb: (m: { server: string; code: number | null }) => void): (() => void) => {
+    const h = (_e: unknown, m: { server: string; code: number | null }): void => cb(m)
+    ipcRenderer.on('lsp:exited', h)
+    return () => ipcRenderer.removeListener('lsp:exited', h)
+  },
   nbStop: (session: number): Promise<void> => ipcRenderer.invoke('nb:stop', session),
   nbInput: (session: number, value: string | null): Promise<void> => ipcRenderer.invoke('nb:input', session, value),
   onNbEvent: (cb: (session: number, cell: string | null, ev: NbEvent) => void): (() => void) => {

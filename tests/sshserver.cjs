@@ -8,6 +8,7 @@ const { OPEN_MODE, STATUS_CODE, flagsToString } = utils.sftp
 const hostKey = crypto.generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { type: 'pkcs1', format: 'pem' }, publicKeyEncoding: { type: 'pkcs1', format: 'pem' } }).privateKey
 const local = (p) => path.join(remoteRoot, ...String(p).split('/').filter((s) => s && s !== '..'))
 const attrsOf = (st) => ({ mode: st.mode, uid: 0, gid: 0, size: st.size, atime: Math.floor(st.atimeMs / 1000), mtime: Math.floor(st.mtimeMs / 1000) })
+const children = new Set()
 const server = new Server({ hostKeys: [hostKey] }, (client) => {
   client.on('authentication', (ctx) => { if (ctx.method === 'password' && ctx.username === 'tester' && ctx.password === 'secret') ctx.accept(); else ctx.reject(['password']) })
   client.on('error', () => undefined)
@@ -21,6 +22,7 @@ const server = new Server({ hostKeys: [hostKey] }, (client) => {
         if (!m) { stream.stderr.write('bad command'); stream.exit(2); return stream.end() }
         const cwd = local(m[1])
         const child = require('child_process').spawn('bash', ['-c', m[2]], { cwd })
+        children.add(child); child.on('close', () => children.delete(child))
         const roots = [remoteRoot, fs.realpathSync.native(remoteRoot)].map((r) => r.split(require('path').sep).join('/'))
         const fix = (d) => Buffer.from(roots.reduce((s, r) => s.split(r).join(''), d.toString('utf-8')))
         child.stdout.on('data', (d) => stream.write(fix(d)))
@@ -54,5 +56,11 @@ const server = new Server({ hostKeys: [hostKey] }, (client) => {
   })
 })
 
+  // Commands the server started (git, sh) must not outlive it: they would keep the temporary folder from being deleted.
+  const origClose = server.close.bind(server)
+  server.close = (...a) => {
+    for (const c of children) { try { require('child_process').execSync('taskkill /F /T /PID ' + c.pid, { stdio: 'ignore' }) } catch { /* already gone */ } }
+    return origClose(...a)
+  }
   return server
 }

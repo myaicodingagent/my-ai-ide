@@ -8,6 +8,7 @@ import { addRecentFolder, getRecentFolders, loadExtraFolders, loadSession, remov
 import { TerminalPanel, PanelTab, readActiveTerminalText } from './TerminalPanel'
 import { DebugConsoleView, OutputView, ProblemsView } from './PanelViews'
 import { OpenEditors, Outline, Timeline } from './ExplorerSections'
+import { initLanguageServers, notifySaved, releaseGhost, restartLanguageServers, useLspServers } from './lspClient'
 import { APP_CHANNEL, TASKS_CHANNEL, appendOutput as logOutput } from './outputStore'
 import { ApprovalDialog, Approval } from './ApprovalDialog'
 import { QuickPick, PickItem } from './QuickPick'
@@ -565,7 +566,12 @@ export function App(): JSX.Element {
   const extraRootsRef = useRef(extraRoots)
   extraRootsRef.current = extraRoots
   const rootsRef = useRef(roots)
+  const lspServers = useLspServers()
   rootsRef.current = roots
+  // Language servers (Go, Python, Rust, C/C++): started when a file of that language is open.
+  useEffect(() => {
+    initLanguageServers({ getRoots: () => rootsRef.current, openFile: (p, line) => void openFileRef.current(p, line), notify: showToast })
+  }, [showToast])
   const sessionReadyFor = useRef<string | null>(null) // the folder whose saved tabs have been restored
   const shownModel = useRef<monaco.editor.ITextModel | null>(null)
   const [modelTick, setModelTick] = useState(0)
@@ -848,6 +854,7 @@ export function App(): JSX.Element {
       programmatic.current.delete(tab.path)
     }
     diskText.current.set(tab.path, text)
+    notifySaved(tab.model)
     setTabs((ts) => ts.map((t) => (t.path === tab.path ? { ...t, dirty: false } : t)))
   }, [])
 
@@ -865,6 +872,7 @@ export function App(): JSX.Element {
         pending = (async () => {
           const content = await window.api.readFile(path)
           diskText.current.set(path, content)
+          releaseGhost(path) // a stand-in model made for a peek view gives way to the real one
           const model = monaco.editor.createModel(content, undefined, monaco.Uri.file(path))
           model.onDidChangeContent(() => {
             if (programmatic.current.has(path)) return
@@ -1730,6 +1738,7 @@ export function App(): JSX.Element {
       { label: 'Search: Find in Files (Ctrl+Shift+F)', run: showSearch },
       { label: 'View: Toggle Terminal', run: toggleTerminal },
       { label: 'View: Show Output', run: () => showPanelTab('output') },
+      { label: 'Language Servers: Restart', run: () => void restartLanguageServers() },
       { label: 'View: Show Debug Console', run: () => showPanelTab('debug') },
       { label: 'Terminal: New Terminal (Ctrl+Shift+`)', run: () => newTerminal() },
       {
@@ -2455,6 +2464,11 @@ export function App(): JSX.Element {
         )}
         {tabs.length > 0 && (
           <span className="sb-item">{tabs.find((t) => t.path === active)?.model.getLanguageId()}</span>
+        )}
+        {lspServers.length > 0 && (
+          <span className="sb-item" data-sb="lsp" title={lspServers.map((s) => `${s.label}: ${s.root}`).join('\n')}>
+            {lspServers.map((s) => s.label.replace(/ \(.*\)$/, '')).join(', ')}
+          </span>
         )}
         <button
           className="sb-item sb-btn"

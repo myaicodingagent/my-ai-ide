@@ -1,5 +1,6 @@
 import { ReactNode, useEffect, useState } from 'react'
 import { monaco } from './monaco-setup'
+import { expectsServer, outlineSymbols } from './lspClient'
 
 const baseName = (p: string): string => p.split(/[\\/]/).pop() ?? p
 const dirName = (p: string): string => {
@@ -183,19 +184,24 @@ export function Outline({ model, onReveal }: { model: monaco.editor.ITextModel |
     const compute = async (): Promise<void> => {
       if (gone()) return
       try {
-        let list: Sym[] = []
-        try {
-          const lang = model.getLanguageId()
-          list = lang === 'typescript' || lang === 'javascript' ? await tsSymbols(model) : patternSymbols(model)
-        } catch {
-          list = []
+        let list: Sym[] = (await outlineSymbols(model).catch(() => null)) ?? [] // a language server, when there is one
+        const fromServer = list.length > 0
+        if (gone()) return
+        if (!list.length) {
+          try {
+            const lang = model.getLanguageId()
+            list = lang === 'typescript' || lang === 'javascript' ? await tsSymbols(model) : patternSymbols(model)
+          } catch {
+            list = []
+          }
         }
         if (gone()) return
         // The language service may not know the file yet (or is not up): the declarations found by pattern are better than nothing.
         if (!list.length) list = patternSymbols(model)
         setSyms(list)
         setNote(list.length ? '' : 'No symbols were found in this file.')
-        if (!list.length && retries++ < 3) timer = setTimeout(() => void compute(), 2500)
+        // Nothing yet, or only the pattern guess while a language server is still starting: look again shortly.
+        if ((!list.length || (!fromServer && expectsServer(model))) && retries++ < (expectsServer(model) ? 12 : 3)) timer = setTimeout(() => void compute(), 2500)
       } catch {
         // the model went away while it was being read
       }
