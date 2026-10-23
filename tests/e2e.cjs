@@ -718,11 +718,12 @@ function removeTestHistory() {
     await openFromTree('bad.ts')
     check('a syntax error is counted in the status bar', await waitFor(async () => !(await problemCounts()).includes('⊗ 0'), 'problem counted', 20000), await problemCounts())
     await c.ev(`document.querySelector('[data-sb="problems"]').click()`)
-    const problemItems = await waitFor(() => c.ev(`[...document.querySelectorAll('.qp-item')].map(i => i.textContent)`).then((r) => r.length && r), 'problems list')
-    check('clicking the count lists the problem with its file and line', problemItems.some((t) => t.includes('bad.ts:1')), JSON.stringify(problemItems))
+    const problemItems = await waitFor(() => c.ev(`[...document.querySelectorAll('[data-problem-row]')].map((r) => r.closest('[role="listitem"]').querySelector('.pv-file').textContent + ' ' + r.textContent)`).then((r) => r.length && r), 'problems list')
+    check('clicking the count shows the Problems tab of the bottom panel with the problem, its file and line', problemItems.some((t) => t.includes('bad.ts') && t.includes('[1,')) && (await c.ev(`document.querySelector('[data-panel-tab="problems"]').getAttribute('aria-selected')`)) === 'true', JSON.stringify(problemItems))
     await openFromTree('plain.txt')
-    await c.ev(`document.querySelector('.qp-item').click()`)
-    check('choosing a problem opens the file at that line', await waitFor(async () => (await activeTab()) === 'bad.ts', 'jumped to problem'))
+    await c.ev(`document.querySelector('[data-problem-row]').click()`)
+    check('clicking a problem opens the file at that line', await waitFor(async () => (await activeTab()) === 'bad.ts', 'jumped to problem'))
+    await c.ev(`[...document.querySelectorAll('.term-btn')].find((b) => b.textContent === 'Hide').click()`)
 
     // Sidebar, zoom, palette editor commands
     await ctrl('b')
@@ -1062,6 +1063,7 @@ function removeTestHistory() {
     // ---- Next edit suggestions ----
     if ((await tabNames()).length) { await rightClick('.tab'); await clickMenu('Close All') }
     await setSetting('autocomplete', false) // ghost text would take the Tab key first
+    await setSetting('nextEdit', true) // off by default: each suggestion uses a request from the plan
     const edTextNow = () => c.ev(`(document.querySelector('.group-main .view-lines')?.textContent || document.querySelector('.monaco-editor .view-lines')?.textContent || '').replace(/ /g, ' ')`)
     fs.writeFileSync(path.join(PROJ, 'nextedit.ts'), 'const alpha = 1\nconst beta = 2\nconst gamma = 3\nconst delta = 4\n')
     await waitFor(() => c.ev(`!!document.querySelector('.tree-row[data-tree-path$="nextedit.ts"]')`), 'nextedit.ts in tree', 10000)
@@ -1737,9 +1739,13 @@ function removeTestHistory() {
     await openFromTree('merge3.txt')
     await waitFor(() => c.ev(`[...document.querySelectorAll('.monaco-editor .codelens-decoration a')].some(a => a.textContent === 'Open Merge Editor')`), 'open merge editor link', 15000)
     await c.ev(`window.__alerts = []; window.__mergeEvents = 0; window.addEventListener('myaiide-open-merge', () => { window.__mergeEvents++ })`)
+    await c.ev(`(() => { const s = document.createElement('style'); s.textContent = '.monaco-editor .minimap { display: none !important }'; document.head.appendChild(s) })()`) // the narrower editor (activity bar) would put the link under the minimap
+    await c.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'l', ctrlKey: true, bubbles: true }))`) // hide the chat panel: with it open the editor is too narrow to show all four links
+    await new Promise((r) => setTimeout(r, 700)) // let the editor lay out again before measuring the link
     const lensBox2 = await c.ev(`(() => { const r = [...document.querySelectorAll('.monaco-editor .codelens-decoration a')].find(a => a.textContent === 'Open Merge Editor').getBoundingClientRect(); return { x: r.x + 6, y: r.y + r.height / 2 } })()`)
     for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) await c.send('Input.dispatchMouseEvent', { type, x: lensBox2.x, y: lensBox2.y, button: 'left', clickCount: 1 })
-    check('the link above a conflict in the editor opens the merge editor too', await waitFor(() => c.ev(`!!document.querySelector('[data-merge-view]')`), 'merge editor from link').catch(async (e) => { console.log('DIAG2', JSON.stringify(await c.ev(`[window.__alerts, window.__mergeEvents, document.querySelector('[data-diff-view]') ? 'diff' : '', [...document.querySelectorAll('.codelens-decoration a')].map(a => a.textContent), !!document.querySelector('[data-merge-view]')]`))); return false }))
+    check('the link above a conflict in the editor opens the merge editor too', await waitFor(() => c.ev(`!!document.querySelector('[data-merge-view]')`), 'merge editor from link').catch(async (e) => { console.log('DIAG3', JSON.stringify(await c.ev(`(() => { const e = document.elementFromPoint(${lensBox2.x}, ${lensBox2.y}); return [${lensBox2.x}, ${lensBox2.y}, e ? e.tagName + '.' + e.className + ' ' + (e.textContent || '').slice(0, 40) : null] })()`))); console.log('DIAG2', JSON.stringify(await c.ev(`[window.__alerts, window.__mergeEvents, document.querySelector('[data-diff-view]') ? 'diff' : '', [...document.querySelectorAll('.codelens-decoration a')].map(a => a.textContent), !!document.querySelector('[data-merge-view]')]`))); return false }))
+    await c.ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'l', ctrlKey: true, bubbles: true }))`) // chat panel back
     await c.ev(`document.querySelector('[data-merge-action="close"]').click()`)
     check('Close leaves the file as it was', await waitFor(() => c.ev(`!document.querySelector('[data-merge-view]')`), 'closed') && fs.readFileSync(path.join(PROJ, 'merge3.txt'), 'utf8').includes('<<<<<<<'))
     await rightClick('.tab'); await clickMenu('Close All')
@@ -1948,7 +1954,7 @@ function removeTestHistory() {
 
     // ---- Folder over SSH (against an SSH server in this process) ----
     const sshRoot = path.join(os.tmpdir(), 'e2e-ssh-' + process.pid)
-    fs.rmSync(sshRoot, { recursive: true, force: true })
+    fs.rmSync(sshRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 300 })
     fs.mkdirSync(path.join(sshRoot, 'home', 'tester', 'proj', 'sub'), { recursive: true })
     fs.writeFileSync(path.join(sshRoot, 'home', 'tester', 'proj', 'remote.ts'), 'export const remote = 1\n')
     fs.writeFileSync(path.join(sshRoot, 'home', 'tester', 'proj', 'sub', 'deep.txt'), 'a needle-in-the-remote here\n')
@@ -1980,7 +1986,7 @@ function removeTestHistory() {
     await typeInput('.search-box input', 'needle-in-the-remote')
     check('Find in files searches the other computer', await waitFor(() => c.ev(`[...document.querySelectorAll('.search-hit')].some(h => /needle-in-the-remote/.test(h.textContent))`), 'remote search', 15000))
     await c.ev(`document.querySelector('[data-view="git"]').click()`)
-    check('Source Control says it is not available there instead of failing', await waitFor(() => c.ev(`/over SSH/.test(document.querySelector('.sidebar')?.textContent || '')`), 'git remote message'))
+    check('Source Control works over SSH: it asks git on the other computer and finds no repository there', await waitFor(() => c.ev(`/Initialize|not a git repository|repository/i.test(document.querySelector('.sidebar')?.textContent || '') && !/not available/i.test(document.querySelector('.sidebar')?.textContent || '')`), 'git over ssh'))
     await c.ev(`document.querySelectorAll('.sidebar-views button')[0].click()`)
     await waitFor(() => c.ev(`!!document.querySelector('.tree-row[data-tree-path$="remote.ts"]')`), 'remote.ts in the tree again')
     await rightClick('.tree-row[data-tree-path$="remote.ts"]')
@@ -1996,7 +2002,7 @@ function removeTestHistory() {
     check('the local project folder is still there to go back to', back === true)
     await c.ev(`window.api.sshDisconnect('127-0-0-1')`)
     sshServer.close()
-    fs.rmSync(sshRoot, { recursive: true, force: true })
+    fs.rmSync(sshRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 300 }) // a git command run over SSH may still be closing
 
     check('no uncaught renderer errors', c.errors.length === 0, c.errors.slice(0, 3).join(' | '))
   } catch (e) {

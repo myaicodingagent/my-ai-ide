@@ -3,8 +3,7 @@ import { promises as fs } from 'fs'
 import { ChildProcess, fork } from 'child_process'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'path'
 import AdmZip from 'adm-zip'
-import Anthropic from '@anthropic-ai/sdk'
-import { loadKey } from './ai'
+import * as llm from './llm'
 import { parseJsonc } from './jsonc'
 import { isRemotePath } from './sshfs'
 import HOST_SOURCE from './exthost.js?raw'
@@ -460,17 +459,8 @@ function stopHost(): void {
 }
 
 async function aiAsk(prompt: string): Promise<string> {
-  const apiKey = await loadKey()
-  if (!apiKey) throw new Error('No API key set.')
-  const res = await new Anthropic({ apiKey }).messages.create({
-    model: 'claude-haiku-5-5',
-    max_tokens: 1500,
-    thinking: { type: 'disabled' },
-    output_config: { effort: 'low' },
-    messages: [{ role: 'user', content: prompt.slice(0, 40_000) }]
-  })
-  const block = res.content.find((b) => b.type === 'text')
-  return block && block.type === 'text' ? block.text : ''
+  if (!(await llm.ready())) throw new Error(llm.notReady)
+  return llm.text({ prompt: prompt.slice(0, 40_000), maxTokens: 1500 })
 }
 
 async function hostRequest(method: string, params: any): Promise<unknown> {

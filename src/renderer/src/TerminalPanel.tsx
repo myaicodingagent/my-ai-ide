@@ -172,9 +172,23 @@ interface Tab {
 
 const MIN_HEIGHT = 120
 
+export type PanelTab = 'problems' | 'output' | 'debug' | 'terminal'
+const PANEL_TABS: { id: PanelTab; label: string }[] = [
+  { id: 'problems', label: 'Problems' },
+  { id: 'output', label: 'Output' },
+  { id: 'debug', label: 'Debug Console' },
+  { id: 'terminal', label: 'Terminal' }
+]
+
+// The bottom panel: Problems, Output, Debug Console and Terminal. The terminals stay mounted (and running) whichever
+// tab is showing; the other tabs' contents come in as children.
 export function TerminalPanel({
   cwd,
   visible,
+  panelTab,
+  onPanelTab,
+  problemCount,
+  children,
   newTabSignal,
   newTabShell,
   newTabExtra,
@@ -183,6 +197,10 @@ export function TerminalPanel({
 }: {
   cwd: string | null
   visible: boolean
+  panelTab: PanelTab
+  onPanelTab: (tab: PanelTab) => void
+  problemCount: number
+  children?: React.ReactNode
   // Changes when something asks for one more terminal (Ctrl+Shift+`, palette).
   newTabSignal: number
   // Which shell the requested terminal uses (a shell id, or ssh:user@host); the default one if null.
@@ -228,14 +246,14 @@ export function TerminalPanel({
   // Showing the panel while it has no terminals starts one. This only reacts to the panel being shown:
   // closing the last tab must not start a new terminal while the panel is still on its way to hiding.
   useEffect(() => {
-    if (!visible || tabsRef.current.length > 0 || creating.current) return
+    if (!visible || panelTab !== 'terminal' || tabsRef.current.length > 0 || creating.current) return
     creating.current = true
     // If the panel was opened by a request for a particular shell (an SSH session), that is the one to start.
     void addTab(newTabShell ?? undefined, newTabExtra).finally(() => {
       creating.current = false
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visible, addTab])
+  }, [visible, panelTab, addTab])
 
   // A request for one more terminal (shortcut or palette).
   useEffect(() => {
@@ -280,7 +298,23 @@ export function TerminalPanel({
   return (
     <div className="terminal-panel" role="region" aria-label="Terminal" style={{ display: visible ? 'flex' : 'none', height }}>
       <div className="term-resize" onMouseDown={startDrag} title="Drag to resize" />
-      <div className="term-tabs" role="tablist" aria-label="Terminals">
+      <div className="term-tabs">
+        <div className="panel-tabs" role="tablist" aria-label="Panel">
+          {PANEL_TABS.map((p) => (
+            <button
+              key={p.id}
+              role="tab"
+              aria-selected={panelTab === p.id}
+              className={'panel-tab' + (panelTab === p.id ? ' on' : '')}
+              data-panel-tab={p.id}
+              onClick={() => onPanelTab(p.id)}
+            >
+              {p.label}
+              {p.id === 'problems' && problemCount > 0 && <span className="badge">{problemCount}</span>}
+            </button>
+          ))}
+        </div>
+        <div className="term-tablist" role="tablist" aria-label="Terminals" style={{ display: panelTab === 'terminal' ? 'flex' : 'none' }}>
         {tabs.map((t) => (
           <div
             key={t.key}
@@ -318,6 +352,7 @@ export function TerminalPanel({
         <button className="term-btn term-shells" title="Choose a shell" onClick={() => setMenuOpen((v) => !v)}>
           ▾
         </button>
+        </div>
         {menuOpen && (
           <>
             <div className="term-menu-backdrop" onMouseDown={() => setMenuOpen(false)} />
@@ -340,11 +375,12 @@ export function TerminalPanel({
           </>
         )}
         <span className="term-spacer" />
-        <button className="term-btn" title="Hide the terminal panel (Ctrl+`)" onClick={onHide}>
+        <button className="term-btn" title="Hide the panel (Ctrl+`)" onClick={onHide}>
           Hide
         </button>
       </div>
-      <div className="term-views">
+      {panelTab !== 'terminal' && <div className="panel-body">{children}</div>}
+      <div className="term-views" style={{ display: panelTab === 'terminal' ? undefined : 'none' }}>
         {tabs.map((t) => (
           <div key={t.key} className="term-view" style={{ display: t.key === active ? 'block' : 'none' }}>
             <TerminalView
@@ -352,7 +388,7 @@ export function TerminalPanel({
               shellId={t.shellId}
               cwd={t.cwd}
               command={t.command}
-              active={visible && t.key === active}
+              active={visible && panelTab === 'terminal' && t.key === active}
               onExit={() => closeTab(t.key)}
             />
           </div>

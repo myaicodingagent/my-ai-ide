@@ -2,8 +2,8 @@ import { ipcMain, shell } from 'electron'
 import { isAbsolute, join, relative, resolve } from 'path'
 import { promises as fs, realpathSync } from 'fs'
 import { spawn } from 'child_process'
-import Anthropic from '@anthropic-ai/sdk'
-import { loadKey } from './ai'
+import * as llm from './llm'
+import * as ssh from './sshfs'
 import { isRemotePath } from './sshfs'
 
 // Everything here shells out to the user's own `git`, so it behaves exactly like git in a terminal.
@@ -18,7 +18,14 @@ const MAX_OUTPUT = 8_000_000
 const MAX_DIFF_FILE = 1_000_000
 
 export function runGit(cwd: string, args: string[], opts: { input?: string; timeout?: number } = {}): Promise<GitResult> {
-  if (isRemotePath(cwd)) return Promise.resolve({ code: -2, stdout: '', stderr: 'Git is not available for folders opened over SSH yet.' })
+  if (isRemotePath(cwd)) {
+    // On the other computer: the same git, run over the SSH connection.
+    return ssh.exec(cwd, ['git', '-c', 'core.quotepath=false', ...args], {
+      input: opts.input,
+      timeout: opts.timeout,
+      env: { GIT_TERMINAL_PROMPT: '0', GIT_EDITOR: 'true', LC_ALL: 'C', GIT_OPTIONAL_LOCKS: '0' }
+    }).then((r) => (r.code === 127 ? { ...r, stderr: 'git is not installed on the remote computer' } : r))
+  }
   return new Promise((resolveResult) => {
     let child
     try {
@@ -109,13 +116,16 @@ export interface GitStatus {
 
 async function topLevel(root: string): Promise<{ top: string } | { error: string; nogit: boolean }> {
   const r = await runGit(root, ['rev-parse', '--show-toplevel'])
-  if (r.code === 0) return { top: resolve(r.stdout.trim()) }
+  if (r.code === 0) {
+    const top = r.stdout.trim()
+    const remote = ssh.parseRemote(root)
+    return { top: remote ? ssh.remoteUnc(remote.name, top) : resolve(top) }
+  }
   if (r.code === -1) return { error: r.stderr, nogit: true }
   return { error: r.stderr.trim(), nogit: false }
 }
 
 async function status(root: string): Promise<GitStatus> {
-  if (isRemotePath(root)) return { state: 'remote', error: 'Git is not available for folders opened over SSH yet.', files: [] }
   const t = await topLevel(root)
   if ('error' in t) {
     const unsafe = /dubious ownership in repository at '([^']+)'/.exec(t.error)?.[1]
@@ -142,7 +152,7 @@ async function status(root: string): Promise<GitStatus> {
   // case, so compare against its real path, but hand back paths built from the folder as given.
   let realRoot = root
   try {
-    realRoot = realpathSync.native(root)
+    if (!isRemotePath(root)) realRoot = realpathSync.native(root)
   } catch {
     // Fall back to the path as given.
   }
@@ -202,10 +212,11 @@ async function diffSides(
     return { original, modified }
   }
   const original = await fileAt(root, `:${rel}`) // index; empty for a new file
-  const stat = await fs.stat(abs).catch(() => null)
-  if (!stat) return { original, modified: '' } // deleted in the working tree
-  if (stat.size > MAX_DIFF_FILE) return { error: 'This file is too large to show a diff.' }
-  const modified = await fs.readFile(abs, 'utf-8')
+  const remote = isRemotePath(root)
+  const size = remote ? await ssh.statSize(abs).catch(() => null) : (await fs.stat(abs).catch(() => null))?.size ?? null
+  if (size === null) return { original, modified: '' } // deleted in the working tree
+  if (size > MAX_DIFF_FILE) return { error: 'This file is too large to show a diff.' }
+  const modified = remote ? await ssh.readFile(abs) : await fs.readFile(abs, 'utf-8')
   if (modified.slice(0, 1000).includes('\u0000')) return { error: 'This is a binary file.' }
   return { original, modified }
 }
@@ -263,7 +274,8 @@ export function registerGitHandlers(): void {
     }
     for (const rel of safeRels(root, untracked)) {
       const abs = resolve(root, rel)
-      if (process.env.MY_AI_IDE_NO_TRASH) await fs.rm(abs, { recursive: true, force: true }) // tests only
+      if (isRemotePath(abs)) await ssh.remove(abs).catch(() => undefined) // a server has no Recycle Bin
+      else if (process.env.MY_AI_IDE_NO_TRASH) await fs.rm(abs, { recursive: true, force: true }) // tests only
       else await shell.trashItem(abs).catch(() => undefined)
     }
     return { ok: true as const }
@@ -425,24 +437,19 @@ export function registerGitHandlers(): void {
       runGit(root, ['diff', '--cached', '--stat', '--no-color'])
     ])
     if (!diff.stdout.trim()) return { ok: false as const, error: 'Nothing is staged, so there is nothing to describe.' }
-    const apiKey = await loadKey()
-    if (!apiKey) return { ok: false as const, error: 'No API key set. Add one in the Chat tab.' }
-    const MAX = 60_000
+    if (!(await llm.ready())) return { ok: false as const, error: llm.notReady }
+    const MAX = 14_000 // the service takes one question of about 20,000 characters
     const body = diff.stdout.length > MAX ? diff.stdout.slice(0, MAX) + '\n[diff truncated]' : diff.stdout
     try {
-      const res = await new Anthropic({ apiKey }).messages.create({
-        model: 'claude-haiku-5-5',
-        max_tokens: 400,
-        thinking: { type: 'disabled' },
-        output_config: { effort: 'low' },
+      const raw = await llm.text({
+        maxTokens: 400,
         system:
           'You write git commit messages. Reply with ONLY the message: a subject line in the imperative mood of at most 72 characters, ' +
           'then, only if the change really needs it, a blank line and a short body. No quotes, no markdown fences, no preamble. ' +
           'Do not include internal or system XML tags in your response.',
-        messages: [{ role: 'user', content: `Files changed:\n${stat.stdout}\nDiff:\n${body}` }]
+        prompt: `Files changed:\n${stat.stdout}\nDiff:\n${body}`
       })
-      const block = res.content.find((b) => b.type === 'text')
-      const text = block && block.type === 'text' ? block.text.replace(/^```\w*\n?|\n?```$/g, '').trim() : ''
+      const text = raw.replace(/^```\w*\n?|\n?```$/g, '').trim()
       return text ? { ok: true as const, message: text } : { ok: false as const, error: 'The model returned nothing.' }
     } catch (e) {
       return { ok: false as const, error: e instanceof Error ? e.message : String(e) }

@@ -1,6 +1,9 @@
 import { ChildProcess, spawn } from 'child_process'
 import { existsSync, realpathSync } from 'fs'
-import { dirname } from 'path'
+import { createServer, connect as tcpConnect } from 'net'
+import { Readable, Writable } from 'stream'
+import { homedir } from 'os'
+import { delimiter, dirname, join } from 'path'
 import type { DbgBreakpoint, DbgEvent, DbgFrame, DbgScope, DbgVar } from './debugger'
 import { findPython, hasDebugpy } from './pythonenv'
 
@@ -16,9 +19,10 @@ class Dap {
   private listeners = new Map<string, ((body: any) => void)[]>()
   closed = false
 
-  constructor(readonly child: ChildProcess) {
-    child.stdout?.on('data', (b: Buffer) => this.feed(b))
-    child.on('close', () => {
+  // The adapter is reached over a pair of streams: its stdin/stdout, or a TCP socket.
+  constructor(private readonly io: { input: Readable; output: Writable }, closeOn: { once(event: 'close', cb: () => void): unknown }) {
+    io.input.on('data', (b: Buffer) => this.feed(b))
+    closeOn.once('close', () => {
       this.closed = true
       for (const p of this.pending.values()) p.reject(new Error('The debugger stopped.'))
       this.pending.clear()
@@ -61,7 +65,7 @@ class Dap {
 
   private write(obj: Json): void {
     const body = Buffer.from(JSON.stringify(obj), 'utf-8')
-    this.child.stdin?.write(Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, 'ascii'), body]))
+    this.io.output.write(Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, 'ascii'), body]))
   }
 
   request<T = any>(command: string, args: Json = {}): Promise<T> {
@@ -111,22 +115,164 @@ const toVar = (v: Json): DbgVar => ({
 
 export const DEBUGPY_HELP = 'Python debugging needs the "debugpy" package. Install it by running:  py -3 -m pip install debugpy  (or: python -m pip install debugpy)'
 
-/** Starts a Python program under debugpy. Resolves when it is running (breakpoints set), rejects with a readable message. */
-export async function startPythonDebug(
-  opts: { file: string; args?: string[]; cwd?: string; env?: Record<string, string>; stopOnEntry?: boolean; breakpoints: Record<string, DbgBreakpoint[]> },
-  emit: (e: DbgEvent) => void
-): Promise<DapSession> {
-  if (!existsSync(opts.file)) throw new Error(`The file does not exist: ${opts.file}`)
-  const py = await findPython()
-  if (!py) throw new Error('Python 3 was not found. Install it from python.org (tick "Add to PATH").')
-  if (!(await hasDebugpy(py))) throw new Error(DEBUGPY_HELP)
-  const env: NodeJS.ProcessEnv = { ...process.env, PYTHONIOENCODING: 'utf-8' }
+export interface DebugOptions {
+  file: string
+  args?: string[]
+  cwd?: string
+  env?: Record<string, string>
+  stopOnEntry?: boolean
+  breakpoints: Record<string, DbgBreakpoint[]>
+}
+
+// A debug adapter for one language: how to start it, and what to send in the launch request.
+interface Adapter {
+  id: string
+  label: string
+  files: RegExp // the files whose breakpoints belong to this adapter
+  start(opts: DebugOptions, emit: (e: DbgEvent) => void): Promise<{ child: ChildProcess; io: { input: Readable; output: Writable }; launch: Json; stderr: () => string }>
+}
+
+const cleanEnv = (): NodeJS.ProcessEnv => {
+  const env: NodeJS.ProcessEnv = { ...process.env }
   delete env.ANTHROPIC_API_KEY
   delete env.ANTHROPIC_AUTH_TOKEN
-  const child = spawn(py.file, [...py.args, '-m', 'debugpy.adapter'], { cwd: opts.cwd || dirname(opts.file), env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
-  const dap = new Dap(child)
-  let stderr = ''
-  child.stderr?.on('data', (b: Buffer) => (stderr = (stderr + b.toString('utf-8')).slice(-2000)))
+  return env
+}
+
+const pythonAdapter: Adapter = {
+  id: 'python',
+  label: 'Python',
+  files: /\.pyw?$/i,
+  async start(opts) {
+    const py = await findPython()
+    if (!py) throw new Error('Python 3 was not found. Install it from python.org (tick "Add to PATH").')
+    if (!(await hasDebugpy(py))) throw new Error(DEBUGPY_HELP)
+    const env = { ...cleanEnv(), PYTHONIOENCODING: 'utf-8' }
+    const child = spawn(py.file, [...py.args, '-m', 'debugpy.adapter'], { cwd: opts.cwd || dirname(opts.file), env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+    let stderr = ''
+    child.stderr?.on('data', (b: Buffer) => (stderr = (stderr + b.toString('utf-8')).slice(-2000)))
+    return {
+      child,
+      io: { input: child.stdout!, output: child.stdin! },
+      stderr: () => stderr,
+      launch: {
+        name: 'Python',
+        type: 'python',
+        request: 'launch',
+        program: opts.file,
+        args: opts.args ?? [],
+        cwd: opts.cwd || dirname(opts.file),
+        env: opts.env ?? {},
+        python: py.executable,
+        console: 'internalConsole',
+        redirectOutput: true,
+        justMyCode: true,
+        stopOnEntry: opts.stopOnEntry === true
+      }
+    }
+  }
+}
+
+export const DELVE_HELP = 'Go debugging needs Delve. Install it by running:  go install github.com/go-delve/delve/cmd/dlv@latest'
+
+function findDelve(): string | null {
+  const exe = process.platform === 'win32' ? 'dlv.exe' : 'dlv'
+  const dirs = (process.env.PATH ?? process.env.Path ?? '').split(delimiter)
+  dirs.push(join(process.env.GOPATH || join(homedir(), 'go'), 'bin'))
+  for (const d of dirs) if (d && existsSync(join(d, exe))) return join(d, exe)
+  return null
+}
+
+const freePort = (): Promise<number> =>
+  new Promise((resolve, reject) => {
+    const s = createServer()
+    s.once('error', reject)
+    s.listen(0, '127.0.0.1', () => {
+      const port = (s.address() as { port: number }).port
+      s.close(() => resolve(port))
+    })
+  })
+
+// Delve speaks the Debug Adapter Protocol over TCP: `dlv dap --listen=...`, then connect to that port.
+const goAdapter: Adapter = {
+  id: 'go',
+  label: 'Go',
+  files: /\.go$/i,
+  async start(opts, emit) {
+    const dlv = findDelve()
+    if (!dlv) throw new Error(DELVE_HELP)
+    const port = await freePort()
+    const cwd = opts.cwd || dirname(opts.file)
+    const child = spawn(dlv, ['dap', `--listen=127.0.0.1:${port}`], { cwd, env: cleanEnv(), stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+    let stderr = ''
+    let said = ''
+    let ready = false
+    child.stderr?.on('data', (b: Buffer) => {
+      stderr = (stderr + b.toString('utf-8')).slice(-2000)
+      if (ready) emit({ type: 'output', stream: 'stderr', text: b.toString('utf-8') }) // the program's own error output
+    })
+    // Before the handshake this is Delve talking; afterwards it is the program, which shares Delve's output.
+    child.stdout?.on('data', (b: Buffer) => {
+      if (!ready) said += b.toString('utf-8')
+      else emit({ type: 'output', stream: 'stdout', text: b.toString('utf-8') })
+    })
+    await new Promise<void>((resolve, reject) => {
+      const t0 = Date.now()
+      const tick = (): void => {
+        if (/listening/i.test(said)) return resolve()
+        if (child.exitCode !== null) return reject(new Error(`Delve stopped right away.${stderr ? '\n' + stderr : ''}`))
+        if (Date.now() - t0 > 15_000) return reject(new Error('Delve did not start in time.'))
+        setTimeout(tick, 50)
+      }
+      child.once('error', (e) => reject(new Error(`Could not start Delve: ${e.message}`)))
+      tick()
+    }).catch((e) => {
+      child.kill()
+      throw e
+    })
+    const socket = tcpConnect(port, '127.0.0.1')
+    await new Promise<void>((resolve, reject) => {
+      socket.once('connect', resolve)
+      socket.once('error', (e) => reject(new Error(`Could not connect to Delve: ${e.message}`)))
+    }).catch((e) => {
+      child.kill()
+      throw e
+    })
+    ready = true
+    child.once('close', () => socket.destroy())
+    return {
+      child,
+      io: { input: socket, output: socket },
+      stderr: () => stderr,
+      launch: {
+        name: 'Go',
+        type: 'go',
+        request: 'launch',
+        mode: 'debug',
+        // The package that holds the file, built as `go run .` would.
+        program: dirname(opts.file),
+        args: opts.args ?? [],
+        cwd,
+        env: opts.env ?? {},
+        stopOnEntry: opts.stopOnEntry === true
+      }
+    }
+  }
+}
+
+export const adapterFor = (file: string): Adapter | null => [pythonAdapter, goAdapter].find((a) => a.files.test(file)) ?? null
+
+export function startPythonDebug(opts: DebugOptions, emit: (e: DbgEvent) => void): Promise<DapSession> {
+  return startDapDebug(pythonAdapter, opts, emit)
+}
+
+/** Starts a program under a debug adapter. Resolves when it is running (breakpoints set), rejects with a readable message. */
+export async function startDapDebug(adapter: Adapter, opts: DebugOptions, emit: (e: DbgEvent) => void): Promise<DapSession> {
+  if (!existsSync(opts.file)) throw new Error(`The file does not exist: ${opts.file}`)
+  const started = await adapter.start(opts, emit)
+  const { child } = started
+  const dap = new Dap(started.io, child)
+  const stderrOf = (): string => started.stderr()
   // The adapter reports long, real paths; the editor knows the files by the spelling it was given (short Windows names...).
   const spelling = new Map<string, string>()
   const key = (p: string): string => {
@@ -202,41 +348,28 @@ export async function startPythonDebug(
   const caps = await dap.request('initialize', {
     clientID: 'my-ai-ide',
     clientName: 'My AI IDE',
-    adapterID: 'python',
+    adapterID: adapter.id,
     pathFormat: 'path',
     linesStartAt1: true,
     columnsStartAt1: true,
     supportsVariableType: true,
     supportsRunInTerminalRequest: false
   }).catch((e) => {
-    throw new Error(`Could not start the Python debugger: ${e.message}${stderr ? '\n' + stderr : ''}`)
+    throw new Error(`Could not start the ${adapter.label} debugger: ${e.message}${stderrOf() ? '\n' + stderrOf() : ''}`)
   })
   void caps
   // launch's answer comes after configurationDone, so it is not awaited here.
-  const launched = dap.request('launch', {
-    name: 'Python',
-    type: 'python',
-    request: 'launch',
-    program: opts.file,
-    args: opts.args ?? [],
-    cwd: opts.cwd || dirname(opts.file),
-    env: opts.env ?? {},
-    python: py.executable,
-    console: 'internalConsole',
-    redirectOutput: true,
-    justMyCode: true,
-    stopOnEntry: opts.stopOnEntry === true
-  })
+  const launched = dap.request('launch', started.launch)
   launched.catch(() => undefined)
-  await Promise.race([initialized, new Promise((_r, rej) => setTimeout(() => rej(new Error('The Python debugger did not start in time.' + (stderr ? '\n' + stderr : ''))), 30_000))])
+  await Promise.race([initialized, new Promise((_r, rej) => setTimeout(() => rej(new Error(`The ${adapter.label} debugger did not start in time.` + (stderrOf() ? '\n' + stderrOf() : ''))), 30_000))])
   for (const [file, bps] of Object.entries(opts.breakpoints)) {
-    if (!/\.py$/i.test(file)) continue
+    if (!adapter.files.test(file)) continue
     await dap.request('setBreakpoints', { source: { path: file }, breakpoints: bps.map((b) => ({ line: b.line, ...(b.condition?.trim() ? { condition: b.condition } : {}) })) }).catch(() => undefined)
   }
   await dap.request('setExceptionBreakpoints', { filters: ['uncaught'] }).catch(() => undefined)
   await dap.request('configurationDone').catch(() => undefined)
   await launched.catch((e) => {
-    throw new Error(`The program could not be started: ${e.message}${stderr ? '\n' + stderr : ''}`)
+    throw new Error(`The program could not be started: ${e.message}${stderrOf() ? '\n' + stderrOf() : ''}`)
   })
   emit({ type: 'started', pid: child.pid ?? 0 })
 
@@ -253,7 +386,7 @@ export async function startPythonDebug(
       }
     },
     async setBreakpoints(file, bps) {
-      if (!/\.py$/i.test(file)) return
+      if (!adapter.files.test(file)) return
       await dap.request('setBreakpoints', { source: { path: file }, breakpoints: bps.map((b) => ({ line: b.line, ...(b.condition?.trim() ? { condition: b.condition } : {}) })) })
     },
     async scopes(frameIndex) {

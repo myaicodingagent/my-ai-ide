@@ -299,6 +299,78 @@ const same = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLower
   }
   void havePy
 
+  // --- Go, through Delve (skipped when Go or dlv is not installed)
+  {
+    const have = (cmd) => { try { require('child_process').execSync(cmd, { stdio: 'ignore' }); return true } catch { return false } }
+    const dlvOk = have('go version') && (have('dlv version') || fs.existsSync(path.join(os.homedir(), 'go', 'bin', process.platform === 'win32' ? 'dlv.exe' : 'dlv')))
+    if (!dlvOk) console.log('SKIP  Go debugging (Go or Delve not installed)')
+    else {
+      events.length = 0
+      const gdir = path.join(dir, 'gosrc'); fs.mkdirSync(gdir, { recursive: true })
+      fs.writeFileSync(path.join(gdir, 'go.mod'), 'module prog\n\ngo 1.21\n')
+      const goFile = path.join(gdir, 'main.go')
+      fs.writeFileSync(goFile, [
+        'package main',                       // 1
+        '',                                   // 2
+        'import "fmt"',                       // 3
+        '',                                   // 4
+        'func add(a, b int) int {',           // 5
+        '\tsum := a + b',                     // 6
+        '\treturn sum',                       // 7
+        '}',                                  // 8
+        '',                                   // 9
+        'func main() {',                      // 10
+        '\tr := add(4, 1)',                   // 11
+        '\tfmt.Println("go result", r)',      // 12
+        '}'                                   // 13
+      ].join('\n') + '\n')
+      r = await call('dbg:start', { file: goFile, breakpoints: { [goFile]: [{ line: 7 }] } })
+      check('Go: a program starts under Delve', r.ok === true, JSON.stringify(r))
+      p = await paused('go breakpoint')
+      check('Go: it stops at the breakpoint, in the right function and line', p.reason === 'breakpoint' && /add$/.test(p.frames[0].name) && p.frames[0].line === 7 && same(p.frames[0].file, goFile), JSON.stringify(p.frames[0]))
+      scopes = await call('dbg:scopes', 0)
+      const gl = scopes.flatMap((s) => s.vars)
+      check('Go: the variables are listed', gl.find((v) => v.name === 'sum')?.value === '5' && gl.find((v) => v.name === 'a')?.value === '4', JSON.stringify(gl))
+      ev = await call('dbg:eval', 'a * 10', 0)
+      check('Go: an expression is evaluated in the stopped frame', ev.ok && ev.value.value === '40', JSON.stringify(ev))
+      await call('dbg:stepOut')
+      p = await paused('go step out')
+      check('Go: Step Out returns to the caller', p.frames[0].name.endsWith('main') && p.frames[0].line >= 11, JSON.stringify(p.frames[0]))
+      await call('dbg:continue')
+      const gend = await waitEvent((e) => e.type === 'exited', 'go exit')
+      const gout = events.filter((e) => e.type === 'output').map((e) => e.text).join('')
+      check('Go: the program finishes and its output arrives', gend.code === 0 && /go result 5/.test(gout), JSON.stringify([gend, gout]))
+      events.length = 0
+      r = await call('dbg:start', { file: goFile, breakpoints: {} })
+      await waitEvent((e) => e.type === 'exited', 'go no breakpoints')
+      check('Go: without breakpoints it just runs to the end', r.ok === true)
+      events.length = 0
+    }
+  }
+
+  // --- attach to a program that is already running
+  {
+    events.length = 0
+    const loop = path.join(dir, 'loop.js')
+    fs.writeFileSync(loop, ['let n = 0', 'function tick() {', '  n++', '  return n', '}', 'setInterval(tick, 100)', ''].join('\n'))
+    const port = 19339
+    const child = require('child_process').spawn('node', [`--inspect=127.0.0.1:${port}`, loop], { stdio: 'ignore', windowsHide: true })
+    await sleep(1500)
+    let a = await call('dbg:attach', { port: 1 })
+    check('attaching where nothing listens gives a clear error', a.ok === false && /Nothing is listening/.test(a.error), JSON.stringify(a))
+    a = await call('dbg:attach', { port, breakpoints: { [loop]: [{ line: 3 }] } })
+    check('attaches to a running program by its inspector port', a.ok === true, JSON.stringify(a))
+    const ap = await paused('attached breakpoint')
+    check('a breakpoint set before attaching stops the running program', ap.reason === 'breakpoint' && ap.frames[0].name === 'tick' && ap.frames[0].line === 3 && same(ap.frames[0].file, loop), JSON.stringify(ap.frames[0]))
+    a = await call('dbg:attach', { port })
+    check('a second attach is refused while one is active', a.ok === false)
+    await call('dbg:stop')
+    await waitEvent((e) => e.type === 'exited', 'detached')
+    await sleep(300)
+    check('Stop only disconnects: the program keeps running', child.exitCode === null && child.signalCode === null)
+    child.kill()
+  }
+
   await sleep(800)
   try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }) } catch { /* a debuggee may still be closing; it is only a temp folder */ }
   const failed = results.filter((x) => !x).length

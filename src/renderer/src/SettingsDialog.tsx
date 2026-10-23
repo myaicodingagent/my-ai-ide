@@ -281,7 +281,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }): JSX.Elemen
               ))}
             </select>
           </Row>
-          <Row label="Autocomplete" hint="Ghost-text suggestions as you type (Haiku 5.5, uses API credits)">
+          <Row label="Autocomplete" hint="Ghost-text suggestions as you type (uses the suggestions allowance of your plan)">
             <Check setting="autocomplete" keyName="autocomplete" s={s} />
           </Row>
           <div className="set-group">Accessibility</div>
@@ -291,7 +291,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }): JSX.Elemen
           <Row label="Reduce motion" hint="No smooth scrolling or caret animation. Your system's own setting is respected as well">
             <Check setting="reduceMotion" keyName="reduceMotion" s={s} />
           </Row>
-          <Row label="Next edit suggestions" hint="After you edit, suggest the change you will probably make next; Tab jumps to it, Tab applies it (Haiku 5.5, uses API credits)">
+          <Row label="Next edit suggestions" hint="After you edit, suggest the change you will probably make next; Tab jumps to it, Tab applies it (each suggestion uses one request from your daily allowance, so it is off until you turn it on)">
             <Check setting="nextEdit" keyName="nextEdit" s={s} />
           </Row>
 

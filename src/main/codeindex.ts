@@ -1,8 +1,8 @@
 import { ipcMain } from 'electron'
 import { promises as fs } from 'fs'
 import { join, relative } from 'path'
-import Anthropic from '@anthropic-ai/sdk'
-import { loadKey } from './ai'
+import * as llm from './llm'
+import { directMode } from './backend'
 import { isRemotePath } from './sshfs'
 import { dot, embed, embedStatus, loadVectorCache, saveVectorCache, textHash, type EmbedStatus } from './embeddings'
 
@@ -28,7 +28,7 @@ const SKIP_EXT = new Set([
   'dylib', 'bin', 'class', 'jar', 'woff', 'woff2', 'ttf', 'otf', 'eot', 'mp3', 'mp4', 'mov', 'avi', 'wasm', 'map',
   'lock', 'min', 'pyc', 'node', 'db', 'sqlite'
 ])
-const MAX_FILES = 6000
+const MAX_FILES = 25000
 const MAX_FILE_BYTES = 300_000
 const CHUNK_LINES = 50
 const CHUNK_OVERLAP = 8
@@ -378,17 +378,8 @@ function queryTerms(query: string, extra: string[] = []): Map<string, number> {
 
 const FAST_MODEL = 'claude-haiku-5-5'
 
-async function ask(client: Anthropic, system: string, user: string, maxTokens: number): Promise<string> {
-  const res = await client.messages.create({
-    model: FAST_MODEL,
-    max_tokens: maxTokens,
-    thinking: { type: 'disabled' },
-    output_config: { effort: 'low' },
-    system,
-    messages: [{ role: 'user', content: user }]
-  })
-  const block = res.content.find((b) => b.type === 'text')
-  return block && block.type === 'text' ? block.text : ''
+async function ask(system: string, user: string, maxTokens: number): Promise<string> {
+  return llm.text({ system, prompt: user, maxTokens })
 }
 
 const jsonFrom = (text: string): unknown => {
@@ -401,10 +392,9 @@ const jsonFrom = (text: string): unknown => {
   }
 }
 
-async function expandQuery(client: Anthropic, query: string): Promise<string[] | null> {
+async function expandQuery(query: string): Promise<string[] | null> {
   try {
     const text = await ask(
-      client,
       'Task: expand a code search query. The user asks about a codebase in everyday words. Reply with ONLY a JSON array of at most 12 ' +
         'lower-case identifiers, function or class name fragments and technical words that code answering the question is likely to contain. ' +
         'No explanation.',
@@ -418,13 +408,12 @@ async function expandQuery(client: Anthropic, query: string): Promise<string[] |
   }
 }
 
-async function rerank(client: Anthropic, query: string, hits: Hit[]): Promise<Hit[] | null> {
+async function rerank(query: string, hits: Hit[]): Promise<Hit[] | null> {
   try {
     const listing = hits
       .map((h, i) => `[${i}] ${h.rel}:${h.start}-${h.end}\n${h.text.split('\n').slice(0, 14).join('\n')}`)
       .join('\n\n')
     const text = await ask(
-      client,
       'Task: rerank code search results. Given a question about a codebase and numbered excerpts, reply with ONLY a JSON array of the ' +
         'excerpt numbers that help answer it, most relevant first. Leave out irrelevant ones. No explanation.',
       `Question: ${query}\n\nExcerpts:\n${listing}`,
@@ -467,9 +456,8 @@ export async function searchCodebase(roots: string[], query: string, opts: { lim
   try {
     const built = await Promise.all(roots.map((r) => refresh(r)))
     const indexed = { files: built.reduce((n, i) => n + i.files.size, 0), chunks: built.reduce((n, i) => n + i.chunks.size, 0) }
-    const key = opts.ai === false ? null : await loadKey()
-    const client = key ? new Anthropic({ apiKey: key }) : null
-    const expanded = client ? await expandQuery(client, query) : null
+    const useAi = opts.ai !== false && (await llm.ready())
+    const expanded = useAi ? await expandQuery(query) : null
     const weighted = queryTerms(query, expanded ?? [])
     const words = bm25(built, weighted, limit * 5)
     // Meaning: compute vectors in the background (waiting a little, so a small project is ready on its first search), then compare.
@@ -498,8 +486,9 @@ export async function searchCodebase(roots: string[], query: string, opts: { lim
     }
     let hits = dedupe(ranked.map(hitOf)).slice(0, Math.max(limit, 20))
     let reranked = false
-    if (client && hits.length > 1) {
-      const better = await rerank(client, query, hits)
+    // Reordering by the model costs one more request, so through the service it is left out (the meaning ranking already does this job).
+    if (useAi && directMode() && hits.length > 1) {
+      const better = await rerank(query, hits)
       if (better) {
         hits = better
         reranked = true

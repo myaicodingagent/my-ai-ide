@@ -187,7 +187,7 @@ export function GitPanel({
   }
 
   if (!root) return <div className="empty">Open a folder to use source control.</div>
-  if (status.state === 'remote') return <div className="empty">Source control is not available for folders opened over SSH yet. Use an SSH terminal to run git there.</div>
+  if (status.state === 'remote') return <div className="empty">Source control could not reach git on the remote computer.</div>
   if (status.state === 'nogit') {
     return (
       <div className="empty">

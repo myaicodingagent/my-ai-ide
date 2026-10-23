@@ -122,8 +122,19 @@ async function cell(session, id, code, ms = 20000) {
     check('Python: an object with _repr_html_ gives both an HTML and a plain-text result', x.events.some((e) => e.type === 'result' && e.data['text/html'] === '<b>boxed</b>' && e.data['text/plain'] === 'Box()'), JSON.stringify(x.events.filter((e) => e.type === 'result')))
     x = await cell(py, 'p8', 'display("shown")\n"after"')
     check('Python: display() and the final result', x.display.length === 1 && x.display[0]['text/plain'] === "'shown'" && x.result === "'after'")
+    // input(): the kernel asks, the answer is sent back, and a cancelled prompt ends the cell with an error.
+    const answerWith = (id, value) => {
+      let sent = false
+      const t = setInterval(() => {
+        if (!sent && events.some(([s, c, ev]) => s === py && c === id && ev.type === 'input_request')) { sent = true; clearInterval(t); call('nb:input', py, value) }
+      }, 20)
+    }
+    answerWith('p9', 'Ada')
     x = await cell(py, 'p9', 'input("name? ")')
-    check('Python: input() is refused instead of hanging', !x.ok && /input\(\) is not supported/.test(x.error.evalue))
+    check('Python: input() asks, and the answer is the result', x.ok && x.result === "'Ada'" && x.events.some((e) => e.type === 'input_request' && e.prompt === 'name? '), JSON.stringify(x.events))
+    answerWith('p9b', null)
+    x = await cell(py, 'p9b', 'input()')
+    check('Python: a cancelled input() ends the cell with an error', !x.ok, JSON.stringify(x.error))
     x = await cell(py, 'p10', 'import os\nos.system("echo from-a-child-process")\n"done"')
     check('Python: output of a child process cannot break the notebook', x.ok && x.result === "'done'")
     x = await cell(py, 'p11', 'x = 5\nx')

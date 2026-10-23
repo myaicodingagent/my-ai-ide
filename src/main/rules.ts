@@ -18,6 +18,7 @@ export interface RuleFile {
 
 async function readIfSmall(path: string): Promise<string | null> {
   try {
+    if (isRemotePath(path)) return (await ssh.statSize(path)) > MAX_FILE_BYTES ? null : await ssh.readFile(path)
     const stat = await fs.stat(path)
     if (!stat.isFile() || stat.size > MAX_FILE_BYTES) return null
     return await fs.readFile(path, 'utf-8')
@@ -28,7 +29,6 @@ async function readIfSmall(path: string): Promise<string | null> {
 
 /** The rule files found in a project and their combined text, ready to put in a prompt. */
 export async function loadRules(root: string): Promise<{ files: RuleFile[]; text: string }> {
-  if (isRemotePath(root)) return { files: [], text: '' } // rules files on another computer are not read yet
   const found: { file: RuleFile; text: string }[] = []
   const add = async (abs: string): Promise<void> => {
     const text = await readIfSmall(abs)
@@ -36,7 +36,9 @@ export async function loadRules(root: string): Promise<{ files: RuleFile[]; text
   }
   for (const f of FILES) await add(join(root, f))
   for (const d of DIRS) {
-    const names = await fs.readdir(join(root, d)).catch(() => [] as string[])
+    const names = isRemotePath(root)
+      ? await ssh.readDir(join(root, d)).then((l) => l.filter((e) => !e.isDir).map((e) => e.name), () => [] as string[])
+      : await fs.readdir(join(root, d)).catch(() => [] as string[])
     for (const n of names.filter((x) => /\.(md|mdc)$/i.test(x)).sort().slice(0, 10)) await add(join(root, d, n))
   }
 
@@ -76,6 +78,7 @@ Instructions for AI assistants working in this project. Edit freely; every chat,
 - (for example: do not edit files in src/generated)
 `
 
+import * as ssh from './sshfs'
 import { isRemotePath } from './sshfs'
 
 export function registerRulesHandlers(): void {

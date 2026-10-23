@@ -14,6 +14,20 @@ const server = new Server({ hostKeys: [hostKey] }, (client) => {
   client.on('ready', () => {
     client.on('session', (accept) => {
       const session = accept()
+      // exec: the command the app sends is "cd '<remote path>' && ENV=.. 'git' ..."; run it with bash in the matching local folder.
+      session.on('exec', (accept2, _reject, info) => {
+        const stream = accept2()
+        const m = /^cd '([^']*)' && ([\s\S]*)$/.exec(info.command)
+        if (!m) { stream.stderr.write('bad command'); stream.exit(2); return stream.end() }
+        const cwd = local(m[1])
+        const child = require('child_process').spawn('bash', ['-c', m[2]], { cwd })
+        const roots = [remoteRoot, fs.realpathSync.native(remoteRoot)].map((r) => r.split(require('path').sep).join('/'))
+        const fix = (d) => Buffer.from(roots.reduce((s, r) => s.split(r).join(''), d.toString('utf-8')))
+        child.stdout.on('data', (d) => stream.write(fix(d)))
+        child.stderr.on('data', (d) => stream.stderr.write(fix(d)))
+        child.on('close', (code) => { stream.exit(code ?? 1); stream.end() })
+        stream.pipe(child.stdin)
+      })
       session.on('sftp', (accept2) => {
         const sftp = accept2()
         const open = new Map(); let next = 1

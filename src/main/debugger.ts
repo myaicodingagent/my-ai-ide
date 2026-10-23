@@ -6,7 +6,7 @@ import { delimiter, dirname, join, resolve as resolvePath } from 'path'
 import { fileURLToPath, pathToFileURL } from 'url'
 import WebSocket from 'ws'
 import { SourceMapIndex, parseSourceMap } from './sourcemap'
-import { DapSession, startPythonDebug } from './dap'
+import { DapSession, adapterFor, startDapDebug } from './dap'
 import { isRemotePath } from './sshfs'
 
 // A JavaScript debugger: the program runs under `node --inspect-brk` and this talks to Node's built-in inspector
@@ -59,7 +59,7 @@ interface Remote {
 }
 
 interface Session {
-  child: ChildProcess
+  child: ChildProcess | null // null when attached to a program that was already running
   ws: WebSocket | null
   nextId: number
   pending: Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>
@@ -399,6 +399,105 @@ async function start(opts: {
   })
 }
 
+// ---- attaching to a program that is already running (started with --inspect, or given a PID) ----
+
+async function inspectorUrl(host: string, port: number): Promise<string> {
+  const res = await fetch(`http://${host}:${port}/json/list`, { signal: AbortSignal.timeout(5000) }).catch(() => null)
+  if (!res || !res.ok) throw new Error(`Nothing is listening for a debugger at ${host}:${port}. Start the program with node --inspect, or attach by process id.`)
+  const list = (await res.json()) as { webSocketDebuggerUrl?: string; type?: string }[]
+  const target = list.find((t) => t.webSocketDebuggerUrl && (!t.type || t.type === 'node')) ?? list.find((t) => t.webSocketDebuggerUrl)
+  if (!target?.webSocketDebuggerUrl) throw new Error('The program did not offer a debugger connection (another debugger may be attached).')
+  return target.webSocketDebuggerUrl.replace(/^ws:\/\/[^/]+/, `ws://${host}:${port}`)
+}
+
+// Asks a running Node process to open its inspector (what SIGUSR1 does); it listens on 9229 unless that is taken.
+async function enableInspector(pid: number): Promise<number> {
+  const { file, env } = nodeCommand()
+  const code = `try { process._debugProcess(${Math.floor(pid)}) } catch (e) { console.error(e.message); process.exit(1) }`
+  await new Promise<void>((resolve, reject) => {
+    const c = spawn(file, ['-e', code], { env, windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] })
+    let err = ''
+    c.stderr?.on('data', (b: Buffer) => (err += b.toString()))
+    c.on('error', reject)
+    c.on('close', (n) => (n === 0 ? resolve() : reject(new Error(err.trim() || `Could not signal process ${pid}.`))))
+  })
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 250))
+    for (const port of [9229, 9230, 9231]) {
+      const ok = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(500) }).then((r) => r.ok, () => false)
+      if (ok) return port
+    }
+  }
+  throw new Error(`Process ${pid} did not open a debugger. Is it a Node.js process that is still running?`)
+}
+
+async function attach(opts: { host?: string; port?: number; pid?: number; breakpoints: Record<string, DbgBreakpoint[]> }): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (session && !session.exited) return { ok: false, error: 'A debug session is already running. Stop it first.' }
+  const host = opts.host || '127.0.0.1'
+  let url: string
+  let pid = 0
+  try {
+    let port = opts.port
+    if (!port && opts.pid) {
+      pid = opts.pid
+      port = await enableInspector(opts.pid)
+    }
+    if (!port || port < 1 || port > 65535) return { ok: false, error: 'Give a port (for example 9229) or a process id.' }
+    url = await inspectorUrl(host, port)
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) }
+  }
+  const s: Session = {
+    child: null, ws: null, nextId: 1, pending: new Map(), frames: [], breakpointIds: new Map(), scripts: new Map(),
+    stopOnEntry: false, firstPause: false, exited: false
+  }
+  session = s
+  return new Promise((resolve) => {
+    let connected = false
+    const ws = new WebSocket(url)
+    s.ws = ws
+    const fail = (error: string): void => {
+      if (connected) return
+      connected = true
+      s.exited = true
+      if (session === s) session = null
+      try {
+        ws.close()
+      } catch {
+        // already closed
+      }
+      resolve({ ok: false, error })
+    }
+    ws.on('open', async () => {
+      try {
+        await send(s, 'Runtime.enable')
+        await send(s, 'Debugger.enable')
+        await send(s, 'Debugger.setPauseOnExceptions', { state: 'uncaught' })
+        for (const [f, bps] of Object.entries(opts.breakpoints)) await applyBreakpoints(s, f, bps)
+        connected = true
+        resolve({ ok: true })
+        emit({ type: 'started', pid })
+        emit({ type: 'output', stream: 'info', text: `Attached to ${host} (the program keeps running; Stop only disconnects).
+` })
+      } catch (e) {
+        fail(e instanceof Error ? e.message : String(e))
+      }
+    })
+    ws.on('message', (d) => handleMessage(s, d.toString()))
+    ws.on('error', (e) => fail(`Could not connect to the debugger: ${e.message}`))
+    ws.on('close', () => {
+      if (!connected) return fail('The debugger connection closed.')
+      if (s.exited) return
+      s.exited = true
+      for (const p of s.pending.values()) p.reject(new Error('The debugger disconnected.'))
+      s.pending.clear()
+      if (session === s) session = null
+      emit({ type: 'exited', code: null })
+    })
+    setTimeout(() => fail('Timed out connecting to the debugger.'), 15_000)
+  })
+}
+
 // ---- inspecting ----
 
 async function propsOf(s: Session, objectId: string): Promise<DbgVar[]> {
@@ -424,10 +523,11 @@ export function registerDebugHandlers(getWin: () => BrowserWindow | null): void 
   ipcMain.handle('dbg:start', async (_e, opts) => {
     if (isRemotePath(opts?.file)) return { ok: false as const, error: 'Programs on another computer cannot be debugged from here yet. Run them in an SSH terminal.' }
     if ((session && !session.exited) || dapActive()) return { ok: false as const, error: 'A debug session is already running. Stop it first.' }
-    // Python goes through the Debug Adapter Protocol (debugpy); JavaScript and TypeScript through Node's inspector.
-    if (/\.pyw?$/i.test(String(opts?.file))) {
+    // Python (debugpy) and Go (Delve) go through the Debug Adapter Protocol; JavaScript and TypeScript through Node's inspector.
+    const adapter = adapterFor(String(opts?.file))
+    if (adapter) {
       try {
-        dapSession = await startPythonDebug(opts, emit)
+        dapSession = await startDapDebug(adapter, opts, emit)
         return { ok: true as const }
       } catch (e) {
         dapSession = null
@@ -436,10 +536,20 @@ export function registerDebugHandlers(getWin: () => BrowserWindow | null): void 
     }
     return start(opts)
   })
+  ipcMain.handle('dbg:attach', async (_e, opts) => {
+    if ((session && !session.exited) || dapActive()) return { ok: false as const, error: 'A debug session is already running. Stop it first.' }
+    return attach({
+      host: typeof opts?.host === 'string' && /^[A-Za-z0-9.-]{1,255}$/.test(opts.host) ? opts.host : undefined,
+      port: Number.isInteger(opts?.port) ? opts.port : undefined,
+      pid: Number.isInteger(opts?.pid) ? opts.pid : undefined,
+      breakpoints: opts?.breakpoints ?? {}
+    })
+  })
   ipcMain.handle('dbg:stop', () => {
     dapActive()?.stop()
     const s = session
     if (!s) return
+    if (!s.child) return void s.ws?.close() // attached: let go, the program keeps running
     try {
       s.child.kill()
     } catch {
@@ -516,7 +626,8 @@ export function registerDebugHandlers(getWin: () => BrowserWindow | null): void 
 export function stopDebugging(): void {
   if (dapSession && dapSession.active) dapSession.stop()
   try {
-    session?.child.kill()
+    if (session?.child) session.child.kill()
+    else session?.ws?.close()
   } catch {
     // already gone
   }

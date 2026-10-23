@@ -187,6 +187,20 @@ export async function startDebugging(
   return null
 }
 
+// Connects to a Node program that is already running: by inspector port (started with --inspect) or by process id.
+export async function attachDebugging(target: { host?: string; port?: number; pid?: number }): Promise<string | null> {
+  if (isActive()) return 'A debug session is already running.'
+  const breakpoints: Record<string, DbgBreakpoint[]> = {}
+  for (const v of Object.values(snap.breakpoints)) breakpoints[v.path] = v.bps
+  emit({ status: 'running', frames: [], frame: 0, reason: '', exception: undefined, output: [], file: target.pid ? `process ${target.pid}` : `${target.host ?? '127.0.0.1'}:${target.port}`, version: snap.version + 1 })
+  const r = await window.api.dbgAttach({ ...target, breakpoints })
+  if (!r.ok) {
+    emit({ status: 'idle', output: [{ stream: 'stderr', text: r.error + '\n' }] })
+    return r.error
+  }
+  return null
+}
+
 export const stopDebugging = (): Promise<void> => window.api.dbgStop()
 export const stepDebug = (kind: 'continue' | 'stepOver' | 'stepInto' | 'stepOut' | 'pause'): Promise<{ ok: boolean; error?: string }> => window.api.dbgStep(kind)
 

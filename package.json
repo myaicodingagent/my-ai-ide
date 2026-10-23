@@ -23,6 +23,11 @@
     "test:contrast": "node tests/a11y-contrast.cjs",
     "test:nbmodel": "node tests/notebook-model.cjs",
     "test:notebook": "node tests/notebook-handlers.cjs",
+    "test:e2e-account": "node tests/e2e-account.cjs",
+    "test:backend": "node tests/backend-handlers.cjs",
+    "test:menus2": "node tests/menus2.cjs",
+    "test:menus": "node tests/menus.cjs",
+    "test:ssh-git": "node tests/ssh-git.cjs",
     "test:ssh": "node tests/ssh-handlers.cjs"
   },
   "dependencies": {

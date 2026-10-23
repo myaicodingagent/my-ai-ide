@@ -3,6 +3,8 @@ import { join } from 'path'
 import { promises as fs } from 'fs'
 import { createHash } from 'crypto'
 import Anthropic from '@anthropic-ai/sdk'
+import * as backend from './backend'
+import * as llm from './llm'
 
 export interface ChatMessage {
   role: 'user' | 'assistant'
@@ -68,22 +70,18 @@ export function registerAiHandlers(getWin: () => BrowserWindow | null): void {
       _e,
       req: { fileName: string; language: string; original: string; snippet: string }
     ): Promise<{ ok: true; text: string } | { ok: false; error: string }> => {
-      const apiKey = await loadKey()
-      if (!apiKey) return { ok: false, error: 'No API key set. Add one in the Chat tab.' }
-      if (req.original.length > 50_000) return { ok: false, error: 'This file is too large for Apply. Use Insert instead.' }
+      if (!(await llm.ready())) return { ok: false, error: llm.notReady }
+      // The service takes one question of about 20,000 characters, which has to hold the whole file and the change.
+      const limit = backend.directMode() ? 50_000 : 12_000
+      if (req.original.length > limit) return { ok: false, error: 'This file is too large for Apply. Use Insert instead.' }
       try {
-        const stream = new Anthropic({ apiKey }).messages.stream({
-          model: 'claude-sonnet-5-5',
-          max_tokens: 32000,
-          output_config: { effort: 'low' },
+        let text = await llm.text({
+          strong: true,
           system:
             'You apply a proposed change to a source file. You get the complete original file and a code snippet the user wants applied. ' +
             'The snippet may be a full replacement, a partial piece with placeholders such as "// ... existing code ...", or a fragment that belongs at some place in the file. ' +
             'Reply with ONLY the complete updated file: no explanation, no markdown fences. Keep everything that the change does not affect exactly as it was, including formatting and comments. Use \n line endings.',
-          messages: [
-            {
-              role: 'user',
-              content: `File: ${req.fileName} (${req.language})
+          prompt: `File: ${req.fileName} (${req.language})
 
 Original file:
 <<<FILE
@@ -94,13 +92,7 @@ Change to apply:
 <<<CHANGE
 ${req.snippet}
 CHANGE>>>`
-            }
-          ]
         })
-        const final = await stream.finalMessage()
-        if (final.stop_reason === 'max_tokens') return { ok: false, error: 'The updated file was too long for the model to return. Use Insert instead.' }
-        const block = final.content.find((b) => b.type === 'text')
-        let text = block && block.type === 'text' ? block.text : ''
         text = text.replace(/^```[\w+-]*\n/, '').replace(/\n```\s*$/, '') // in case it added a fence anyway
         return text.trim() ? { ok: true, text } : { ok: false, error: 'The model returned nothing.' }
       } catch (e) {
@@ -127,7 +119,8 @@ CHANGE>>>`
     await fs.writeFile(chatFile(root), JSON.stringify(recent), 'utf-8')
   })
 
-  ipcMain.handle('ai:hasKey', async () => (await loadKey()) !== null)
+  // "Can a model call be made?": signed in to the service, or (development) an own key.
+  ipcMain.handle('ai:hasKey', async () => llm.ready())
 
   ipcMain.handle('ai:setKey', async (_e, key: string) => {
     if (!safeStorage.isEncryptionAvailable()) {
@@ -145,11 +138,21 @@ CHANGE>>>`
   // Short, non-streaming completion for ghost-text autocomplete. Fails quietly with null.
   ipcMain.handle(
     'ai:complete',
-    async (_e, req: { requestId: number; system: string; prompt: string; maxTokens?: number }) => {
-      const apiKey = await loadKey()
-      if (!apiKey) return null
+    async (_e, req: { requestId: number; system: string; prompt: string; maxTokens?: number; inline?: { language: string; prefix: string; suffix: string } }) => {
+      if (!(await llm.ready())) return null
       const controller = new AbortController()
       inflight.set(req.requestId, controller)
+      if (!backend.directMode()) {
+        try {
+          if (req.inline) return (await backend.complete(req.inline.language, req.inline.prefix, req.inline.suffix, controller.signal)) || null
+          return (await llm.text({ system: req.system, prompt: req.prompt, signal: controller.signal })) || null
+        } catch {
+          return null
+        } finally {
+          inflight.delete(req.requestId)
+        }
+      }
+      const apiKey = (await loadKey()) as string
       try {
         const client = new Anthropic({ apiKey })
         const res = await client.messages.create(
@@ -177,10 +180,32 @@ CHANGE>>>`
     const send = (channel: string, ...args: unknown[]): void =>
       getWin()?.webContents.send(channel, req.requestId, ...args)
 
-    const apiKey = await loadKey()
-    if (!apiKey) return send('ai:error', 'No API key set. Click the key icon to add one.')
-
     const controller = new AbortController()
+    if (!(await llm.ready())) return send('ai:error', llm.notReady)
+    if (!backend.directMode()) {
+      // Through our service: one question holds the instructions, the earlier turns and the new message.
+      inflight.set(req.requestId, controller)
+      try {
+        const msgs = req.messages
+        const last = msgs[msgs.length - 1]
+        const r = await backend.ask({
+          prompt: llm.fit(req.system, msgs.slice(0, -1), last?.content ?? ''),
+          strong: !req.model.includes('haiku'),
+          images: (req.images ?? []).slice(0, 5),
+          signal: controller.signal,
+          onText: (t) => send('ai:delta', t)
+        })
+        send('ai:done', 'end_turn', r.inputTokens, r.outputTokens)
+      } catch (err) {
+        if (controller.signal.aborted) send('ai:done', 'aborted', 0, 0)
+        else send('ai:error', backend.explain(err))
+      } finally {
+        inflight.delete(req.requestId)
+      }
+      return
+    }
+    const apiKey = (await loadKey()) as string
+
     inflight.set(req.requestId, controller)
     try {
       const client = new Anthropic({ apiKey })

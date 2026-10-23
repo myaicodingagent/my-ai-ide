@@ -32,7 +32,7 @@ export const DEFAULT_SETTINGS: Settings = {
   terminalShell: 'powershell',
   defaultModel: DEFAULT_MODEL,
   autocomplete: true,
-  nextEdit: true,
+  nextEdit: false,
   meaningSearch: true,
   screenReader: false,
   reduceMotion: false,

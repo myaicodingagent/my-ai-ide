@@ -20,6 +20,7 @@ export type NbEvent =
   | { type: 'result'; data: Record<string, string> }
   | { type: 'display'; data: Record<string, string> }
   | { type: 'error'; ename: string; evalue: string; traceback: string[] }
+  | { type: 'input_request'; prompt: string }
   | { type: 'done'; ok: boolean }
 
 const PY_DRIVER = `import sys, os, json, ast, io, traceback, base64
@@ -47,10 +48,17 @@ class _Out(io.TextIOBase):
 sys.stdout = _Out('stdout')
 sys.stderr = _Out('stderr')
 
-def _no_input(prompt=''):
-    raise RuntimeError('input() is not supported in this notebook')
+def _input(prompt=''):
+    _send({'id': _cur[0], 'type': 'input_request', 'prompt': str(prompt)})
+    line = sys.stdin.readline()
+    if not line:
+        raise EOFError('The kernel was closed while waiting for input')
+    reply = json.loads(line)
+    if reply.get('cancel'):
+        raise KeyboardInterrupt('input cancelled')
+    return reply.get('value', '')
 import builtins
-builtins.input = _no_input
+builtins.input = _input
 
 def _bundle(obj):
     data = {}
@@ -271,6 +279,12 @@ export function registerNotebookHandlers(getWin: () => BrowserWindow | null): vo
     if (!s || !s.alive) return { ok: false as const, error: 'The kernel is not running.' }
     s.child.stdin?.write(JSON.stringify({ id: String(cellId), code: String(code) }) + '\n')
     return { ok: true as const }
+  })
+  // The answer to an input() the Python kernel is waiting on (value null = the user cancelled).
+  ipcMain.handle('nb:input', (_e, session: number, value: string | null) => {
+    const s = sessions.get(session)
+    if (!s || !s.alive) return
+    s.child.stdin?.write(JSON.stringify(value === null ? { cancel: true } : { value: String(value) }) + '\n')
   })
   // There is no way to send Ctrl+C to a process on Windows, so an interrupt stops the kernel (variables are lost).
   ipcMain.handle('nb:stop', (_e, session: number) => {

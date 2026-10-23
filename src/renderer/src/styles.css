@@ -531,3 +531,93 @@ html.reduce-motion *, html.reduce-motion *::before, html.reduce-motion *::after 
 .nb-tools button:hover:not(:disabled) { background: var(--hover); }
 .nb-tools button:disabled { opacity: 0.35; cursor: default; }
 .nb-add-end { display: flex; gap: 6px; justify-content: center; margin-top: 12px; }
+
+/* Account */
+.signin-code { font-size: 22px; letter-spacing: 3px; font-weight: 600; font-family: var(--mono, monospace); text-align: center; margin: 8px 0; }
+
+/* ---------- Menu bar and activity bar (VS Code layout) ---------- */
+.menubar { display: flex; align-items: stretch; height: 30px; flex: none; background: var(--side); border-bottom: 1px solid var(--border); padding: 0 6px; user-select: none; font-size: 13px; }
+.menu-wrap { position: relative; display: flex; }
+.menu-title { padding: 0 9px; margin: 3px 0; border-radius: 4px; color: var(--fg); background: none; border: 0; font: inherit; cursor: default; }
+.menu-title:hover, .menu-title.open { background: var(--hover); }
+.menu-drop { position: absolute; top: 100%; left: 0; z-index: 70; min-width: 260px; padding: 4px; background: var(--side); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow); }
+.menu-item { display: flex; justify-content: space-between; gap: 28px; padding: 5px 12px; border-radius: 5px; white-space: nowrap; cursor: default; }
+.menu-item.hi:not(.disabled) { background: var(--accent); color: var(--on-accent); }
+.menu-item.hi:not(.disabled) .menu-key { color: inherit; opacity: 0.85; }
+.menu-item.disabled { opacity: 0.4; }
+.menu-key { color: var(--muted); }
+.menu-sep { height: 1px; margin: 4px 8px; background: var(--border); }
+
+.activitybar { width: 48px; flex: none; display: flex; flex-direction: column; justify-content: space-between; background: var(--side); border-right: 1px solid var(--border); }
+.activitybar .sidebar-views { flex: none; flex-direction: column; }
+.activity-bottom { display: flex; flex-direction: column; }
+.activitybar .activity-btn { position: relative; display: flex; align-items: center; justify-content: center; width: 48px; height: 48px; margin: 0; padding: 0; color: var(--muted); border: 0; border-left: 2px solid transparent; border-bottom: 0; background: none; text-transform: none; letter-spacing: 0; cursor: pointer; }
+.activitybar .activity-btn:hover { color: var(--fg); }
+.activitybar .activity-btn.on { color: var(--fg); border-left-color: var(--accent); }
+.activitybar .activity-btn svg { width: 26px; height: 26px; }
+.activitybar .activity-btn .badge { position: absolute; right: 5px; bottom: 6px; margin: 0; min-width: 16px; padding: 0 4px; line-height: 16px; text-align: center; font-size: 10px; font-weight: 600; background: var(--accent); color: var(--on-accent); border-radius: 8px; }
+.sidebar-title { font-size: 11px; font-weight: 400; letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg); padding-left: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sidebar-header { border-bottom: 0; }
+.sidebar-header .icon-btn { display: flex; align-items: center; padding: 4px; color: var(--muted); border-radius: 4px; }
+.sidebar-header .icon-btn:hover { color: var(--fg); background: var(--hover); }
+.sidebar-header .icon-btn svg { width: 18px; height: 18px; }
+.menu-title u { text-decoration: none; }
+.menubar.alt .menu-title u { text-decoration: underline; }
+.menu-check { width: 16px; flex: none; margin-left: -6px; text-align: center; }
+.menu-label { flex: 1; }
+
+/* ---------- Explorer sections (Open Editors, Outline, Timeline) ---------- */
+.explorer { flex: 1; min-height: 0; flex-direction: column; }
+.explorer > .tree { flex: 1 1 40%; min-height: 90px; display: block; }
+.ex-section { flex: none; border-top: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
+.ex-head { display: flex; align-items: center; justify-content: space-between; height: 24px; padding-right: 6px; }
+.ex-toggle { display: flex; align-items: center; gap: 4px; flex: 1; height: 100%; padding: 0 8px 0 4px; background: none; border: 0; color: var(--fg); font: inherit; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; text-align: left; cursor: pointer; }
+.ex-chevron { display: inline-block; width: 14px; color: var(--muted); transition: transform 0.12s; }
+.ex-chevron.open { transform: rotate(90deg); }
+.ex-count { margin-left: 6px; min-width: 16px; padding: 0 5px; border-radius: 8px; background: var(--accent); color: var(--on-accent); font-size: 10px; text-align: center; letter-spacing: 0; }
+.ex-actions { display: flex; gap: 2px; }
+.ex-act { padding: 0 5px; background: none; border: 0; color: var(--muted); cursor: pointer; border-radius: 3px; }
+.ex-act:hover { color: var(--fg); background: var(--hover); }
+.ex-body { max-height: 220px; overflow: auto; padding-bottom: 4px; }
+.ex-empty { padding: 4px 14px; color: var(--muted); font-size: 12px; }
+.oe-row, .ol-row, .tl-row { display: flex; align-items: center; gap: 6px; min-height: 22px; padding: 0 8px 0 14px; cursor: pointer; white-space: nowrap; }
+.oe-row:hover, .ol-row:hover, .tl-row:hover { background: var(--hover); }
+.oe-row.on { background: var(--active); }
+.oe-name { overflow: hidden; text-overflow: ellipsis; }
+.oe-dir { flex: 1; overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-size: 11px; }
+.oe-close { width: 16px; text-align: center; color: var(--muted); border-radius: 3px; }
+.oe-close.dirty { color: var(--fg); }
+.oe-close:hover { background: var(--active); color: var(--fg); }
+.ol-icon { width: 16px; flex: none; text-align: center; font-size: 11px; font-weight: 700; color: var(--accent); }
+.ol-name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.ol-line { color: var(--muted); font-size: 11px; }
+.tl-row { flex-direction: column; align-items: flex-start; justify-content: center; gap: 0; padding-top: 2px; padding-bottom: 2px; }
+.tl-subject { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.tl-meta { color: var(--muted); font-size: 11px; }
+
+/* ---------- Bottom panel tabs and views ---------- */
+.panel-tabs { display: flex; align-items: stretch; flex: none; padding-left: 6px; }
+.panel-tab { padding: 0 10px; background: none; border: 0; border-bottom: 2px solid transparent; color: var(--muted); font: inherit; font-size: 11px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; cursor: pointer; white-space: nowrap; }
+.panel-tab:hover { color: var(--fg); }
+.panel-tab.on { color: var(--fg); border-bottom-color: var(--accent); }
+.panel-tab .badge { margin-left: 5px; padding: 0 5px; border-radius: 8px; background: var(--accent); color: var(--on-accent); font-size: 10px; letter-spacing: 0; }
+.term-tablist { display: flex; align-items: stretch; min-width: 0; margin-left: 10px; padding-left: 10px; border-left: 1px solid var(--border); }
+.panel-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.pv { flex: 1; min-height: 0; display: flex; flex-direction: column; font-size: 12px; }
+.pv-bar { display: flex; align-items: center; gap: 10px; height: 30px; flex: none; padding: 0 10px; border-bottom: 1px solid var(--border); }
+.pv-bar select, .pv-filter, .pv-input { background: var(--sunken); color: var(--fg); border: 1px solid var(--border); border-radius: var(--radius); padding: 2px 6px; font: inherit; }
+.pv-filter { width: 240px; }
+.pv-check { display: flex; align-items: center; gap: 4px; color: var(--muted); }
+.pv-count { color: var(--muted); }
+.pv-spacer { flex: 1; }
+.pv-list, .pv-output { flex: 1; min-height: 0; overflow: auto; }
+.pv-output { margin: 0; padding: 6px 12px; font-family: var(--font-code); white-space: pre-wrap; word-break: break-word; }
+.pv-input { margin: 6px 10px; flex: none; }
+.pv-empty { padding: 14px; color: var(--muted); }
+.pv-file { padding: 3px 10px; font-weight: 600; }
+.pv-dim { color: var(--muted); font-weight: 400; margin-left: 8px; }
+.pv-row { display: flex; align-items: center; gap: 8px; padding: 2px 10px 2px 26px; cursor: pointer; }
+.pv-row:hover { background: var(--hover); }
+.pv-error .pv-icon { color: var(--danger); }
+.pv-warning .pv-icon { color: #cca700; }
+.pv-msg { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

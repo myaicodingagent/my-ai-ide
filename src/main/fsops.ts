@@ -223,6 +223,8 @@ export function registerFsOps(getWin: () => BrowserWindow | null): void {
     clipboard.writeText(String(text))
   })
 
+  ipcMain.handle('app:readText', () => clipboard.readText())
+
   // ---- watcher ----
   let watchers: FSWatcher[] = []
   let timer: NodeJS.Timeout | null = null

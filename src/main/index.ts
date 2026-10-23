@@ -1,8 +1,9 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell } from 'electron'
-import { join, relative, resolve, sep } from 'path'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import { promises as fs, statSync } from 'fs'
 import * as pty from '@lydell/node-pty'
 import { registerAiHandlers } from './ai'
+import { registerBackendHandlers } from './backend'
 import { registerAgentHandlers } from './agent'
 import { registerUpdater } from './updater'
 import { registerGitHandlers } from './git'
@@ -15,6 +16,7 @@ import { extensionThemes, registerExtensionHandlers, stopExtensions } from './ex
 import { registerTaskHandlers } from './tasks'
 import { registerNotebookHandlers, stopAllKernels } from './notebook'
 import * as ssh from './sshfs'
+import { parseJsonc } from './jsonc'
 import { execFile } from 'child_process'
 import { parseWslList, sshArgs, validSshTarget, wslLocation, wslShellArgs } from './shellspec'
 
@@ -195,9 +197,43 @@ ipcMain.handle('app:setNativeTheme', (_e, type: 'light' | 'dark') => {
   nativeTheme.themeSource = type === 'light' ? 'light' : 'dark'
 })
 
+// Tests answer the native dialogs through environment variables instead of showing them (like MY_AI_IDE_NO_TRASH).
 ipcMain.handle('dialog:openFolder', async () => {
+  if (process.env.MY_AI_IDE_TEST_OPEN_FOLDER) return process.env.MY_AI_IDE_TEST_OPEN_FOLDER
   const res = await dialog.showOpenDialog({ properties: ['openDirectory'] })
   return res.canceled ? null : res.filePaths[0]
+})
+
+// .code-workspace files: a list of folders (relative to the file or absolute) plus settings, which are ignored.
+ipcMain.handle('workspace:open', async (): Promise<{ file: string; folders: string[] } | { error: string } | null> => {
+  const testFile = process.env.MY_AI_IDE_TEST_WORKSPACE_FILE
+  const res = testFile ? { canceled: false, filePaths: [testFile] } : await dialog.showOpenDialog({ properties: ['openFile'], filters: [{ name: 'Workspace', extensions: ['code-workspace'] }] })
+  if (res.canceled) return null
+  const file = res.filePaths[0]
+  try {
+    const data = parseJsonc(await fs.readFile(file, 'utf-8')) as { folders?: { path?: unknown; uri?: unknown }[] }
+    const base = dirname(file)
+    const folders: string[] = []
+    for (const f of Array.isArray(data?.folders) ? data.folders : []) {
+      if (typeof f?.path !== 'string') continue
+      const dir = isAbsolute(f.path) ? f.path : resolve(base, f.path)
+      if (statSync(dir, { throwIfNoEntry: false })?.isDirectory()) folders.push(dir)
+    }
+    if (folders.length === 0) return { error: 'That workspace file has no folders that exist on this PC.' }
+    return { file, folders }
+  } catch (e) {
+    return { error: `Could not read the workspace file: ${e instanceof Error ? e.message : String(e)}` }
+  }
+})
+
+ipcMain.handle('workspace:save', async (_e, folders: string[]): Promise<string | null> => {
+  const testFile = process.env.MY_AI_IDE_TEST_SAVE_FILE
+  const res = testFile ? { canceled: false, filePath: testFile } : await dialog.showSaveDialog({ defaultPath: 'project.code-workspace', filters: [{ name: 'Workspace', extensions: ['code-workspace'] }] })
+  if (res.canceled || !res.filePath) return null
+  const base = dirname(res.filePath)
+  const list = (Array.isArray(folders) ? folders : []).map((d) => ({ path: (relative(base, d) || '.').split(sep).join('/') }))
+  await fs.writeFile(res.filePath, JSON.stringify({ folders: list, settings: {} }, null, 2) + '\n', 'utf-8')
+  return res.filePath
 })
 
 ipcMain.handle('fs:readDir', async (_e, dir: string): Promise<DirEntry[]> => {
@@ -424,6 +460,7 @@ app.whenReady().then(() => {
   // No default menu: its accelerators (Ctrl+W closes the window, Ctrl+R reloads) would fight the editor's own shortcuts.
   Menu.setApplicationMenu(null)
   registerAiHandlers(() => mainWin)
+  registerBackendHandlers(() => mainWin, app.getVersion())
   registerAgentHandlers(() => mainWin)
   registerUpdater(() => mainWin)
   registerGitHandlers()

@@ -257,6 +257,48 @@ export async function connect(address: string, secrets: { password?: string; pas
   return { ok: true, name: h.name, home: await realpath(sftp, '.') }
 }
 
+const shq = (s: string): string => `'${s.replace(/'/g, `'\\''`)}'`
+
+/** Runs a command on the remote computer, in the folder `unc` names, and collects its output (used for git). */
+export function exec(
+  unc: string,
+  command: string[],
+  opts: { input?: string; timeout?: number; env?: Record<string, string>; onData?: (text: string) => void; signal?: AbortSignal } = {}
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    let t: { conn: Live; path: string }
+    try {
+      t = target(unc)
+    } catch (e) {
+      return resolve({ code: -1, stdout: '', stderr: (e as Error).message })
+    }
+    const env = Object.entries(opts.env ?? {}).map(([k, v]) => `${k}=${shq(v)}`)
+    const line = `cd ${shq(t.path)} && ${[...env, ...command.map(shq)].join(' ')}`
+    t.conn.client.exec(line, (err, stream) => {
+      if (err) return resolve({ code: -1, stdout: '', stderr: err.message })
+      let stdout = ''
+      let stderr = ''
+      const timer = setTimeout(() => stream.close(), opts.timeout ?? 30_000)
+      const abort = (): void => stream.close()
+      opts.signal?.addEventListener('abort', abort)
+      stream.on('data', (d: Buffer) => {
+        opts.onData?.(d.toString('utf-8'))
+        if (stdout.length < 8_000_000) stdout += d.toString('utf-8')
+      })
+      stream.stderr.on('data', (d: Buffer) => {
+        opts.onData?.(d.toString('utf-8'))
+        if (stderr.length < 8_000_000) stderr += d.toString('utf-8')
+      })
+      stream.on('close', (code: number | null) => {
+        clearTimeout(timer)
+        opts.signal?.removeEventListener('abort', abort)
+        resolve({ code: code ?? -1, stdout, stderr })
+      })
+      stream.end(opts.input ?? '')
+    })
+  })
+}
+
 export function disconnect(name: string): void {
   const c = live.get(name)
   live.delete(name)
@@ -349,6 +391,17 @@ export async function writeFile(unc: string, text: string, exclusive = false): P
     s.on('close', () => resolve())
     s.end(Buffer.from(text, 'utf-8'))
   })
+}
+
+/** Creates a folder and any missing parents; fine if it exists already. */
+export async function mkdirp(unc: string): Promise<void> {
+  const { conn, path } = target(unc)
+  let cur = ''
+  for (const part of path.split('/').filter(Boolean)) {
+    cur += '/' + part
+    const have = await stat(conn.sftp, cur).then((s) => s.isDirectory(), () => false)
+    if (!have) await new Promise<void>((resolve, reject) => conn.sftp.mkdir(cur, (e) => (e ? reject(errno(e)) : resolve())))
+  }
 }
 
 export async function mkdir(unc: string): Promise<void> {

@@ -99,7 +99,7 @@ export function parseLaunch(data: unknown, errors: string[]): LaunchConfig[] {
     const c = (raw ?? {}) as Record<string, unknown>
     const name = str(c.name)
     if (!name) return void errors.push(`configurations[${i}] has no "name"`)
-    if (c.type !== undefined && !['node', 'pwa-node', 'python', 'debugpy'].includes(String(c.type))) return void errors.push(`"${name}": only "node" and "python" configurations are supported (this one is "${String(c.type)}")`)
+    if (c.type !== undefined && !['node', 'pwa-node', 'python', 'debugpy', 'go'].includes(String(c.type))) return void errors.push(`"${name}": only "node", "python" and "go" configurations are supported (this one is "${String(c.type)}")`)
     if (c.request !== undefined && c.request !== 'launch') return void errors.push(`"${name}": only "launch" is supported`)
     const program = str(c.program)
     if (!program) return void errors.push(`"${name}" has no "program"`)

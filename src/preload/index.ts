@@ -8,11 +8,14 @@ import type { ExtRecord, RegistryResult, SnippetSet } from '../main/extensions'
 import type { TasksInfo } from '../main/tasks'
 import type { KernelInfo, NbEvent } from '../main/notebook'
 import type { ConnectResult } from '../main/sshfs'
+import type { AuthState, Me } from '../main/backend'
 
 type GitResult = { ok: true } | { ok: false; error: string }
 
 const api = {
   openFolder: (): Promise<string | null> => ipcRenderer.invoke('dialog:openFolder'),
+  openWorkspaceFile: (): Promise<{ file: string; folders: string[] } | { error: string } | null> => ipcRenderer.invoke('workspace:open'),
+  saveWorkspaceFile: (folders: string[]): Promise<string | null> => ipcRenderer.invoke('workspace:save', folders),
   initialFolder: (): Promise<string | null> => ipcRenderer.invoke('app:initialFolder'),
   setNativeTheme: (type: 'light' | 'dark'): Promise<void> => ipcRenderer.invoke('app:setNativeTheme', type),
   themesList: (): Promise<{ file: string; text: string }[]> => ipcRenderer.invoke('themes:list'),
@@ -40,6 +43,7 @@ const api = {
   fsTrash: (root: string, target: string): Promise<GitResult> => ipcRenderer.invoke('fs:trash', root, target),
   fsReveal: (target: string): Promise<void> => ipcRenderer.invoke('fs:reveal', target),
   copyText: (text: string): Promise<void> => ipcRenderer.invoke('app:copyText', text),
+  readText: (): Promise<string> => ipcRenderer.invoke('app:readText'),
   fsWatch: (folders: string | string[] | null): Promise<void> => ipcRenderer.invoke('fs:watch', folders),
   onFsChanged: (cb: (e: { paths: string[]; git: boolean }) => void): (() => void) => {
     const h = (_e: unknown, e: { paths: string[]; git: boolean }): void => cb(e)
@@ -110,6 +114,12 @@ const api = {
     stopOnEntry?: boolean
     breakpoints: Record<string, DbgBreakpoint[]>
   }): Promise<{ ok: true } | { ok: false; error: string }> => ipcRenderer.invoke('dbg:start', opts),
+  dbgAttach: (opts: {
+    host?: string
+    port?: number
+    pid?: number
+    breakpoints: Record<string, DbgBreakpoint[]>
+  }): Promise<{ ok: true } | { ok: false; error: string }> => ipcRenderer.invoke('dbg:attach', opts),
   dbgStop: (): Promise<void> => ipcRenderer.invoke('dbg:stop'),
   dbgStep: (kind: 'continue' | 'stepOver' | 'stepInto' | 'stepOut' | 'pause'): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('dbg:' + kind),
@@ -133,6 +143,7 @@ const api = {
   nbStart: (kernel: string, cwd: string): Promise<{ ok: true; session: number } | { ok: false; error: string }> => ipcRenderer.invoke('nb:start', kernel, cwd),
   nbExecute: (session: number, cellId: string, code: string): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke('nb:execute', session, cellId, code),
   nbStop: (session: number): Promise<void> => ipcRenderer.invoke('nb:stop', session),
+  nbInput: (session: number, value: string | null): Promise<void> => ipcRenderer.invoke('nb:input', session, value),
   onNbEvent: (cb: (session: number, cell: string | null, ev: NbEvent) => void): (() => void) => {
     const h = (_e: unknown, s: number, c: string | null, ev: NbEvent): void => cb(s, c, ev)
     ipcRenderer.on('nb:event', h)
@@ -286,8 +297,21 @@ const api = {
   }): Promise<{ ok: true; text: string } | { ok: false; error: string }> => ipcRenderer.invoke('ai:apply', req),
   gitDiffText: (root: string): Promise<string> => ipcRenderer.invoke('git:diffText', root),
   aiAbort: (requestId: number): void => ipcRenderer.send('ai:abort', requestId),
-  aiComplete: (req: { requestId: number; system: string; prompt: string; maxTokens?: number }): Promise<string | null> =>
+  aiComplete: (req: { requestId: number; system: string; prompt: string; maxTokens?: number; inline?: { language: string; prefix: string; suffix: string } }): Promise<string | null> =>
     ipcRenderer.invoke('ai:complete', req),
+  authState: (): Promise<AuthState> => ipcRenderer.invoke('auth:state'),
+  authMode: (): Promise<{ direct: boolean }> => ipcRenderer.invoke('auth:mode'),
+  authStart: (): Promise<{ ok: true; state: AuthState } | { ok: false; error: string }> => ipcRenderer.invoke('auth:start'),
+  authCancel: (): Promise<void> => ipcRenderer.invoke('auth:cancel'),
+  authSignOut: (): Promise<void> => ipcRenderer.invoke('auth:signOut'),
+  authMe: (): Promise<Me | null> => ipcRenderer.invoke('auth:me'),
+  authGetUrl: (): Promise<string> => ipcRenderer.invoke('auth:getUrl'),
+  authSetUrl: (url: string): Promise<{ ok: true } | { ok: false; error: string }> => ipcRenderer.invoke('auth:setUrl', url),
+  onAuthState: (cb: (s: AuthState) => void): (() => void) => {
+    const h = (_e: unknown, s: AuthState): void => cb(s)
+    ipcRenderer.on('auth:state', h)
+    return () => ipcRenderer.removeListener('auth:state', h)
+  },
   onAiEvent: (handlers: {
     delta: (id: number, text: string) => void
     done: (id: number, stopReason: string | null, inTok: number, outTok: number) => void

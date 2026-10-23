@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { MODELS } from './models'
 import { getSettings, useSettings } from './settings'
+import { SignInCard } from './AccountCard'
+import { useAuth } from './authStore'
 import { ChatImage, toChatImage } from './imageUtil'
 import { RulesChip } from './RulesChip'
 
@@ -222,6 +224,7 @@ export function ChatPanel({
   const [msgs, setMsgs] = useState<Msg[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
+  const auth = useAuth()
   const [hasKey, setHasKey] = useState<boolean | null>(null)
   const [keyInput, setKeyInput] = useState('')
   const [editingKey, setEditingKey] = useState(false)
@@ -236,7 +239,7 @@ export function ChatPanel({
 
   useEffect(() => {
     void window.api.aiHasKey().then(setHasKey)
-  }, [])
+  }, [auth.state.state])
 
   useEffect(() => {
     const patchLast = (fn: (m: Msg) => Msg): void =>
@@ -474,7 +477,16 @@ export function ChatPanel({
     setHasKey(false)
   }
 
-  if (hasKey === false || editingKey) {
+  if (!auth.direct && auth.loaded && hasKey === false) {
+    return (
+      <aside className="chat" aria-label="AI chat">
+        <div className="chat-header">AI CHAT</div>
+        <SignInCard />
+      </aside>
+    )
+  }
+
+  if (auth.direct && (hasKey === false || editingKey)) {
     return (
       <aside className="chat" aria-label="AI chat">
         <div className="chat-header">AI CHAT</div>
@@ -517,9 +529,11 @@ export function ChatPanel({
           <button title="Switch to agent mode" onClick={onSwitch}>
             Agent
           </button>
-          <button title="API key" onClick={() => setEditingKey(true)}>
-            Key
-          </button>
+          {auth.direct && (
+            <button title="API key" onClick={() => setEditingKey(true)}>
+              Key
+            </button>
+          )}
           <button title="New chat" onClick={() => !busy && setMsgs([])}>
             New
           </button>

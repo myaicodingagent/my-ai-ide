@@ -89,7 +89,7 @@ export function DebugPanel({
   const outRef = useRef<HTMLPreElement>(null)
 
   const usingConfig = configs.some((c) => c.name === selected)
-  const runnable = usingConfig || (!!activeFile && /\.((c|m)?(j|t)sx?|pyw?)$/i.test(activeFile))
+  const runnable = usingConfig || (!!activeFile && /\.((c|m)?(j|t)sx?|pyw?|go)$/i.test(activeFile))
   const active = isActive(d)
 
   // Variables and watches follow the stop position.
@@ -162,7 +162,7 @@ export function DebugPanel({
       {problems.length > 0 && <div className="chat-error" data-dbg-problems>{problems.join(' ')}</div>}
       <div className="dbg-bar">
         {!active ? (
-          <button className="primary" data-dbg-action="start" disabled={!runnable} title={runnable ? 'Run the open file with the debugger (F5)' : 'Open a .js, .ts or .py file to debug it'} onClick={() => void start()}>
+          <button className="primary" data-dbg-action="start" disabled={!runnable} title={runnable ? 'Run the open file with the debugger (F5)' : 'Open a .js, .ts, .py or .go file to debug it'} onClick={() => void start()}>
             ▶ Start Debugging
           </button>
         ) : (

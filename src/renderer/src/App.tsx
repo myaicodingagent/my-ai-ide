@@ -5,7 +5,10 @@ import { LiveRegions, announce } from './a11y'
 import { ContextMenu, MenuItem } from './ContextMenu'
 import { Breadcrumbs } from './Breadcrumbs'
 import { addRecentFolder, getRecentFolders, loadExtraFolders, loadSession, removeRecentFolder, saveExtraFolders, saveSession } from './session'
-import { TerminalPanel, readActiveTerminalText } from './TerminalPanel'
+import { TerminalPanel, PanelTab, readActiveTerminalText } from './TerminalPanel'
+import { DebugConsoleView, OutputView, ProblemsView } from './PanelViews'
+import { OpenEditors, Outline, Timeline } from './ExplorerSections'
+import { APP_CHANNEL, TASKS_CHANNEL, appendOutput as logOutput } from './outputStore'
 import { ApprovalDialog, Approval } from './ApprovalDialog'
 import { QuickPick, PickItem } from './QuickPick'
 import { ChatPanel, EditorContext } from './ChatPanel'
@@ -14,8 +17,12 @@ import { registerAutocomplete } from './autocomplete'
 import { AgentPanel } from './AgentPanel'
 import { SearchPanel } from './SearchPanel'
 import { Welcome } from './Welcome'
+import { MenuBar, MenuDef } from './MenuBar'
+import { Icons } from './ActivityBar'
 import { applyTheme, getTheme, getThemes, subscribeTheme } from './theme'
 import { SettingsDialog } from './SettingsDialog'
+import { AccountDialog } from './AccountCard'
+import { planSummary, useAuth } from './authStore'
 import { useUpdateState } from './update'
 import { editorOptions, getSettings, updateSettings, useSettings } from './settings'
 import { GitPanel } from './GitPanel'
@@ -41,7 +48,7 @@ import { validSshTarget, wslUnc } from '../../main/shellspec'
 import type { ConnectResult } from '../../main/sshfs'
 import { extensionCommands, initExtensions } from './extStore'
 import { attachDebugEditor, toggleBreakpointAtCaret } from './debugEditor'
-import { getDebug, initDebug, isActive as debugActive, startDebugging, stepDebug, stopDebugging, clearBreakpoints as clearAllBreakpoints } from './debugStore'
+import { attachDebugging, getDebug, initDebug, isActive as debugActive, startDebugging, stepDebug, stopDebugging, clearBreakpoints as clearAllBreakpoints } from './debugStore'
 import { initBackground, needsAttention, useBgTasks } from './bgStore'
 
 interface Tab {
@@ -66,7 +73,8 @@ export function App(): JSX.Element {
   const roots = useMemo(() => (root ? [root, ...extraRoots] : []), [root, extraRoots])
   const [tabs, setTabs] = useState<Tab[]>([])
   const [active, setActive] = useState<string | null>(null)
-  const [showTerminal, setShowTerminal] = useState(false)
+  const [showTerminal, setShowTerminal] = useState(false) // the bottom panel is shown
+  const [panelTab, setPanelTab] = useState<PanelTab>('terminal')
   // The terminal panel stays mounted after the first time it is shown, so its sessions survive hiding it.
   const [terminalOpened, setTerminalOpened] = useState(false)
   const [newTermSignal, setNewTermSignal] = useState(0)
@@ -78,11 +86,34 @@ export function App(): JSX.Element {
   const newTerminal = useCallback((shellId?: string, extra?: { title: string; command: string; cwd: string | null }): void => {
     setNewTermShell(typeof shellId === 'string' ? shellId : null)
     setNewTermExtra(extra ?? null)
+    setPanelTab('terminal')
     setShowTerminal(true)
     setTerminalOpened(true)
     setNewTermSignal((n) => n + 1)
   }, [])
   const hideTerminal = useCallback((): void => setShowTerminal(false), [])
+  // The last terminal closing hides the panel only if the terminal is what you are looking at.
+  const panelTabRef = useRef(panelTab)
+  panelTabRef.current = panelTab
+  const terminalEmpty = useCallback((): void => {
+    if (panelTabRef.current === 'terminal') setShowTerminal(false)
+  }, [])
+  const showPanelTab = useCallback((tab: PanelTab): void => {
+    setPanelTab(tab)
+    setShowTerminal(true)
+    setTerminalOpened(true)
+  }, [])
+  // Ctrl+`: show the terminal; if the panel shows something else, switch to the terminal; if it is the terminal, hide.
+  const toggleTerminal = useCallback((): void => {
+    setShowTerminal((vis) => {
+      if (vis && panelTabRef.current !== 'terminal') {
+        setPanelTab('terminal')
+        return true
+      }
+      if (!vis) setPanelTab('terminal')
+      return !vis
+    })
+  }, [])
   useEffect(() => {
     if (!showTerminal) {
       setNewTermShell(null) // a shell or task asked for once is not asked for again when the panel is shown later
@@ -114,6 +145,7 @@ export function App(): JSX.Element {
   const [toast, setToast] = useState<{ text: string; kind: string; n: number } | null>(null)
   const showToast = useCallback((text: string, kind = 'info'): void => {
     setToast((cur) => ({ text, kind, n: (cur?.n ?? 0) + 1 }))
+    logOutput(APP_CHANNEL, (kind === 'error' ? 'Error: ' : '') + text)
     announce(text, kind === 'error' ? 'assertive' : 'polite')
   }, [])
   useEffect(() => {
@@ -323,6 +355,7 @@ export function App(): JSX.Element {
       if (ed?.getModel()) ed.focus()
       else document.querySelector<HTMLElement>('.tabs [tabindex="0"], .tabs [role="tab"]')?.focus()
     } else if (name === 'terminal') {
+      setPanelTab('terminal')
       setShowTerminal(true)
       setTerminalOpened(true)
       setTimeout(() => document.querySelector<HTMLElement>('.terminal-panel .xterm-helper-textarea')?.focus(), 80)
@@ -437,6 +470,7 @@ export function App(): JSX.Element {
     if (missing.length) return void window.alert('This task depends on tasks that do not exist: ' + missing.join(', '))
     if (commands.length === 0) return void window.alert('This task has nothing to run.')
     announce('Running task ' + task.label)
+    logOutput(TASKS_CHANNEL, 'Running task: ' + task.label)
     const ctx = { root: r, file: focusedPath() }
     const cwd = task.cwd ? expandVars(task.cwd, ctx) : r
     newTerminal(undefined, { title: 'Task: ' + task.label, command: expandVars(commands.join('; '), ctx), cwd })
@@ -465,14 +499,14 @@ export function App(): JSX.Element {
     void reloadTasks()
   }, [])
   // Files the debugger can run: JavaScript and TypeScript (Node), Python.
-  const isRunnable = (p: string | null): p is string => !!p && /[.]((c|m)?(j|t)sx?|pyw?)$/i.test(p)
+  const isRunnable = (p: string | null): p is string => !!p && /[.]((c|m)?(j|t)sx?|pyw?|go)$/i.test(p)
   // Saves the file first (the program runs from disk), then starts it under the debugger.
   const startDebug = useCallback(async (): Promise<string | null> => {
     const file = focusedPath()
     const r = rootRef.current
     const cfg = tasksInfoRef.current?.launch.find((l) => l.name === launchSelRef.current)
     // A launch configuration names its own program; only the plain "Current file" choice needs an open file.
-    if (!(cfg && r) && !isRunnable(file)) return 'Open a .js, .ts or .py file to debug it.'
+    if (!(cfg && r) && !isRunnable(file)) return 'Open a .js, .ts, .py or .go file to debug it.'
     const tab = tabsRef.current.find((t) => t.path === file)
     if (tab?.dirty) await saveTab(tab)
     showDebug()
@@ -570,6 +604,8 @@ export function App(): JSX.Element {
     }
   }, [settings.autoCheckUpdates])
   const [showSettings, setShowSettings] = useState(false)
+  const [showAccount, setShowAccount] = useState(false)
+  const auth = useAuth()
   const autocomplete = settings.autocomplete
   const autocompleteRef = useRef(autocomplete)
   autocompleteRef.current = autocomplete
@@ -723,12 +759,15 @@ export function App(): JSX.Element {
 
   // ---- Workspace folders: more than one project folder in the same window ----
   const extrasLoadedFor = useRef<string | null>(null)
+  // Folders from a .code-workspace file, used instead of the remembered ones when its main folder opens.
+  const pendingExtras = useRef<string[] | null>(null)
   useEffect(() => {
     extrasLoadedFor.current = null
     if (!root) return setExtraRoots([])
     let cancelled = false
     void (async () => {
-      const saved = loadExtraFolders(root)
+      const saved = pendingExtras.current ?? loadExtraFolders(root)
+      pendingExtras.current = null
       const alive: string[] = []
       for (const d of saved) if (await window.api.fsIsDir(d)) alive.push(d)
       if (cancelled) return
@@ -752,6 +791,25 @@ export function App(): JSX.Element {
     if ([r, ...extraRootsRef.current].some((x) => samePath(x) === samePath(dir))) return void window.alert('That folder is already in the workspace.')
     extrasLoadedFor.current = r // a manual change counts as loaded
     setExtraRoots((cur) => [...cur, dir])
+  }, [])
+  const openWorkspaceFile = useCallback(async (): Promise<void> => {
+    const r = await window.api.openWorkspaceFile()
+    if (!r) return
+    if ('error' in r) return void window.alert(r.error)
+    const [main, ...rest] = r.folders
+    if (rootRef.current && samePath(main) === samePath(rootRef.current)) {
+      extrasLoadedFor.current = rootRef.current
+      return setExtraRoots(rest)
+    }
+    pendingExtras.current = rest
+    await openFolderPathRef.current(main)
+    if (rootRef.current && samePath(rootRef.current) !== samePath(main)) pendingExtras.current = null // the user declined
+  }, [])
+  const saveWorkspaceFile = useCallback(async (): Promise<void> => {
+    const r = rootRef.current
+    if (!r) return void window.alert('Open a folder first.')
+    const file = await window.api.saveWorkspaceFile([r, ...extraRootsRef.current])
+    if (file) showToast(`Saved ${baseName(file)}`)
   }, [])
   const removeWorkspaceFolder = useCallback((dir: string): void => {
     setExtraRoots((cur) => cur.filter((x) => x !== dir))
@@ -1555,13 +1613,15 @@ export function App(): JSX.Element {
       const go = (): void => {
         ed.focus()
         if (!ed.hasTextFocus() && ++tries < 10) return void setTimeout(go, 40)
-        void ed.getAction(id)?.run()
+        // Some of Monaco's features (go to definition...) are commands, not actions: run those as commands.
+        const action = ed.getAction(id)
+        if (action) void action.run()
+        else ed.trigger('menu', id, null)
       }
       setTimeout(go, 80)
     }
 
-  const openPalette = useCallback((): void => {
-    setPickItems([
+  const buildCommands = (): PickItem[] => [
       { label: 'File: Open Folder', run: () => void openFolder() },
       { label: 'File: Save', run: () => void save() },
       { label: 'Agent: Run a Task in the Background…', run: () => showAgents() },
@@ -1586,8 +1646,29 @@ export function App(): JSX.Element {
       { label: 'View: Focus AI Panel', run: () => focusRegion('chat') },
       { label: 'Debug: Start Debugging (F5)', run: () => void startDebug() },
       {
+        label: 'Debug: Install the Go Debugger (Delve)',
+        run: () => newTerminal(undefined, { title: 'Install Delve', command: 'go install github.com/go-delve/delve/cmd/dlv@latest', cwd: rootRef.current })
+      },
+      {
         label: 'Debug: Install the Python Debugger (debugpy)',
         run: () => newTerminal(undefined, { title: 'Install debugpy', command: 'python -m pip install --user debugpy', cwd: rootRef.current })
+      },
+      {
+        label: 'Debug: Attach to Node.js Program…',
+        run: () =>
+          setInputRequest({
+            title: 'Attach to a running Node.js program: a port (9229, or host:port) or a process id with "pid "',
+            placeholder: '9229   or   pid 12345',
+            confirmLabel: 'Attach',
+            validate: (v) => (/^\s*(pid\s+\d+|\d{2,5}|[A-Za-z0-9.-]+:\d{2,5})\s*$/i.test(v) ? null : 'Use a port like 9229, host:port, or "pid 12345".'),
+            onSubmit: (v) => {
+              const t = v.trim()
+              const pid = /^pid\s+(\d+)$/i.exec(t)
+              const hp = /^(?:([A-Za-z0-9.-]+):)?(\d+)$/.exec(t)
+              showDebug()
+              void attachDebugging(pid ? { pid: Number(pid[1]) } : { host: hp?.[1], port: Number(hp?.[2]) }).then((err) => err && showToast(err, 'error'))
+            }
+          })
       },
       { label: 'Debug: Stop (Shift+F5)', run: () => void stopDebugging() },
       { label: 'Debug: Toggle Breakpoint (F9)', run: () => toggleBreakpointAtCaret(focusedEditor()) },
@@ -1597,6 +1678,8 @@ export function App(): JSX.Element {
       { label: 'Debug: Remove All Breakpoints', run: () => clearAllBreakpoints() },
       { label: 'Debug: Show Run and Debug', run: () => showDebug() },
       { label: 'File: Add Folder to Workspace…', run: () => void addWorkspaceFolder() },
+      { label: 'File: Open Workspace from File…', run: () => void openWorkspaceFile() },
+      { label: 'File: Save Workspace As…', run: () => void saveWorkspaceFile() },
       {
         label: 'File: Remove Folder from Workspace…',
         run: () => {
@@ -1635,7 +1718,7 @@ export function App(): JSX.Element {
       { label: 'Editor: Go to Line…  (Ctrl+G)', run: runEditorAction('editor.action.gotoLine') },
       { label: 'Editor: Go to Symbol in File…', run: runEditorAction('editor.action.quickOutline') },
       { label: 'Editor: Find  (Ctrl+F)', run: runEditorAction('actions.find') },
-      { label: 'Editor: Replace  (Ctrl+H)', run: runEditorAction('editor.action.startFindReplace') },
+      { label: 'Editor: Replace  (Ctrl+H)', run: runEditorAction('editor.action.startFindReplaceAction') },
       { label: 'Editor: Toggle Line Comment', run: runEditorAction('editor.action.commentLine') },
       { label: 'Editor: Fold All', run: runEditorAction('editor.foldAll') },
       { label: 'Editor: Unfold All', run: runEditorAction('editor.unfoldAll') },
@@ -1645,7 +1728,9 @@ export function App(): JSX.Element {
       { label: 'File: New File…', run: () => rootRef.current && createEntry(selected ? (selected.isDir ? selected.path : parentOf(selected.path)) : rootRef.current, 'file') },
       { label: 'File: New Folder…', run: () => rootRef.current && createEntry(selected ? (selected.isDir ? selected.path : parentOf(selected.path)) : rootRef.current, 'folder') },
       { label: 'Search: Find in Files (Ctrl+Shift+F)', run: showSearch },
-      { label: 'View: Toggle Terminal', run: () => setShowTerminal((v) => !v) },
+      { label: 'View: Toggle Terminal', run: toggleTerminal },
+      { label: 'View: Show Output', run: () => showPanelTab('output') },
+      { label: 'View: Show Debug Console', run: () => showPanelTab('debug') },
       { label: 'Terminal: New Terminal (Ctrl+Shift+`)', run: () => newTerminal() },
       {
         label: 'Terminal: New SSH Terminal…',
@@ -1665,6 +1750,7 @@ export function App(): JSX.Element {
           if (p) void openMerge(p)
         }
       },
+      { label: 'Account: Sign In or Account Details…', run: () => setShowAccount(true) },
       {
         label: 'File: Open Folder over SSH…',
         run: () => openSshFolderPicker()
@@ -1709,10 +1795,188 @@ export function App(): JSX.Element {
       { label: 'Git: Push', run: () => void window.api.gitRemote(rootRef.current ?? '', 'push').then((r) => (r.ok ? refreshGit(rootRef.current) : window.alert(r.error))) },
       { label: 'Preferences: Color Theme', run: openThemePicker },
       { label: 'Preferences: Open Settings (Ctrl+,)', run: () => setShowSettings(true) }
-    ])
+  ]
+  const openPalette = useCallback((): void => {
+    setPickItems(buildCommands())
     setPickOpts({ initial: 0 })
     setPicker('commands')
-  }, [save, saveAll, openFileSearch, toggleAutocomplete, showSearch, openThemePicker, newTerminal, openBranchPicker, createEntry, selected, openFolderPath, openProblemsPicker, openFile])
+  }, [buildCommands])
+
+  // ---- The menu bar: every entry runs a command that is also in the palette, or a Monaco editor action ----
+  const cmd = (prefix: string) => (): void => void buildCommands().find((c) => c.label.startsWith(prefix))?.run()
+  const act = (id: string) => runEditorAction(id)
+  const selectAllInEditor = (): void => {
+    const ed = focusedEditor()
+    const model = ed?.getModel()
+    if (!ed || !model) return
+    ed.focus()
+    ed.setSelection(model.getFullModelRange())
+  }
+  // Cut, copy and paste go through the system clipboard directly, so they do not depend on the browser's own permission rules.
+  const clipboardAction = (kind: 'cut' | 'copy' | 'paste') => (): void => {
+    const ed = focusedEditor()
+    const model = ed?.getModel()
+    if (!ed || !model) return
+    ed.focus()
+    const sel = ed.getSelection()
+    if (!sel) return
+    if (kind === 'paste') {
+      void window.api.readText().then((text) => {
+        if (!text) return
+        ed.pushUndoStop()
+        ed.executeEdits('menu', [{ range: sel, text, forceMoveMarkers: true }])
+        ed.pushUndoStop()
+      })
+      return
+    }
+    // With nothing selected, the whole line is used, as in VS Code.
+    const range = sel.isEmpty() ? { startLineNumber: sel.startLineNumber, startColumn: 1, endLineNumber: sel.startLineNumber + 1, endColumn: 1 } : sel
+    const text = model.getValueInRange(range)
+    void window.api.copyText(text)
+    if (kind === 'cut') {
+      ed.pushUndoStop()
+      ed.executeEdits('menu', [{ range, text: '', forceMoveMarkers: true }])
+      ed.pushUndoStop()
+    }
+  }
+  // Undo and redo are Monaco commands, not actions, so they are sent to the editor as commands.
+  const editorCommand = (id: string) => (): void => {
+    const ed = focusedEditor()
+    if (!ed || !ed.getModel()) return
+    ed.focus()
+    ed.trigger('menu', id, null)
+  }
+  const menus: MenuDef[] = [
+    {
+      label: 'File',
+      items: [
+        { label: 'New File…', run: cmd('File: New File…') },
+        { label: 'New Folder…', run: cmd('File: New Folder…') },
+        { label: 'Open Folder…', run: () => void openFolder(), separator: true },
+        { label: 'Open Recent…', run: cmd('File: Open Recent…') },
+        { label: 'Open Workspace from File…', run: () => void openWorkspaceFile() },
+        { label: 'Add Folder to Workspace…', run: () => void addWorkspaceFolder() },
+        { label: 'Save Workspace As…', run: () => void saveWorkspaceFile() },
+        { label: 'Open Folder over SSH…', run: () => openSshFolderPicker(), separator: true },
+        { label: 'Open WSL Folder…', run: cmd('File: Open WSL Folder…') },
+        { label: 'Save', shortcut: 'Ctrl+S', run: () => void save(), separator: true },
+        { label: 'Save All', shortcut: 'Ctrl+Alt+S', run: () => void saveAll() },
+        { label: 'Close Editor', shortcut: 'Ctrl+W', run: cmd('File: Close Editor'), separator: true },
+        { label: 'Reopen Closed Editor', shortcut: 'Ctrl+Shift+T', run: reopenClosedTab },
+        { label: 'Settings', shortcut: 'Ctrl+,', run: () => setShowSettings(true), separator: true },
+        { label: 'Color Theme', run: openThemePicker },
+        { label: 'Exit', run: () => window.close(), separator: true }
+      ]
+    },
+    {
+      label: 'Edit',
+      items: [
+        { label: 'Undo', shortcut: 'Ctrl+Z', run: editorCommand('undo') },
+        { label: 'Redo', shortcut: 'Ctrl+Y', run: editorCommand('redo') },
+        { label: 'Cut', shortcut: 'Ctrl+X', run: clipboardAction('cut'), separator: true },
+        { label: 'Copy', shortcut: 'Ctrl+C', run: clipboardAction('copy') },
+        { label: 'Paste', shortcut: 'Ctrl+V', run: clipboardAction('paste') },
+        { label: 'Find', shortcut: 'Ctrl+F', run: act('actions.find'), separator: true },
+        { label: 'Replace', shortcut: 'Ctrl+H', run: act('editor.action.startFindReplaceAction') },
+        { label: 'Find in Files', shortcut: 'Ctrl+Shift+F', run: showSearch },
+        { label: 'Toggle Line Comment', shortcut: 'Ctrl+/', run: act('editor.action.commentLine'), separator: true },
+        { label: 'Toggle Block Comment', shortcut: 'Shift+Alt+A', run: act('editor.action.blockComment') },
+        { label: 'Format Document', shortcut: 'Shift+Alt+F', run: act('editor.action.formatDocument') },
+        { label: 'Edit Selection with AI', shortcut: 'Ctrl+K', run: () => startInlineRef.current(), separator: true }
+      ]
+    },
+    {
+      label: 'Selection',
+      items: [
+        { label: 'Select All', shortcut: 'Ctrl+A', run: selectAllInEditor },
+        { label: 'Expand Selection', shortcut: 'Shift+Alt+Right', run: act('editor.action.smartSelect.expand') },
+        { label: 'Shrink Selection', shortcut: 'Shift+Alt+Left', run: act('editor.action.smartSelect.shrink') },
+        { label: 'Copy Line Up', shortcut: 'Shift+Alt+Up', run: act('editor.action.copyLinesUpAction'), separator: true },
+        { label: 'Copy Line Down', shortcut: 'Shift+Alt+Down', run: act('editor.action.copyLinesDownAction') },
+        { label: 'Move Line Up', shortcut: 'Alt+Up', run: act('editor.action.moveLinesUpAction') },
+        { label: 'Move Line Down', shortcut: 'Alt+Down', run: act('editor.action.moveLinesDownAction') },
+        { label: 'Add Cursor Above', shortcut: 'Ctrl+Alt+Up', run: act('editor.action.insertCursorAbove'), separator: true },
+        { label: 'Add Cursor Below', shortcut: 'Ctrl+Alt+Down', run: act('editor.action.insertCursorBelow') },
+        { label: 'Add Next Occurrence', shortcut: 'Ctrl+D', run: act('editor.action.addSelectionToNextFindMatch') },
+        { label: 'Select All Occurrences', shortcut: 'Ctrl+Shift+L', run: act('editor.action.selectHighlights') }
+      ]
+    },
+    {
+      label: 'View',
+      items: [
+        { label: 'Command Palette…', shortcut: 'Ctrl+Shift+P', run: openPalette },
+        { label: 'Explorer', run: () => { setShowSidebar(true); setSidebarView('files') }, separator: true },
+        { label: 'Search', shortcut: 'Ctrl+Shift+F', run: showSearch },
+        { label: 'Source Control', shortcut: 'Ctrl+Shift+G', run: () => { setShowSidebar(true); setSidebarView('git') } },
+        { label: 'Run and Debug', run: () => showDebug() },
+        { label: 'Extensions', run: () => { setShowSidebar(true); setSidebarView('ext') } },
+        { label: 'Agents', run: () => showAgents() },
+        { label: 'AI Chat', shortcut: 'Ctrl+L', run: () => setShowChat((v) => !v), checked: showChat, separator: true },
+        { label: 'Terminal', shortcut: 'Ctrl+`', run: toggleTerminal, checked: showTerminal && panelTab === 'terminal' },
+        { label: 'Problems', run: () => showPanelTab('problems'), checked: showTerminal && panelTab === 'problems' },
+        { label: 'Output', run: () => showPanelTab('output'), checked: showTerminal && panelTab === 'output' },
+        { label: 'Debug Console', run: () => showPanelTab('debug'), checked: showTerminal && panelTab === 'debug' },
+        { label: 'Toggle Sidebar', shortcut: 'Ctrl+B', run: () => setShowSidebar((v) => !v), checked: showSidebar, separator: true },
+        { label: 'Toggle Word Wrap', run: () => updateSettings({ wordWrap: !getSettings().wordWrap }), checked: getSettings().wordWrap },
+        { label: 'Split Editor Right', shortcut: 'Ctrl+\\', run: () => openSplit(null, 'right'), separator: true },
+        { label: 'Split Editor Down', run: () => openSplit(null, 'down') },
+        { label: 'Close Split Editor', run: () => closeSplit() },
+        { label: 'Zoom In', shortcut: 'Ctrl+=', run: () => updateSettings({ uiZoom: getSettings().uiZoom + 0.1 }), separator: true },
+        { label: 'Zoom Out', shortcut: 'Ctrl+-', run: () => updateSettings({ uiZoom: getSettings().uiZoom - 0.1 }) },
+        { label: 'Reset Zoom', shortcut: 'Ctrl+0', run: () => updateSettings({ uiZoom: 1 }) }
+      ]
+    },
+    {
+      label: 'Go',
+      items: [
+        { label: 'Go to File…', shortcut: 'Ctrl+P', run: () => void openFileSearch() },
+        { label: 'Go to Symbol in File…', shortcut: 'Ctrl+Shift+O', run: act('editor.action.quickOutline') },
+        { label: 'Go to Line…', shortcut: 'Ctrl+G', run: act('editor.action.gotoLine') },
+        { label: 'Go to Definition', shortcut: 'F12', run: act('editor.action.revealDefinition'), separator: true },
+        { label: 'Go to References', shortcut: 'Shift+F12', run: act('editor.action.goToReferences') },
+        { label: 'Next Problem', shortcut: 'F8', run: act('editor.action.marker.next'), separator: true },
+        { label: 'Previous Problem', shortcut: 'Shift+F8', run: act('editor.action.marker.prev') },
+        { label: 'Reveal Active File in Explorer', run: () => activeRef.current && revealInExplorer(activeRef.current), separator: true }
+      ]
+    },
+    {
+      label: 'Run',
+      items: [
+        { label: 'Start Debugging', shortcut: 'F5', run: () => void startDebug() },
+        { label: 'Stop Debugging', shortcut: 'Shift+F5', run: () => void stopDebugging() },
+        { label: 'Step Over', shortcut: 'F10', run: () => void stepDebug('stepOver'), separator: true },
+        { label: 'Step Into', shortcut: 'F11', run: () => void stepDebug('stepInto') },
+        { label: 'Step Out', shortcut: 'Shift+F11', run: () => void stepDebug('stepOut') },
+        { label: 'Toggle Breakpoint', shortcut: 'F9', run: () => toggleBreakpointAtCaret(focusedEditor()), separator: true },
+        { label: 'Remove All Breakpoints', run: () => clearAllBreakpoints() },
+        { label: 'Attach to Node.js Program…', run: cmd('Debug: Attach to Node.js Program'), separator: true },
+        { label: 'Open Launch Configurations', run: () => void openConfigFile('launch') }
+      ]
+    },
+    {
+      label: 'Terminal',
+      items: [
+        { label: 'New Terminal', shortcut: 'Ctrl+Shift+`', run: () => newTerminal() },
+        { label: 'New SSH Terminal…', run: cmd('Terminal: New SSH Terminal') },
+        { label: 'Run Task…', run: () => void openTasksPicker(), separator: true },
+        { label: 'Run Build Task', run: () => void openTasksPicker('build') },
+        { label: 'Run Test Task', run: () => void openTasksPicker('test') },
+        { label: 'Open Tasks File', run: () => void openConfigFile('tasks') },
+        { label: 'Toggle Terminal', shortcut: 'Ctrl+`', run: toggleTerminal, checked: showTerminal && panelTab === 'terminal', separator: true }
+      ]
+    },
+    {
+      label: 'Help',
+      items: [
+        { label: 'Show All Commands', shortcut: 'Ctrl+Shift+P', run: openPalette },
+        { label: 'Project Rules (AGENTS.md)', run: cmd('AI: Create or Open Project Rules') },
+        { label: 'Account…', run: () => setShowAccount(true) },
+        { label: 'Toggle Developer Tools', run: () => void window.api.toggleDevTools(), separator: true },
+        { label: 'About My AI IDE', run: () => window.alert('My AI IDE\nA code editor with Claude built in.\nElectron + React + Monaco.'), separator: true }
+      ]
+    }
+  ]
+
 
   // Debugger keys: F5 start / continue, Shift+F5 stop, F9 breakpoint, F10 / F11 / Shift+F11 step.
   useEffect(() => {
@@ -1792,7 +2056,12 @@ export function App(): JSX.Element {
         updateSettings({ uiZoom: 1 })
       } else if (k === 'g' && e.shiftKey) {
         e.preventDefault()
+        setShowSidebar(true)
         setSidebarView('git')
+      } else if (k === 'e' && e.shiftKey) {
+        e.preventDefault()
+        setShowSidebar(true)
+        setSidebarView('files')
       } else if (k === 'f' && e.shiftKey) {
         e.preventDefault()
         showSearch()
@@ -1813,52 +2082,83 @@ export function App(): JSX.Element {
         newTerminal()
       } else if (e.key === '`') {
         e.preventDefault()
-        setShowTerminal((v) => !v)
+        toggleTerminal()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [save, openPalette, openFileSearch, showSearch, newTerminal])
+  }, [save, openPalette, openFileSearch, showSearch, newTerminal, toggleTerminal])
 
   return (
     <div className="app">
+      <MenuBar menus={menus} />
       <div className="workbench">
-      <aside className={'sidebar' + (showSidebar ? '' : ' hidden')} aria-label="Side bar">
-        <div className="sidebar-header">
-          <span className="sidebar-views" role="tablist" aria-label="Side bar views">
-            <button role="tab" aria-selected={sidebarView === 'files'} className={sidebarView === 'files' ? 'on' : ''} onClick={() => setSidebarView('files')}>
-              Explorer
-            </button>
-            <button role="tab" aria-selected={sidebarView === 'search'} className={sidebarView === 'search' ? 'on' : ''} onClick={showSearch}>
-              Search
-            </button>
-            <button role="tab" aria-selected={sidebarView === 'agents'} className={sidebarView === 'agents' ? 'on' : ''} data-view="agents" onClick={showAgents}>
-              Agents
-              {bgAttention > 0 && <span className="badge" data-bg-badge>{bgAttention}</span>}
-            </button>
-            <button role="tab" aria-selected={sidebarView === 'debug'} className={sidebarView === 'debug' ? 'on' : ''} data-view="debug" onClick={showDebug}>
-              Run
-            </button>
-            <button role="tab" aria-selected={sidebarView === 'ext'} className={sidebarView === 'ext' ? 'on' : ''} data-view="ext" onClick={() => setSidebarView('ext')}>
-              Ext
-            </button>
-            <button role="tab" aria-selected={sidebarView === 'git'} className={sidebarView === 'git' ? 'on' : ''} data-view="git" onClick={() => setSidebarView('git')}>
-              Git
-              {git.status.state === 'ok' && changeCount(git.status) > 0 && (
-                <span className="badge">{changeCount(git.status)}</span>
-              )}
-            </button>
-          </span>
-          <button className="ghost" title="Open Folder…" onClick={openFolder}>
-            Open…
+      <nav className="activitybar" aria-label="Activity bar">
+        <div className="sidebar-views" role="tablist" aria-label="Side bar views" aria-orientation="vertical">
+          {(
+            [
+              { id: 'files', label: 'Explorer', key: 'Ctrl+Shift+E', icon: Icons.files, go: () => { setShowSidebar(true); setSidebarView('files') } },
+              { id: 'search', label: 'Search', key: 'Ctrl+Shift+F', icon: Icons.search, go: showSearch },
+              { id: 'git', label: 'Source Control', key: 'Ctrl+Shift+G', icon: Icons.git, go: () => { setShowSidebar(true); setSidebarView('git') } },
+              { id: 'debug', label: 'Run', key: 'F5', icon: Icons.debug, go: showDebug },
+              { id: 'ext', label: 'Extensions', key: '', icon: Icons.ext, go: () => { setShowSidebar(true); setSidebarView('ext') } },
+              { id: 'agents', label: 'Agents', key: '', icon: Icons.agents, go: showAgents }
+            ] as const
+          ).map((v) => {
+            const count = v.id === 'git' ? (git.status.state === 'ok' ? changeCount(git.status) : 0) : v.id === 'agents' ? bgAttention : 0
+            const on = sidebarView === v.id && showSidebar
+            return (
+              <button
+                key={v.id}
+                role="tab"
+                aria-selected={sidebarView === v.id}
+                className={'activity-btn' + (on ? ' on' : '')}
+                data-view={v.id}
+                title={v.label + (v.key ? ` (${v.key})` : '')}
+                onClick={v.go}
+              >
+                {v.icon}
+                <span className="sr-only">{v.label}</span>
+                {count > 0 && <span className="badge" data-bg-badge={v.id === 'agents' ? '' : undefined}>{count}</span>}
+              </button>
+            )
+          })}
+        </div>
+        <div className="activity-bottom">
+          <button className="activity-btn" title="Account" aria-label="Account" onClick={() => setShowAccount(true)}>
+            {Icons.account}
+          </button>
+          <button className="activity-btn" title="Settings (Ctrl+,)" aria-label="Settings" onClick={() => setShowSettings(true)}>
+            {Icons.settings}
           </button>
         </div>
+      </nav>
+      <aside className={'sidebar' + (showSidebar ? '' : ' hidden')} aria-label="Side bar">
+        <div className="sidebar-header">
+          <span className="sidebar-title">
+            {{ files: 'Explorer', search: 'Search', git: 'Source Control', debug: 'Run and Debug', ext: 'Extensions', agents: 'Agents' }[sidebarView]}
+          </span>
+          <button className="ghost icon-btn" title="Open Folder…" aria-label="Open Folder" onClick={openFolder}>
+            {Icons.folder}
+          </button>
+        </div>
+        <div className="explorer" style={{ display: sidebarView === 'files' ? 'flex' : 'none' }}>
+        <OpenEditors
+          tabs={tabs}
+          active={active}
+          onActivate={(p) => {
+            setActive(p)
+            setDiffView(null)
+          }}
+          onClose={closeTab}
+          onSaveAll={() => void saveAll()}
+          onCloseAll={() => closeMany(tabsRef.current.map((t) => t.path))}
+        />
         <div
           className="tree"
           role="tree"
           aria-label="Files"
           onKeyDown={treeKeyDown}
-          style={{ display: sidebarView === 'files' ? 'block' : 'none' }}
           onContextMenu={(e) => {
             if (!root) return
             e.preventDefault()
@@ -1898,6 +2198,13 @@ export function App(): JSX.Element {
               </button>
             </div>
           )}
+        </div>
+        {root && (
+          <>
+            <Outline model={tabs.find((t) => t.path === active)?.model ?? null} onReveal={(line) => active && void openFile(active, line)} />
+            <Timeline roots={roots} file={active} refreshKey={`${git.status.branch ?? ''}:${git.status.state === 'ok' ? changeCount(git.status) : 0}:${git.status.ahead ?? 0}`} onOpen={showFileHistory} />
+          </>
+        )}
         </div>
         {/* Kept mounted so results survive switching back to the explorer. */}
         <div className="tree" style={{ display: sidebarView === 'search' ? 'block' : 'none' }}>
@@ -2061,9 +2368,16 @@ export function App(): JSX.Element {
             newTabSignal={newTermSignal}
             newTabShell={newTermShell}
             newTabExtra={newTermExtra}
-            onEmpty={hideTerminal}
+            onEmpty={terminalEmpty}
             onHide={hideTerminal}
-          />
+            panelTab={panelTab}
+            onPanelTab={showPanelTab}
+            problemCount={problems.errors + problems.warnings}
+          >
+            {panelTab === 'problems' && <ProblemsView onOpen={(f, l) => void openFile(f, l)} />}
+            {panelTab === 'output' && <OutputView />}
+            {panelTab === 'debug' && <DebugConsoleView />}
+          </TerminalPanel>
         )}
       </main>
       {/* Both panels stay mounted so switching modes keeps each conversation. */}
@@ -2105,6 +2419,16 @@ export function App(): JSX.Element {
             ⇄ SSH: {root.split('\\')[2]?.slice(4)}
           </span>
         )}
+        {!auth.direct && auth.loaded && (
+          <button
+            className="sb-item sb-btn"
+            data-sb="account"
+            title={auth.state.state === 'signed-in' ? 'Your account and plan' : 'Sign in to use the AI features'}
+            onClick={() => setShowAccount(true)}
+          >
+            {auth.state.state === 'signed-in' ? '● ' + (planSummary(auth.state.me) || 'Signed in') : auth.state.state === 'signing-in' ? 'Signing in…' : '○ Sign in'}
+          </button>
+        )}
         {Object.entries(extStatus).map(([id, it]) => (
           <button key={id} className="sb-item sb-btn" data-sb-ext={id} title={it.tooltip || it.text} disabled={!it.command} onClick={() => it.command && void window.api.extRun(it.extId, it.command)}>
             {it.text}
@@ -2136,7 +2460,7 @@ export function App(): JSX.Element {
           className="sb-item sb-btn"
           data-sb="problems"
           title="Errors and warnings in open files"
-          onClick={openProblemsPicker}
+          onClick={() => showPanelTab('problems')}
         >
           ⊗ {problems.errors} ⚠ {problems.warnings}
         </button>
@@ -2175,6 +2499,7 @@ export function App(): JSX.Element {
         </button>
       </footer>
       {showSettings && <SettingsDialog onClose={() => setShowSettings(false)} />}
+      {showAccount && <AccountDialog onClose={() => setShowAccount(false)} />}
       {applying && <div className="apply-toast" data-apply-busy>Claude is applying the change…</div>}
       {choice && (
         <ChoiceDialog

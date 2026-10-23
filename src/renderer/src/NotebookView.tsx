@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { monaco } from './monaco-setup'
 import { announce } from './a11y'
+import { InputDialog, InputRequest } from './InputDialog'
 import { editorOptions, useSettings } from './settings'
 import { renderMarkdown } from './miniMarkdown'
 import {
@@ -273,6 +274,8 @@ export function NotebookView({
   }, [])
   useEffect(() => stopKernel, [stopKernel])
 
+  const [askInput, setAskInput] = useState<(InputRequest & { onCancel?: () => void }) | null>(null)
+
   const ensureKernel = useCallback(async (): Promise<number | null> => {
     if (session.current !== null) return session.current
     setKernelStatus('starting')
@@ -301,6 +304,24 @@ export function NotebookView({
       const cell = cur.cells.find((c) => c.id === cellId)
       if (!cell) return
       let outputs = cell.outputs
+      if (ev.type === 'input_request') {
+        const answer = (v: string | null): void => void window.api.nbInput(sid, v)
+        let answered = false
+        setAskInput({
+          title: ev.prompt || 'The code is asking for input',
+          confirmLabel: 'Send',
+          onSubmit: (v) => {
+            answered = true
+            commit(updateCell(nbRef.current!, cellId, { outputs: appendStream(nbRef.current!.cells.find((c) => c.id === cellId)?.outputs ?? [], 'stdout', `${ev.prompt}${v}
+`) }), false)
+            answer(v)
+          },
+          onCancel: () => {
+            if (!answered) answer(null)
+          }
+        })
+        return
+      }
       if (ev.type === 'stream') outputs = appendStream(outputs, ev.name, ev.text)
       else if (ev.type === 'result') outputs = [...outputs, { output_type: 'execute_result', data: ev.data, metadata: {}, execution_count: cell.execution_count }]
       else if (ev.type === 'display') outputs = [...outputs, { output_type: 'display_data', data: ev.data, metadata: {} }]
@@ -477,6 +498,17 @@ export function NotebookView({
 
   return (
     <div className="notebook" data-notebook ref={rootRef} role="region" aria-label={`Notebook ${baseName(path)}`}>
+      {askInput && (
+        <InputDialog
+          request={askInput}
+          onClose={() => {
+            // Submitting closes the dialog first and then sends the answer, so judge "cancelled" after that.
+            const cancel = askInput.onCancel
+            setTimeout(() => cancel?.(), 0)
+            setAskInput(null)
+          }}
+        />
+      )}
       <div className="nb-toolbar">
         <span className="diff-title">{baseName(path)}</span>
         <button data-nb-action="run-all" onClick={() => void runCells(nb.cells.map((c) => c.id))} title="Run every code cell, top to bottom">
