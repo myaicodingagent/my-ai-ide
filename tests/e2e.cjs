@@ -806,7 +806,7 @@ function removeTestHistory() {
     // r3.txt is open with unsaved edits: it must never be changed behind the editor's back
     await c.ev(`document.querySelector('.tree-row[data-tree-path$="r3.txt"]').click()`)
     await waitFor(async () => (await activeTab()) === 'r3.txt', 'r3 open')
-    await waitFor(() => c.ev(`/alpha in an open file/.test(document.querySelector('.group-main .monaco-editor .view-lines')?.innerText ?? '')`), 'r3 shown in the editor')
+    await waitFor(() => c.ev(`/alpha.in.an.open.file/.test(document.querySelector('.group-main .monaco-editor .view-lines')?.innerText ?? '')`), 'r3 shown in the editor')
     await sleep(300)
     await typeInEditor('#')
     await waitFor(async () => (await dirtyTabs()).includes('r3.txt'), 'r3 dirty')
