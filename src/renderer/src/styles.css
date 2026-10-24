@@ -626,7 +626,12 @@ html.reduce-motion *, html.reduce-motion *::before, html.reduce-motion *::after 
 .xt-row { display: flex; align-items: center; gap: 4px; min-height: 22px; padding-right: 8px; cursor: pointer; white-space: nowrap; }
 .xt-row:hover { background: var(--hover); }
 .xt-chev { width: 12px; flex: none; color: var(--muted); font-size: 10px; text-align: center; }
-.xt-icon { width: 14px; flex: none; text-align: center; color: var(--accent); font-size: 10px; font-weight: 700; }
+.xt-icon { width: 14px; flex: none; text-align: center; color: var(--accent); font-size: 14px; line-height: 1; }
+.xt-icon.xt-img { height: 14px; object-fit: contain; }
+.xt-inline-actions { margin-left: auto; display: none; gap: 2px; }
+.xt-row:hover .xt-inline-actions, .xt-row:focus-within .xt-inline-actions { display: inline-flex; }
+.xt-inline { background: transparent; border: 1px solid var(--border); color: var(--fg); border-radius: 3px; font-size: 11px; padding: 0 5px; cursor: pointer; }
+.xt-inline:hover, .xt-inline:focus-visible { background: var(--hover); }
 .xt-label { overflow: hidden; text-overflow: ellipsis; }
 .xt-desc { margin-left: 6px; color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
 

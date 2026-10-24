@@ -17,13 +17,25 @@ fs.writeFileSync(path.join(proj, 'readme.txt'), 'hello\n')
 fs.writeFileSync(path.join(extDir, 'package.json'), JSON.stringify({
   name: 'demo-tree', publisher: 'local', version: '1.0.0', main: './extension.js', activationEvents: ['*'], engines: { vscode: '^1.85.0' },
   contributes: {
-    commands: [{ command: 'demo.refresh', title: 'Demo: Refresh' }],
+    commands: [{ command: 'demo.refresh', title: 'Demo: Refresh' }, { command: 'demo.rename', title: 'Rename' }, { command: 'demo.eat', title: 'Eat' }, { command: 'demo.openfolder', title: 'Open Folder' }, { command: 'demo.wave', title: 'Wave' }, { command: 'demo.hidden', title: 'Never Shown' }],
+    menus: { 'view/item/context': [
+      { command: 'demo.eat', when: 'view == demo.tree && viewItem =~ /^(fruit|veg)$/', group: '2_eat@2' },
+      { command: 'demo.rename', when: 'view == demo.tree && viewItem == fruit', group: '1_modify@1' },
+      { command: 'demo.openfolder', when: "view == demo.tree && viewItem == 'group'", group: 'navigation' },
+      { command: 'demo.wave', when: 'view == demo.tree && viewItem == fruit', group: 'inline' },
+      { command: 'demo.hidden', when: 'view == some.other.tree', group: '9_x' },
+      { command: 'demo.hidden', when: 'view == demo.tree && !(viewItem == fruit || viewItem == veg || viewItem == group)', group: '9_x' }
+    ] },
     viewsContainers: { activitybar: [{ id: 'demo-bar', title: 'Demo Bar', icon: 'icon.svg' }] },
     views: { explorer: [{ id: 'demo.tree', name: 'Demo Tree' }], 'demo-bar': [{ id: 'demo.bar', name: 'Bar Items' }] }
   }
 }))
+fs.writeFileSync(path.join(extDir, 'leaf.svg'), '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><circle cx="8" cy="8" r="6" fill="#33aa33"/></svg>')
+fs.writeFileSync(path.join(extDir, 'veg-light.svg'), '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="12" height="12" fill="#ff8800"/></svg>')
+fs.writeFileSync(path.join(extDir, 'veg-dark.svg'), '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="12" height="12" fill="#00ccff"/></svg>')
 fs.writeFileSync(path.join(extDir, 'extension.js'), `
 const vscode = require('vscode')
+const path = require('path')
 exports.activate = (context) => {
   const emitter = new vscode.EventEmitter()
   let tick = 0
@@ -36,15 +48,18 @@ exports.activate = (context) => {
       return []
     },
     getTreeItem(el) {
-      if (el.kind === 'group') { const i = new vscode.TreeItem(el.name, vscode.TreeItemCollapsibleState.Collapsed); i.description = groups[el.name].length + ' items'; i.iconPath = new vscode.ThemeIcon('folder'); return i }
+      if (el.kind === 'group') { const i = new vscode.TreeItem(el.name, vscode.TreeItemCollapsibleState.Collapsed); i.description = groups[el.name].length + ' items'; i.iconPath = new vscode.ThemeIcon('folder'); i.contextValue = 'group'; return i }
       if (el.kind === 'tick') return new vscode.TreeItem('refreshed ' + tick + ' times')
       const i = new vscode.TreeItem(el.name)
+      i.contextValue = el.name === 'carrot' ? 'veg' : 'fruit'
+      i.iconPath = el.name === 'carrot' ? { light: vscode.Uri.file(path.join(__dirname, 'veg-light.svg')), dark: vscode.Uri.file(path.join(__dirname, 'veg-dark.svg')) } : vscode.Uri.file(path.join(__dirname, 'leaf.svg'))
       i.command = { command: 'demo.picked', title: 'Pick', arguments: [el.name] }
       return i
     }
   }
   context.subscriptions.push(vscode.window.createTreeView('demo.tree', { treeDataProvider: provider }))
   vscode.window.registerTreeDataProvider('demo.bar', { getChildren: () => ['one', 'two', 'three'], getTreeItem: (n) => new vscode.TreeItem(n) })
+  for (const [cmd, word] of [['demo.rename', 'renamed'], ['demo.eat', 'ate'], ['demo.openfolder', 'opened'], ['demo.wave', 'waved']]) context.subscriptions.push(vscode.commands.registerCommand(cmd, (el, all) => vscode.window.showInformationMessage(word + ' ' + el.name + ' of ' + all.length)))
   context.subscriptions.push(vscode.commands.registerCommand('demo.picked', (name) => vscode.window.showInformationMessage('picked ' + name)))
   context.subscriptions.push(vscode.commands.registerCommand('demo.refresh', () => { tick++; groups.Fruits.push('cherry'); emitter.fire(undefined) }))
 }
@@ -92,6 +107,45 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
   await ev(`[...document.querySelectorAll('.qp-item')].find((i) => i.textContent.includes('Demo: Refresh'))?.click()`)
   check('when the extension fires its change event the tree reloads (a new child, a changed label)', await waitFor(async () => { const r = await rows('demo.tree'); return r.some((t) => t.includes('cherry')) && r.some((t) => t.includes('refreshed 1 times')) }), JSON.stringify(await rows('demo.tree')))
   check('and the expanded node stays expanded', (await rows('demo.tree')).some((t) => t.includes('apple')))
+  // ---- icons from files
+  const iconOf = (label) => ev(`(() => { const r = ${rowSel('demo.tree', label)}; const i = r?.querySelector('.xt-icon'); return JSON.stringify({ tag: i?.tagName, src: i?.getAttribute('src')?.slice(0, 30), cls: i?.className }) })()`).then((x) => JSON.parse(x || '{}'))
+  const apple = await iconOf('apple')
+  check('an icon given as a file is shown as an image', apple.tag === 'IMG' && /^data:image\/svg\+xml;base64,/.test(apple.src || ''), JSON.stringify(apple))
+  await realClick(rowSel('demo.tree', 'Vegetables')); await sleep(1000)
+  const decode = (label) => ev(`(() => { const i = ${rowSel('demo.tree', label)}?.querySelector('img.xt-icon'); return i ? atob(i.getAttribute('src').split(',')[1]) : '' })()`)
+  check('{ light, dark } icons: the dark theme gets the dark file', /00ccff/.test(await decode('carrot')) && !/ff8800/.test(await decode('carrot')), await decode('carrot'))
+  const folder = await iconOf('Fruits')
+  check('a ThemeIcon is a codicon, drawn by the icon font', /codicon-folder/.test(folder.cls || '') && (await ev(`getComputedStyle(${rowSel('demo.tree', 'Fruits')}.querySelector('.codicon'), '::before').content`)).length > 2, JSON.stringify(folder))
+  // ---- context menus (contributes.menus["view/item/context"])
+  const rightClick = async (sel) => { const { x, y } = JSON.parse(await ev(`(() => { const r = ${sel}.getBoundingClientRect(); return JSON.stringify({ x: r.left + 40, y: r.top + r.height / 2 }) })()`)); for (const t of ['mouseMoved', 'mousePressed', 'mouseReleased']) await send('Input.dispatchMouseEvent', { type: t, x, y, button: t === 'mouseMoved' ? 'none' : 'right', buttons: t === 'mousePressed' ? 2 : 0, clickCount: 1 }) }
+  const menuLabels = () => ev(`JSON.stringify([...document.querySelectorAll('[data-context-menu] [role="menuitem"]')].map((e) => e.textContent))`).then((x) => JSON.parse(x || '[]'))
+  const esc = async () => { await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }); await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }); await sleep(300) }
+  await rightClick(rowSel('demo.tree', 'apple')); await sleep(600)
+  let labels = await menuLabels()
+  check('right-clicking a node shows the entries whose when clause matches, in group order', JSON.stringify(labels) === JSON.stringify(['Rename', 'Eat']), JSON.stringify(labels))
+  check('entries of other views, and ones that do not match, are not shown', !labels.includes('Never Shown') && !labels.includes('Open Folder'))
+  check('a divider is drawn between groups', (await ev(`document.querySelectorAll('[data-context-menu] .ctx-sep').length`)) === 1)
+  await ev(`[...document.querySelectorAll('[data-context-menu] [role="menuitem"]')].find((e) => e.textContent === 'Rename').click()`)
+  check('choosing an entry runs its command with the node the extension gave', await waitFor(() => ev(`document.body.innerText.includes('renamed apple of 1')`)))
+  await rightClick(rowSel('demo.tree', 'carrot')); await sleep(600)
+  labels = await menuLabels()
+  check('a node with another context value gets another menu', JSON.stringify(labels) === JSON.stringify(['Eat']), JSON.stringify(labels))
+  await esc()
+  check('Escape closes the menu', (await menuLabels()).length === 0)
+  await rightClick(rowSel('demo.tree', 'Fruits')); await sleep(600)
+  labels = await menuLabels()
+  check('a group node has its own entry (the clause uses a quoted value)', JSON.stringify(labels) === JSON.stringify(['Open Folder']), JSON.stringify(labels))
+  await esc()
+  // keyboard: the Menu key on a focused row
+  await ev(`${rowSel('demo.tree', 'banana')}.focus()`)
+  await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'ContextMenu', code: 'ContextMenu', windowsVirtualKeyCode: 93 }); await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'ContextMenu', code: 'ContextMenu', windowsVirtualKeyCode: 93 }); await sleep(600)
+  check('the Menu key opens the menu of the focused node', JSON.stringify(await menuLabels()) === JSON.stringify(['Rename', 'Eat']), JSON.stringify(await menuLabels()))
+  await esc()
+  // inline entries are buttons on the row
+  check('inline entries are buttons on the row', await ev(`!!${rowSel('demo.tree', 'apple')}.querySelector('[data-xt-inline="demo.wave"]')`) && !(await ev(`!!${rowSel('demo.tree', 'carrot')}.querySelector('[data-xt-inline]')`)))
+  await ev(`${rowSel('demo.tree', 'apple')}.focus()`); await sleep(300)
+  await realClick(`${rowSel('demo.tree', 'apple')}.querySelector('[data-xt-inline="demo.wave"]')`)
+  check('clicking an inline button runs its command for that node', await waitFor(() => ev(`document.body.innerText.includes('waved apple of 1')`)))
   // the view container of its own
   check('the extension\'s own container has a button in the activity bar', await waitFor(() => ev(`!!document.querySelector('[data-view="xc:demo-bar"]')`)))
   await realClick(`document.querySelector('[data-view="xc:demo-bar"]')`); await sleep(1200)

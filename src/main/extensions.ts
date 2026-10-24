@@ -37,6 +37,8 @@ export interface ExtRecord {
   // Tree views the extension adds (their container is "explorer", another built-in one, or one of `containers`).
   views: { container: string; id: string; name: string; webview?: boolean }[]
   containers: { id: string; title: string }[] // extra activity bar entries
+  // Menu entries for tree items (contributes.menus["view/item/context"]): what to offer in a node's right-click menu.
+  treeMenus: { command: string; title: string; when: string; group: string }[]
   unsupported: string[] // contributions that are ignored (grammars, languages, debuggers...)
   codeIgnored: boolean // a VS Code extension with code (main) that cannot run here
   source: 'vsix' | 'registry' | 'folder'
@@ -100,7 +102,16 @@ async function readExtension(dir: string, source: ExtRecord['source']): Promise<
             return { id: x.command, title: category && !title.startsWith(category) ? `${category}: ${title}` : title }
           })
       : []
-  const unsupported = Object.keys(c).filter((k) => !SUPPORTED.has(k))
+  const unsupported = Object.keys(c).filter((k) => !SUPPORTED.has(k) && k !== 'menus')
+  const menus = (c.menus && typeof c.menus === 'object' ? c.menus : {}) as Record<string, unknown>
+  const otherMenus = Object.keys(menus).filter((k) => k !== 'view/item/context')
+  if (otherMenus.length) unsupported.push('menus (' + otherMenus.join(', ') + ')')
+  const titleOf = new Map(commands.map((x) => [x.id, x.title]))
+  const treeMenus: ExtRecord['treeMenus'] = vscode && Array.isArray(menus['view/item/context'])
+    ? (menus['view/item/context'] as { command?: unknown; when?: unknown; group?: unknown }[])
+        .filter((x) => x && typeof x.command === 'string')
+        .map((x) => ({ command: x.command as string, title: titleOf.get(x.command as string) ?? (x.command as string), when: typeof x.when === 'string' ? x.when : '', group: typeof x.group === 'string' ? x.group : '' }))
+    : []
   const views: ExtRecord['views'] = []
   if (vscode && c.views && typeof c.views === 'object') {
     for (const [container, arr] of Object.entries(c.views as Record<string, unknown>)) {
@@ -130,6 +141,7 @@ async function readExtension(dir: string, source: ExtRecord['source']): Promise<
     commands,
     views,
     containers,
+    treeMenus,
     unsupported,
     codeIgnored: false,
     source
@@ -454,20 +466,49 @@ const webviewRoots = new Set<string>()
 // protocol (so it has an address and security rules of its own, not the editor's).
 const webviewPages = new Map<string, string>()
 
-// What the page needs to talk to its extension: acquireVsCodeApi(), as VS Code's own webviews have.
-const WEBVIEW_API = `const __state = { v: undefined }
+// What the page needs to talk to its extension: acquireVsCodeApi(), as VS Code's own webviews have. The state a page keeps
+// with setState() is sent to the editor, which remembers it (also across restarts, for panels with a serializer).
+const webviewApi = (state: unknown): string => `const __state = { v: ${JSON.stringify(state === undefined ? null : state).replace(/</g, '\\u003c')} }
+if (__state.v === null) __state.v = undefined
 window.acquireVsCodeApi = () => ({
   postMessage: (message) => parent.postMessage({ __vscodeWebview: true, message }, '*'),
   getState: () => __state.v,
-  setState: (s) => { __state.v = s; return s }
+  setState: (s) => { __state.v = s; parent.postMessage({ __vscodeWebview: true, __vscodeState: true, state: s === undefined ? null : s }, '*'); return s }
 })`
+
+// The panels that are open (tabs, not side bar views): kept on disk so that an extension that registers a
+// WebviewPanelSerializer for their type is asked to bring them back when the editor starts again.
+interface PanelEntry {
+  viewType: string
+  title: string
+  extId: string
+  state: unknown
+}
+const panelStore = new Map<string, PanelEntry>()
+let panelFileTimer: NodeJS.Timeout | null = null
+const panelFile = (): string => join(extDir(), 'webview-panels.json')
+function savePanels(): void {
+  if (panelFileTimer) return
+  panelFileTimer = setTimeout(() => {
+    panelFileTimer = null
+    void fs.mkdir(extDir(), { recursive: true }).then(() => fs.writeFile(panelFile(), JSON.stringify([...panelStore.values()]), 'utf-8')).catch(() => undefined)
+  }, 300)
+}
+async function readSavedPanels(): Promise<PanelEntry[]> {
+  try {
+    const list = JSON.parse(await fs.readFile(panelFile(), 'utf-8')) as PanelEntry[]
+    return Array.isArray(list) ? list.filter((x) => x && typeof x.viewType === 'string' && typeof x.extId === 'string').slice(0, 50) : []
+  } catch {
+    return []
+  }
+}
 
 export function webviewPage(id: string): string | null {
   const html = webviewPages.get(id)
   if (html === undefined) return null
   // A page with a Content-Security-Policy that allows scripts only by nonce would block ours: give it the same nonce.
   const nonce = /nonce-([A-Za-z0-9+/=_-]+)/.exec(html)?.[1]
-  const tag = `<script${nonce ? ` nonce="${nonce}"` : ''}>${WEBVIEW_API}</script>`
+  const tag = `<script${nonce ? ` nonce="${nonce}"` : ''}>${webviewApi(panelStore.get(id)?.state)}</script>`
   return /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, (m) => m + tag) : tag + html
 }
 
@@ -633,7 +674,18 @@ async function doStartHost(gen: number): Promise<Host | null> {
     } else if (m.type === 'request' && m.reqId === 0) {
       // Something that needs no answer (a status bar item, a diagnostic, registering a provider...).
       if (m.method === 'webviewHtml') webviewPages.set(String(m.params?.id), String(m.params?.html ?? ''))
-      if (m.method === 'webviewDispose') webviewPages.delete(String(m.params?.id))
+      if (m.method === 'webviewDispose') {
+        webviewPages.delete(String(m.params?.id))
+        if (panelStore.delete(String(m.params?.id))) savePanels()
+      }
+      if (m.method === 'webviewTitle' && panelStore.has(String(m.params?.id))) {
+        panelStore.get(String(m.params.id))!.title = String(m.params.title ?? '')
+        savePanels()
+      }
+      if (m.method === 'webviewCreate' && m.params?.view !== true) {
+        panelStore.set(String(m.params.id), { viewType: String(m.params.viewType), title: String(m.params.title ?? ''), extId: String(m.params.extId), state: m.params.state ?? null })
+        savePanels()
+      }
       if (m.method === 'webviewCreate') for (const r of Array.isArray(m.params?.roots) ? m.params.roots : []) webviewRoots.add(String(r))
       if (m.method === 'clipboardWrite') clipboard?.writeText?.(String(m.params?.text ?? ''))
       else getWinRef()?.webContents.send('ext:request', { reqId: 0, method: m.method, params: m.params })
@@ -652,7 +704,13 @@ async function doStartHost(gen: number): Promise<Host | null> {
     readyResolve()
     if (code) logLine(`The extension host stopped (exit code ${code}).`)
   })
-  child.send({ type: 'init', exts, root: currentRoot })
+  // Panels that were open when the editor was closed: an extension with a serializer for their type gets them back. What
+  // nobody claims is forgotten, except panels of extensions that are not running (disabled, or not installed any more).
+  const saved = panelStore.size ? [...panelStore.values()] : await readSavedPanels()
+  const restore = saved.filter((p) => exts.some((x) => x.id === p.extId))
+  panelStore.clear()
+  saved.filter((p) => !exts.some((x) => x.id === p.extId)).forEach((p, i) => panelStore.set('kept:' + i, p))
+  child.send({ type: 'init', exts, root: currentRoot, restore })
   return h
 }
 
@@ -755,7 +813,16 @@ export function registerExtensionHandlers(getWin: () => BrowserWindow | null): v
     host?.child.send({ type: 'editorState', state })
   })
   // The editor asks an extension's provider (completions, hover) for an answer.
+  // The state a page keeps with setState(): remembered for the panel (and for the page when it is loaded again).
+  ipcMain.handle('ext:webviewState', (_e, id: string, state: unknown) => {
+    const p = panelStore.get(String(id))
+    if (!p) return
+    if (JSON.stringify(state ?? null).length > 1_000_000) return
+    p.state = state ?? null
+    savePanels()
+  })
   ipcMain.handle('ext:provide', async (_e, providerId: string, kind: string, params: unknown) => {
+    if (kind === 'webviewClosed' && panelStore.delete(String(providerId))) savePanels()
     const h = host
     if (!h) return null
     const reqId = nextReq++

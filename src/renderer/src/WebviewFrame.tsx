@@ -13,6 +13,8 @@ export function WebviewFrame({ panel, visible }: { panel: WebviewPanelInfo; visi
   useEffect(() => {
     const onMessage = (e: MessageEvent): void => {
       if (e.source !== ref.current?.contentWindow || !e.data || e.data.__vscodeWebview !== true) return
+      // setState() in the page: the editor keeps it (it comes back with the page, and with the panel after a restart).
+      if (e.data.__vscodeState === true) return void window.api.extWebviewState(panel.id, e.data.state)
       void window.api.extProvide(panel.id, 'webviewMessage', { id: panel.id, message: e.data.message })
     }
     window.addEventListener('message', onMessage)

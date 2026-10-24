@@ -165,6 +165,8 @@ let vscodeApi = null
 // ---- webview panels: an extension's own HTML page, shown as a tab ----
 const webviews = new Map() // id -> { panel, messages: EventEmitter, disposed: EventEmitter, closed }
 let webviewCounter = 1
+const serializers = new Map() // view type -> WebviewPanelSerializer
+let pendingRestore = [] // panels that were open when the editor was closed: { viewType, title, extId, state }
 const webviewViewProviders = new Map() // view id -> provider (registerWebviewViewProvider)
 const handleFor = (st, key, element) => {
   let h = st.byKey.get(key)
@@ -172,6 +174,31 @@ const handleFor = (st, key, element) => {
   st.nodes.set(h, element)
   st.byElement.set(element, h)
   return h
+}
+// An icon given as a file (a path or a Uri, or {light, dark}) is sent to the editor as a data: URL: small image files only.
+const ICON_TYPES = { '.png': 'image/png', '.svg': 'image/svg+xml', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.ico': 'image/x-icon', '.webp': 'image/webp' }
+const MAX_ICON = 32 * 1024
+const iconCache = new Map() // file -> { mtime, url }
+let iconBudget = 0
+function iconData(p) {
+  try {
+    const file = typeof p === 'string' ? p : p && typeof p === 'object' ? (p.fsPath || (p.scheme === 'file' ? p.path : '')) : ''
+    const mime = file ? ICON_TYPES[path.extname(file).toLowerCase()] : undefined
+    if (!mime) return undefined
+    const st = fs.statSync(file)
+    if (!st.isFile() || st.size > MAX_ICON) return undefined
+    let c = iconCache.get(file)
+    if (!c || c.mtime !== st.mtimeMs) { c = { mtime: st.mtimeMs, url: 'data:' + mime + ';base64,' + fs.readFileSync(file).toString('base64') }; iconCache.set(file, c) }
+    if ((iconBudget -= c.url.length) < 0) return undefined
+    return c.url
+  } catch { return undefined }
+}
+function iconFiles(icon) {
+  if (!icon || icon.id !== undefined) return undefined
+  const both = icon && typeof icon === 'object' && (icon.light !== undefined || icon.dark !== undefined) && icon.fsPath === undefined && icon.scheme === undefined
+  const light = iconData(both ? icon.light : icon)
+  const dark = iconData(both ? icon.dark : icon)
+  return light || dark ? { light: light || dark, dark: dark || light } : undefined
 }
 const plain = (v) => (v === undefined || v === null ? undefined : typeof v === 'string' ? v : v.value !== undefined ? String(v.value) : v.label !== undefined ? String(v.label) : String(v))
 function serializeItem(item, handle) {
@@ -184,6 +211,7 @@ function serializeItem(item, handle) {
     tooltip: plain(item.tooltip),
     collapsible: item.collapsibleState || 0,
     codicon: icon && icon.id ? icon.id : undefined,
+    iconFile: iconFiles(icon),
     resource: item.resourceUri ? item.resourceUri.fsPath || String(item.resourceUri.path) : undefined,
     contextValue: item.contextValue,
     hasCommand: !!(item.command && item.command.command)
@@ -219,6 +247,7 @@ async function treeProvide(msg) {
     const kids = (await st.provider.getChildren(parent)) || []
     const parentKey = msg.params.handle == null ? '' : st.keys.get(msg.params.handle) || ''
     const out = []
+    iconBudget = 1_500_000
     for (const k of kids.slice(0, 2000)) {
       const item = await st.provider.getTreeItem(k)
       const label = item.label && typeof item.label === 'object' ? item.label.label : item.label
@@ -227,6 +256,13 @@ async function treeProvide(msg) {
       out.push(serializeItem(item, h))
     }
     return out
+  }
+  if (msg.kind === 'treeCommand') {
+    // A command chosen in a node's menu gets the node (the element the extension gave) and the selection.
+    const el = st.nodes.get(msg.params.handle)
+    if (el === undefined) return false
+    await vscodeApi.commands.executeCommand(String(msg.params.command), el, [el])
+    return true
   }
   if (msg.kind === 'treeAction') {
     const item = st.items.get(msg.params.handle)
@@ -390,6 +426,20 @@ function makeVscode(ext) {
       createTreeView: (viewId, options) => makeTreeView(viewId, options.treeDataProvider, options).view,
       registerWebviewViewProvider: (viewId, provider) => { webviewViewProviders.set(viewId, { provider, make: makeWebviewPanel }); tell('treeView', { viewId, extId: ext.id }); return new Disposable(() => webviewViewProviders.delete(viewId)) },
       createWebviewPanel: (viewType, title, showOptions, options) => makeWebviewPanel(viewType, title, options || {}).panel,
+      registerWebviewPanelSerializer: (viewType, serializer) => {
+        serializers.set(viewType, serializer)
+        // Panels of this type that were open last time are brought back, one after the other.
+        setImmediate(async () => {
+          for (const e of pendingRestore.filter((x) => x.viewType === viewType && x.extId === ext.id)) {
+            pendingRestore.splice(pendingRestore.indexOf(e), 1)
+            try {
+              const { panel } = makeWebviewPanel(viewType, e.title, {}, undefined, e.state)
+              await serializer.deserializeWebviewPanel(panel, e.state === null ? undefined : e.state)
+            } catch (err) { log('Restoring a ' + viewType + ' panel failed: ' + (err && err.stack || err)) }
+          }
+        })
+        return new Disposable(() => serializers.delete(viewType))
+      },
       createTerminal: unsupported('window.createTerminal'),
       showOpenDialog: () => Promise.resolve(undefined),
       showSaveDialog: () => Promise.resolve(undefined)
@@ -519,7 +569,7 @@ function makeVscode(ext) {
     return { view, disposable }
   }
 
-  function makeWebviewPanel(viewType, title, options, viewId) {
+  function makeWebviewPanel(viewType, title, options, viewId, state) {
     const id = ext.id + ':wv:' + webviewCounter++
     const messages = new EventEmitter()
     const disposedEvent = new EventEmitter()
@@ -554,7 +604,7 @@ function makeVscode(ext) {
     }
     const w = { panel, messages, closed: false }
     webviews.set(id, w)
-    tell('webviewCreate', { id, viewType, title: currentTitle, extId: ext.id, roots, view: !!viewId })
+    tell('webviewCreate', { id, viewType, title: currentTitle, extId: ext.id, roots, view: !!viewId, state: state === undefined ? null : state })
     return { id, panel }
   }
 
@@ -670,6 +720,7 @@ process.on('message', async (msg) => {
   try {
     if (msg.type === 'init') {
       root = msg.root || null
+      pendingRestore = Array.isArray(msg.restore) ? msg.restore : []
       for (const ext of msg.exts) await activateExtension(ext)
       process.send({ type: 'ready' })
     } else if (msg.type === 'run') {

@@ -36,7 +36,9 @@
     "test:ssh-background": "node tests/ssh-background.cjs",
     "test:ssh-linux": "node tests/ssh-linux.cjs",
     "test:jupyter": "node tests/jupyter.cjs",
-    "test:jupyter-ui": "node tests/jupyter-ui.cjs"
+    "test:jupyter-ui": "node tests/jupyter-ui.cjs",
+    "test:ext-restore": "node tests/ext-restore.cjs",
+    "test:when": "node tests/when-clause.cjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.1.0",

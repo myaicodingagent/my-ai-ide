@@ -193,6 +193,7 @@ const api = {
   extRun: (extId: string, command: string): Promise<{ ok: true } | { ok: false; error: string }> => ipcRenderer.invoke('ext:run', extId, command),
   extLog: (): Promise<string[]> => ipcRenderer.invoke('ext:log'),
   extOpenFolder: (): Promise<string | null> => ipcRenderer.invoke('ext:openFolder'),
+  extWebviewState: (id: string, state: unknown): Promise<void> => ipcRenderer.invoke('ext:webviewState', id, state),
   extEditorState: (state: unknown): Promise<void> => ipcRenderer.invoke('ext:editorState', state),
   extProvide: (providerId: string, kind: string, params: unknown): Promise<unknown> => ipcRenderer.invoke('ext:provide', providerId, kind, params),
   extRespond: (reqId: number, r: { result?: unknown; error?: string }): Promise<void> => ipcRenderer.invoke('ext:respond', reqId, r),

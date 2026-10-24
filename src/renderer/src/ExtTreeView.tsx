@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { Section } from './ExplorerSections'
+import { ContextMenu, MenuItem } from './ContextMenu'
+import { useExtensions } from './extStore'
+import { evalWhen, menuOrder, WhenContext } from './whenClause'
 import { WebviewFrame } from './WebviewFrame'
 import { useWebviewPanels } from './webviewStore'
 
@@ -13,6 +16,7 @@ interface Item {
   tooltip?: string
   collapsible: number // 0 none, 1 collapsed, 2 expanded
   codicon?: string
+  iconFile?: { light: string; dark: string } // an image file the extension gave, as a data: URL
   resource?: string
   contextValue?: string
   hasCommand: boolean
@@ -56,7 +60,39 @@ const useLiveKey = (): string =>
 
 const ROOT = -1
 
-function TreeRows({ viewId, items, depth, children: render, expanded, onToggle, onActivate }: {
+type TreeMenuEntry = { command: string; title: string; when: string; group: string }
+
+/** The menu entries that apply to a node, in menu order (with the group each belongs to). */
+function entriesFor(menus: TreeMenuEntry[], viewId: string, it: Item): TreeMenuEntry[] {
+  const file = it.resource ?? ''
+  const base = file.split(/[\\/]/).pop() ?? ''
+  const ctx: WhenContext = {
+    view: viewId,
+    viewItem: it.contextValue,
+    resourcePath: file || undefined,
+    resourceFilename: file ? base : undefined,
+    resourceExtname: file && base.includes('.') ? base.slice(base.lastIndexOf('.')) : file ? '' : undefined,
+    resourceScheme: file ? 'file' : undefined
+  }
+  return menus
+    .filter((m) => evalWhen(m.when, ctx))
+    .map((m, i) => ({ m, i, g: menuOrder(m.group) }))
+    .sort((a, b) => (a.g.name === 'navigation' ? 0 : 1) - (b.g.name === 'navigation' ? 0 : 1) || a.g.name.localeCompare(b.g.name) || a.g.order - b.g.order || a.i - b.i)
+    .map((x) => x.m)
+}
+
+const isInline = (m: TreeMenuEntry): boolean => m.group === 'inline' || m.group.startsWith('inline@')
+
+function ItemIcon({ it }: { it: Item }): JSX.Element {
+  if (it.iconFile) {
+    const light = document.documentElement.dataset.themeType === 'light'
+    return <img className="xt-icon xt-img" alt="" src={light ? it.iconFile.light : it.iconFile.dark} />
+  }
+  if (it.codicon) return <span className={'xt-icon codicon codicon-' + it.codicon} aria-hidden="true" title={it.codicon} />
+  return <span className="xt-icon" aria-hidden="true">·</span>
+}
+
+function TreeRows({ viewId, items, depth, children: render, expanded, onToggle, onActivate, menus, onMenu, onRun }: {
   viewId: string
   items: Item[]
   depth: number
@@ -64,6 +100,9 @@ function TreeRows({ viewId, items, depth, children: render, expanded, onToggle, 
   expanded: Set<number>
   onToggle: (item: Item) => void
   onActivate: (item: Item) => void
+  menus: TreeMenuEntry[]
+  onMenu: (item: Item, x: number, y: number) => void
+  onRun: (item: Item, command: string) => void
 }): JSX.Element {
   return (
     <>
@@ -82,12 +121,20 @@ function TreeRows({ viewId, items, depth, children: render, expanded, onToggle, 
               data-xt-view={viewId}
               title={it.tooltip || it.description || it.label}
               style={{ paddingLeft: 8 + depth * 14 }}
+              onContextMenu={(e) => {
+                e.preventDefault()
+                onMenu(it, e.clientX, e.clientY)
+              }}
               onClick={() => {
                 if (it.collapsible) onToggle(it)
                 onActivate(it)
               }}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
+                if (e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey)) {
+                  e.preventDefault()
+                  const r = e.currentTarget.getBoundingClientRect()
+                  onMenu(it, r.left + 24, r.bottom)
+                } else if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault()
                   if (it.collapsible) onToggle(it)
                   onActivate(it)
@@ -96,12 +143,30 @@ function TreeRows({ viewId, items, depth, children: render, expanded, onToggle, 
               }}
             >
               <span className="xt-chev">{it.collapsible ? (open ? '▾' : '▸') : ''}</span>
-              <span className="xt-icon" title={it.codicon}>{it.codicon ? it.codicon[0].toUpperCase() : '·'}</span>
+              <ItemIcon it={it} />
               <span className="xt-label">{it.label}</span>
               {it.description && <span className="xt-desc">{it.description}</span>}
+              <span className="xt-inline-actions">
+                {entriesFor(menus, viewId, it).filter(isInline).map((m) => (
+                  <button
+                    key={m.command}
+                    className="xt-inline"
+                    data-xt-inline={m.command}
+                    title={m.title}
+                    aria-label={m.title + ', ' + it.label}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      onRun(it, m.command)
+                    }}
+                    onKeyDown={(e) => e.stopPropagation()}
+                  >
+                    {m.title}
+                  </button>
+                ))}
+              </span>
             </div>
             {it.collapsible > 0 && open && kids && (
-              <TreeRows viewId={viewId} items={kids} depth={depth + 1} expanded={expanded} onToggle={onToggle} onActivate={onActivate}>
+              <TreeRows viewId={viewId} items={kids} depth={depth + 1} expanded={expanded} onToggle={onToggle} onActivate={onActivate} menus={menus} onMenu={onMenu} onRun={onRun}>
                 {render}
               </TreeRows>
             )}
@@ -143,6 +208,9 @@ export function ExtTreeView({ viewId, name, onOpenFile }: { viewId: string; name
   const [note, setNote] = useState('Loading…')
   const expandedRef = useRef(expanded)
   expandedRef.current = expanded
+  // What the extensions put in a node's menu.
+  const menus = useExtensions().filter((e) => e.enabled && e.views.some((v) => v.id === viewId)).flatMap((e) => e.treeMenus ?? [])
+  const [menu, setMenu] = useState<{ x: number; y: number; item: Item } | null>(null)
 
   const load = useCallback(
     async (handle: number): Promise<void> => {
@@ -194,13 +262,20 @@ export function ExtTreeView({ viewId, name, onOpenFile }: { viewId: string; name
     else if (it.resource && !it.collapsible) onOpenFile(it.resource)
   }
 
+  const run = (it: Item, command: string): void => void window.api.extProvide(viewId, 'treeCommand', { viewId, handle: it.handle, command })
+  const menuItems = (it: Item): MenuItem[] => {
+    const entries = entriesFor(menus, viewId, it).filter((m) => !isInline(m))
+    return entries.map((m, i) => ({ label: m.title, run: () => run(it, m.command), separator: i > 0 && menuOrder(m.group).name !== menuOrder(entries[i - 1].group).name }))
+  }
+
   const root = nodes.get(ROOT) ?? []
   return (
     <Section id={'xt-' + viewId} title={name}>
       <div role="tree" aria-label={name} data-ext-tree={viewId}>
-        <TreeRows viewId={viewId} items={root} depth={0} expanded={expanded} onToggle={toggle} onActivate={activate}>
+        <TreeRows viewId={viewId} items={root} depth={0} expanded={expanded} onToggle={toggle} onActivate={activate} menus={menus} onMenu={(item, x, y) => entriesFor(menus, viewId, item).some((m) => !isInline(m)) && setMenu({ x, y, item })} onRun={run}>
           {(it) => nodes.get(it.handle)}
         </TreeRows>
+        {menu && <ContextMenu x={menu.x} y={menu.y} items={menuItems(menu.item)} onClose={() => setMenu(null)} />}
         {note && !root.length && <div className="ex-empty">{note}</div>}
       </div>
     </Section>
