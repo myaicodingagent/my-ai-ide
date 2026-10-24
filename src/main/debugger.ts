@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'url'
 import WebSocket from 'ws'
 import { SourceMapIndex, parseSourceMap } from './sourcemap'
 import { DapSession, adapterFor, goAdapter, pythonAdapter, startDapAttach, startDapDebug } from './dap'
+import * as ssh from './sshfs'
 import { isRemotePath } from './sshfs'
 
 // A JavaScript debugger: the program runs under `node --inspect-brk` and this talks to Node's built-in inspector
@@ -68,6 +69,8 @@ interface Session {
   scripts: Map<string, string> // script id -> url (call frames only carry the id)
   stopOnEntry: boolean
   firstPause: boolean
+  remote?: string // the name of the computer the program runs on (over SSH); file paths are translated
+  tunnel?: { close(): void }
   exited: boolean
   // TypeScript: the program runs from a JavaScript bundle made from it; this maps between the two.
   ts?: { jsFile: string; index: SourceMapIndex; dir: string }
@@ -84,7 +87,16 @@ const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$
 
 /** A regex source matching the file:// URL Node reports for a file (drive letter case may differ on Windows). */
 export function urlRegexFor(file: string): string {
-  const href = pathToFileURL(file).href
+  return regexForHref(pathToFileURL(file).href)
+}
+
+/** The file URL Node reports for a path on a remote computer (a POSIX path, or C:/... on a Windows server), as a regex. */
+export function urlRegexForNative(native: string): string {
+  const path = (native.startsWith('/') ? native : '/' + native).split('/').map((seg) => encodeURIComponent(seg).replace(/%3A/gi, ':')).join('/')
+  return regexForHref('file://' + path)
+}
+
+function regexForHref(href: string): string {
   const body = escapeRegex(href)
     .replace(/^(file:\/\/\/)([a-zA-Z])(:|%3A)/i, (_m, pre: string, d: string, colon: string) => `${pre}[${d.toLowerCase()}${d.toUpperCase()}]${colon}`)
     // Node leaves ~ ! ' ( ) * unescaped in the script URLs it reports (as in C:/Users/NAME~1/), the URL class escapes some of them.
@@ -92,9 +104,10 @@ export function urlRegexFor(file: string): string {
   return '^' + body + '$'
 }
 
-function fileFromUrl(url: string): string | null {
+function fileFromUrl(url: string, remote?: string): string | null {
   if (!url.startsWith('file:')) return null
   try {
+    if (remote) return ssh.fromNativePath(remote, decodeURIComponent(new URL(url).pathname).replace(/^\/(?=[A-Za-z]:)/, ''))
     return fileURLToPath(url)
   } catch {
     return null
@@ -137,7 +150,14 @@ async function applyBreakpoints(s: Session, file: string, bps: DbgBreakpoint[]):
   for (const bp of bps) {
     try {
       let lineNumber = bp.line - 1
-      let urlRegex = urlRegexFor(file)
+      let urlRegex: string
+      if (s.remote) {
+        // Only files on the computer the program runs on can have breakpoints in it.
+        const native = ssh.parseRemote(file)?.name === s.remote ? ssh.nativePath(file) : null
+        if (!native) continue
+        urlRegex = urlRegexForNative(native)
+      } else if (isRemotePath(file)) continue
+      else urlRegex = urlRegexFor(file)
       let columnNumber: number | undefined
       if (s.ts && srcIdx >= 0) {
         const g = s.ts.index.generatedFor(srcIdx, bp.line - 1)
@@ -172,7 +192,7 @@ async function onPaused(s: Session, p: any): Promise<void> {
   }
   const frames: DbgFrame[] = p.callFrames.map((f: any, i: number): DbgFrame => {
     const url: string = s.scripts.get(f.location.scriptId) ?? f.url ?? ''
-    let file = fileFromUrl(url)
+    let file = fileFromUrl(url, s.remote)
     let line = f.location.lineNumber + 1
     let column = (f.location.columnNumber ?? 0) + 1
     // Code from the TypeScript bundle is shown at its place in the original file.
@@ -287,7 +307,15 @@ async function start(opts: {
   breakpoints: Record<string, DbgBreakpoint[]>
 }): Promise<{ ok: true } | { ok: false; error: string }> {
   if (session && !session.exited) return { ok: false, error: 'A debug session is already running. Stop it first.' }
-  if (!existsSync(opts.file)) return { ok: false, error: `The file does not exist: ${opts.file}` }
+  const remote = isRemotePath(opts.file) ? ssh.parseRemote(opts.file)?.name : undefined
+  if (remote) {
+    if (TS_FILE.test(opts.file)) return { ok: false, error: 'TypeScript programs on another computer cannot be debugged yet. Compile it there and debug the JavaScript file.' }
+    try {
+      await ssh.requireFile(opts.file)
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
+  } else if (!existsSync(opts.file)) return { ok: false, error: `The file does not exist: ${opts.file}` }
   const { file, env } = nodeCommand()
   const cwd = opts.cwd || dirname(opts.file)
   let ts: Session['ts']
@@ -309,6 +337,10 @@ async function start(opts: {
   }
   let child: ChildProcess
   try {
+    if (remote) {
+      // On the other computer: its own node, started over SSH; the debugger port is reached through the same connection.
+      child = ssh.spawnRemote(cwd, ['node', '--inspect-brk=127.0.0.1:0', ssh.nativePath(opts.file) as string, ...(opts.args ?? [])], { env: opts.env }) as unknown as ChildProcess
+    } else
     child = spawn(file, ['--inspect-brk=127.0.0.1:0', program, ...(opts.args ?? [])], {
       cwd,
       env: {
@@ -324,13 +356,14 @@ async function start(opts: {
   }
   const s: Session = {
     child, ws: null, nextId: 1, pending: new Map(), frames: [], breakpointIds: new Map(), scripts: new Map(),
-    stopOnEntry: opts.stopOnEntry === true, firstPause: true, exited: false, ts
+    stopOnEntry: opts.stopOnEntry === true, firstPause: true, exited: false, ts, remote
   }
   session = s
 
   return new Promise((resolve) => {
     let connected = false
     let stderrBuf = ''
+    let wsStarted = false
     const fail = (error: string): void => {
       if (connected) return
       connected = true
@@ -347,25 +380,37 @@ async function start(opts: {
       const text = b.toString('utf-8')
       stderrBuf += text
       const m = /ws:\/\/(127\.0\.0\.1|localhost):(\d+)\/[0-9a-f-]+/.exec(stderrBuf)
-      if (m && !s.ws && !connected) {
-        const ws = new WebSocket(m[0])
-        s.ws = ws
-        ws.on('open', async () => {
-          try {
-            await send(s, 'Runtime.enable')
-            await send(s, 'Debugger.enable')
-            await send(s, 'Debugger.setPauseOnExceptions', { state: 'uncaught' })
-            for (const [f, bps] of Object.entries(opts.breakpoints)) await applyBreakpoints(s, f, bps)
-            connected = true
-            resolve({ ok: true })
-            emit({ type: 'started', pid: child.pid ?? 0 })
-            await send(s, 'Runtime.runIfWaitingForDebugger')
-          } catch (e) {
-            fail(e instanceof Error ? e.message : String(e))
-          }
-        })
-        ws.on('message', (d) => handleMessage(s, d.toString()))
-        ws.on('error', (e) => fail(`Could not connect to the debugger: ${e.message}`))
+      if (m && !s.ws && !connected && !wsStarted) {
+        wsStarted = true
+        const open = (url: string): void => {
+          const ws = new WebSocket(url)
+          s.ws = ws
+          ws.on('open', async () => {
+            try {
+              await send(s, 'Runtime.enable')
+              await send(s, 'Debugger.enable')
+              await send(s, 'Debugger.setPauseOnExceptions', { state: 'uncaught' })
+              for (const [f, bps] of Object.entries(opts.breakpoints)) await applyBreakpoints(s, f, bps)
+              connected = true
+              resolve({ ok: true })
+              emit({ type: 'started', pid: remote ? 0 : (child.pid ?? 0) })
+              await send(s, 'Runtime.runIfWaitingForDebugger')
+            } catch (e) {
+              fail(e instanceof Error ? e.message : String(e))
+            }
+          })
+          ws.on('message', (d) => handleMessage(s, d.toString()))
+          ws.on('error', (e) => fail(`Could not connect to the debugger: ${e.message}`))
+        }
+        if (remote) {
+          ssh.forwardPort(cwd, Number(m[2])).then(
+            (t) => {
+              s.tunnel = t
+              open(m[0].replace(/^ws:\/\/[^/]+/, `ws://127.0.0.1:${t.port}`))
+            },
+            (e) => fail(`Could not reach the debugger on the other computer: ${e instanceof Error ? e.message : String(e)}`)
+          )
+        } else open(m[0])
       }
       // The program has finished; Node now waits for the debugger to let go before it exits.
       if (/Waiting for the debugger to disconnect/.test(text)) {
@@ -392,6 +437,7 @@ async function start(opts: {
       }
       if (!connected) fail(`Node exited before the debugger could connect (code ${code}).\n${stderrBuf.trim()}`)
       if (session === s) session = null
+      s.tunnel?.close()
       if (s.ts) void fsp.rm(s.ts.dir, { recursive: true, force: true }).catch(() => undefined)
       emit({ type: 'exited', code })
     })
@@ -521,7 +567,6 @@ export function registerDebugHandlers(getWin: () => BrowserWindow | null): void 
   const dapActive = (): DapSession | null => (dapSession && dapSession.active ? dapSession : null)
 
   ipcMain.handle('dbg:start', async (_e, opts) => {
-    if (isRemotePath(opts?.file)) return { ok: false as const, error: 'Programs on another computer cannot be debugged from here yet. Run them in an SSH terminal.' }
     if ((session && !session.exited) || dapActive()) return { ok: false as const, error: 'A debug session is already running. Stop it first.' }
     // Python (debugpy) and Go (Delve) go through the Debug Adapter Protocol; JavaScript and TypeScript through Node's inspector.
     const adapter = adapterFor(String(opts?.file))
@@ -564,7 +609,7 @@ export function registerDebugHandlers(getWin: () => BrowserWindow | null): void 
     } catch {
       // already gone
     }
-    if (process.platform === 'win32' && s.child.pid) spawn('taskkill', ['/pid', String(s.child.pid), '/T', '/F'], { windowsHide: true })
+    if (process.platform === 'win32' && s.child.pid && !s.remote) spawn('taskkill', ['/pid', String(s.child.pid), '/T', '/F'], { windowsHide: true })
   })
   for (const [name, method] of [
     ['dbg:continue', 'Debugger.resume'],

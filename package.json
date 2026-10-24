@@ -31,7 +31,10 @@
     "test:menus2": "node tests/menus2.cjs",
     "test:menus": "node tests/menus.cjs",
     "test:ssh-git": "node tests/ssh-git.cjs",
-    "test:ssh": "node tests/ssh-handlers.cjs"
+    "test:ssh": "node tests/ssh-handlers.cjs",
+    "test:ssh-debug": "node tests/ssh-debug.cjs",
+    "test:ssh-background": "node tests/ssh-background.cjs",
+    "test:ssh-linux": "node tests/ssh-linux.cjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.1.0",

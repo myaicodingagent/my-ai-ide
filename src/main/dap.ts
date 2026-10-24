@@ -6,6 +6,7 @@ import { homedir } from 'os'
 import { delimiter, dirname, join } from 'path'
 import type { DbgBreakpoint, DbgEvent, DbgFrame, DbgScope, DbgVar } from './debugger'
 import { findPython, hasDebugpy } from './pythonenv'
+import * as ssh from './sshfs'
 
 // A client for the Debug Adapter Protocol (the protocol VS Code uses to talk to debuggers), and the Python debugger
 // built on it: `python -m debugpy.adapter` is started and driven over stdin/stdout.
@@ -146,6 +147,8 @@ interface Started {
   stderr: () => string
   closeOn?: { once(event: 'close', cb: () => void): unknown } // what ends the connection when there is no child
   pid?: number
+  remote?: string // the computer the program runs on (over SSH): file paths are translated both ways
+  dispose?: () => void // closes what was opened for the connection (an SSH tunnel)
 }
 
 const cleanEnv = (): NodeJS.ProcessEnv => {
@@ -160,6 +163,7 @@ export const pythonAdapter: Adapter = {
   label: 'Python',
   files: /\.pyw?$/i,
   async start(opts) {
+    if (ssh.isRemotePath(opts.file)) return startRemotePython(opts)
     const py = await findPython()
     if (!py) throw new Error('Python 3 was not found. Install it from python.org (tick "Add to PATH").')
     if (!(await hasDebugpy(py))) throw new Error(DEBUGPY_HELP)
@@ -186,6 +190,61 @@ export const pythonAdapter: Adapter = {
         stopOnEntry: opts.stopOnEntry === true
       }
     }
+  }
+}
+
+const randomPort = (): number => 30000 + Math.floor(Math.random() * 20000)
+
+/** Opens a tunnel to a port on the remote computer and connects once something is listening there. */
+async function connectRemote(unc: string, port: number, proc: ssh.RemoteProcess, what: string): Promise<{ socket: Socket; tunnel: { close(): void } }> {
+  const tunnel = await ssh.forwardPort(unc, port)
+  try {
+    for (let i = 0; i < 80; i++) {
+      if (proc.exitCode !== null) break
+      // The tunnel accepts at once; whether something listens on the other end shows when the connection is closed again.
+      const socket = tcpConnect(tunnel.port, '127.0.0.1')
+      const state = await new Promise<'up' | 'down'>((resolve) => {
+        const t = setTimeout(() => resolve('up'), 400)
+        socket.once('close', () => (clearTimeout(t), resolve('down')))
+        socket.once('error', () => undefined)
+      })
+      if (state === 'up') return { socket, tunnel }
+      await new Promise((r) => setTimeout(r, 250))
+    }
+  } catch {
+    // fall through to the error
+  }
+  tunnel.close()
+  throw new Error(`The ${what} debugger on the other computer did not start.`)
+}
+
+// The remote shell: Python 3 under debugpy, listening on a port that is reached through the SSH connection.
+const REMOTE_PYTHON = 'port=$1; shift; for p in python3 python; do if $p -c "import sys" >/dev/null 2>&1; then exec $p -m debugpy --listen 127.0.0.1:$port --wait-for-client "$@"; fi; done; echo "Python was not found on this computer." >&2; exit 127'
+
+async function startRemotePython(opts: DebugOptions): Promise<Started> {
+  const name = ssh.parseRemote(opts.file)?.name as string
+  const cwdUnc = opts.cwd || dirname(opts.file)
+  const port = randomPort()
+  const proc = ssh.spawnRemote(cwdUnc, ['sh', '-c', REMOTE_PYTHON, 'sh', String(port), ssh.nativePath(opts.file) as string, ...(opts.args ?? [])], { env: { PYTHONIOENCODING: 'utf-8', ...(opts.env ?? {}) } })
+  let stderr = ''
+  proc.stderr.on('data', (b: Buffer) => (stderr = (stderr + b.toString('utf-8')).slice(-2000)))
+  proc.stdout.resume()
+  proc.once('error', (e: Error) => (stderr += e.message))
+  let conn: Awaited<ReturnType<typeof connectRemote>>
+  try {
+    conn = await connectRemote(cwdUnc, port, proc, 'Python')
+  } catch (e) {
+    proc.kill()
+    throw new Error(/No module named debugpy/i.test(stderr) ? DEBUGPY_HELP.replace('Install it by running:', 'Install it on that computer by running:') : (e as Error).message + (stderr ? '\n' + stderr.trim() : ''))
+  }
+  return {
+    child: proc as unknown as ChildProcess,
+    io: { input: conn.socket, output: conn.socket },
+    stderr: () => stderr,
+    remote: name,
+    dispose: conn.tunnel.close,
+    // debugpy started the program itself (the command line above); the editor attaches to it.
+    launch: { name: 'Python (remote)', type: 'python', request: 'attach', justMyCode: true, redirectOutput: true }
   }
 }
 
@@ -232,11 +291,18 @@ const freePort = (): Promise<number> =>
   })
 
 // Delve speaks the Debug Adapter Protocol over TCP: `dlv dap --listen=...`, then connect to that port.
-async function spawnDelve(cwd: string, emit: (e: DbgEvent) => void): Promise<{ child: ChildProcess; socket: Socket; stderr: () => string }> {
-  const dlv = findDelve()
-  if (!dlv) throw new Error(DELVE_HELP)
-  const port = await freePort()
-  const child = spawn(dlv, ['dap', `--listen=127.0.0.1:${port}`], { cwd, env: cleanEnv(), stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+async function spawnDelve(cwd: string, emit: (e: DbgEvent) => void): Promise<{ child: ChildProcess; socket: Socket; stderr: () => string; dispose?: () => void }> {
+  const remote = ssh.isRemotePath(cwd)
+  let dlv = ''
+  if (!remote) {
+    const found = findDelve()
+    if (!found) throw new Error(DELVE_HELP)
+    dlv = found
+  }
+  const port = remote ? randomPort() : await freePort()
+  const child = remote
+    ? (ssh.spawnRemote(cwd, ['sh', '-c', 'PATH="$PATH:$HOME/go/bin:/usr/local/go/bin:/usr/local/bin"; exec dlv dap --listen=127.0.0.1:' + port]) as unknown as ChildProcess)
+    : spawn(dlv, ['dap', `--listen=127.0.0.1:${port}`], { cwd, env: cleanEnv(), stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
   let stderr = ''
   let said = ''
   let ready = false
@@ -253,7 +319,7 @@ async function spawnDelve(cwd: string, emit: (e: DbgEvent) => void): Promise<{ c
     const t0 = Date.now()
     const tick = (): void => {
       if (/listening/i.test(said)) return resolve()
-      if (child.exitCode !== null) return reject(new Error(`Delve stopped right away.${stderr ? '\n' + stderr : ''}`))
+      if (child.exitCode !== null) return reject(new Error(`${/not found/i.test(stderr) ? DELVE_HELP.replace('Install it by', 'Install it on that computer by') : 'Delve stopped right away.'}${stderr ? '\n' + stderr : ''}`))
       if (Date.now() - t0 > 15_000) return reject(new Error('Delve did not start in time.'))
       setTimeout(tick, 50)
     }
@@ -263,17 +329,25 @@ async function spawnDelve(cwd: string, emit: (e: DbgEvent) => void): Promise<{ c
     child.kill()
     throw e
   })
-  const socket = tcpConnect(port, '127.0.0.1')
+  let tunnel: { port: number; close(): void } | undefined
+  if (remote) {
+    tunnel = await ssh.forwardPort(cwd, port).catch((e) => {
+      child.kill()
+      throw new Error(`Could not reach Delve on the other computer: ${e instanceof Error ? e.message : String(e)}`)
+    })
+  }
+  const socket = tcpConnect(tunnel ? tunnel.port : port, '127.0.0.1')
   await new Promise<void>((resolve, reject) => {
     socket.once('connect', resolve)
     socket.once('error', (e) => reject(new Error(`Could not connect to Delve: ${e.message}`)))
   }).catch((e) => {
     child.kill()
+    tunnel?.close()
     throw e
   })
   ready = true
   child.once('close', () => socket.destroy())
-  return { child, socket, stderr: () => stderr }
+  return { child, socket, stderr: () => stderr, dispose: tunnel?.close }
 }
 
 export const goAdapter: Adapter = {
@@ -282,20 +356,24 @@ export const goAdapter: Adapter = {
   files: /\.go$/i,
   async start(opts, emit) {
     const cwd = opts.cwd || dirname(opts.file)
-    const { child, socket, stderr } = await spawnDelve(cwd, emit)
+    const remote = ssh.isRemotePath(opts.file)
+    const { child, socket, stderr, dispose } = await spawnDelve(cwd, emit)
+    const native = (p: string): string => (remote ? (ssh.nativePath(p) as string) : p)
     return {
       child,
       io: { input: socket, output: socket },
       stderr,
+      dispose,
+      remote: remote ? ssh.parseRemote(opts.file)?.name : undefined,
       launch: {
         name: 'Go',
         type: 'go',
         request: 'launch',
         mode: 'debug',
         // The package that holds the file, built as `go run .` would.
-        program: dirname(opts.file),
+        program: native(dirname(opts.file)),
         args: opts.args ?? [],
-        cwd,
+        cwd: native(cwd),
         env: opts.env ?? {},
         stopOnEntry: opts.stopOnEntry === true
       }
@@ -326,7 +404,8 @@ export function startPythonDebug(opts: DebugOptions, emit: (e: DbgEvent) => void
 
 /** Starts a program under a debug adapter. Resolves when it is running (breakpoints set), rejects with a readable message. */
 export async function startDapDebug(adapter: Adapter, opts: DebugOptions, emit: (e: DbgEvent) => void): Promise<DapSession> {
-  if (!existsSync(opts.file)) throw new Error(`The file does not exist: ${opts.file}`)
+  if (ssh.isRemotePath(opts.file)) await ssh.requireFile(opts.file)
+  else if (!existsSync(opts.file)) throw new Error(`The file does not exist: ${opts.file}`)
   return runDap(adapter, await adapter.start(opts, emit), opts.breakpoints, [opts.file], false, emit)
 }
 
@@ -343,6 +422,7 @@ async function runDap(adapter: Adapter, started: Started, breakpointsByFile: Rec
   // The adapter reports long, real paths; the editor knows the files by the spelling it was given (short Windows names...).
   const spelling = new Map<string, string>()
   const key = (p: string): string => {
+    if (started.remote) return p.replace(/\\/g, '/').toLowerCase()
     try {
       return realpathSync.native(p).replace(/\\/g, '/').toLowerCase()
     } catch {
@@ -351,14 +431,23 @@ async function runDap(adapter: Adapter, started: Started, breakpointsByFile: Rec
   }
   for (const f of [...files, ...Object.keys(breakpointsByFile)]) spelling.set(key(f), f)
   const spellAs = (p: string): string => spelling.get(key(p)) ?? p
+  // Over SSH the adapter works with the other computer's paths: only files there can have breakpoints, and what it
+  // reports is turned back into the editor's address.
+  const remote = started.remote
+  const toAdapter = (file: string): string | null => {
+    if (!remote) return ssh.isRemotePath(file) ? null : file
+    return ssh.parseRemote(file)?.name === remote ? ssh.nativePath(file) : null
+  }
+  const breakpointArgs = (bps: DbgBreakpoint[]): Json[] => bps.map((b) => ({ line: b.line, ...(b.condition?.trim() ? { condition: b.condition } : {}) }))
   let frames: { id: number }[] = []
   let thread = 1
   let ended = false
   let exitCode: number | null = null
 
-  const finish = (): void => {
-    if (ended) return
-    ended = true
+  let announced = false
+  const announce = (): void => {
+    if (announced) return
+    announced = true
     emit({ type: 'exited', code: exitCode })
     setTimeout(() => {
       try {
@@ -367,7 +456,20 @@ async function runDap(adapter: Adapter, started: Started, breakpointsByFile: Rec
         // gone
       }
       if (!child) started.io.output.end()
+      started.dispose?.()
     }, 300)
+  }
+  const finish = (): void => {
+    if (ended) return
+    ended = true
+    // Over SSH debugpy does not report the exit code; the remote command's own status is the answer.
+    if (exitCode === null && remote && child && child.exitCode === null) {
+      child.once('close', (code: number | null) => {
+        exitCode = code
+        announce()
+      })
+      setTimeout(announce, 1500)
+    } else announce()
   }
 
   dap.on('output', (b) => {
@@ -395,7 +497,7 @@ async function runDap(adapter: Adapter, started: Started, breakpointsByFile: Rec
       const list: DbgFrame[] = st.stackFrames.map((f, i) => ({
         index: i,
         name: String(f.name),
-        file: f.source?.path && existsSync(String(f.source.path)) ? spellAs(String(f.source.path)) : null,
+        file: f.source?.path ? (remote ? ssh.fromNativePath(remote, String(f.source.path)) : existsSync(String(f.source.path)) ? spellAs(String(f.source.path)) : null) : null,
         url: String(f.source?.path ?? ''),
         line: Number(f.line) || 1,
         column: Number(f.column) || 1
@@ -427,19 +529,20 @@ async function runDap(adapter: Adapter, started: Started, breakpointsByFile: Rec
   })
   void caps
   // launch's answer comes after configurationDone, so it is not awaited here.
-  const launched = dap.request(attached ? 'attach' : 'launch', started.launch)
+  const launched = dap.request(started.launch.request === 'attach' ? 'attach' : 'launch', started.launch)
   launched.catch(() => undefined)
   await Promise.race([initialized, launched.then(() => initialized), new Promise((_r, rej) => setTimeout(() => rej(new Error(`The ${adapter.label} debugger did not start in time.` + (stderrOf() ? '\n' + stderrOf() : ''))), 30_000))])
   for (const [file, bps] of Object.entries(breakpointsByFile)) {
-    if (!adapter.files.test(file)) continue
-    await dap.request('setBreakpoints', { source: { path: file }, breakpoints: bps.map((b) => ({ line: b.line, ...(b.condition?.trim() ? { condition: b.condition } : {}) })) }).catch(() => undefined)
+    const path = toAdapter(file)
+    if (!adapter.files.test(file) || !path) continue
+    await dap.request('setBreakpoints', { source: { path }, breakpoints: breakpointArgs(bps) }).catch(() => undefined)
   }
   await dap.request('setExceptionBreakpoints', { filters: ['uncaught'] }).catch(() => undefined)
   await dap.request('configurationDone').catch(() => undefined)
   await launched.catch((e) => {
     throw new Error(`The program could not be started: ${e.message}${stderrOf() ? '\n' + stderrOf() : ''}`)
   })
-  emit({ type: 'started', pid: started.pid ?? child?.pid ?? 0 })
+  emit({ type: 'started', pid: remote ? 0 : (started.pid ?? child?.pid ?? 0) })
   if (attached) emit({ type: 'output', stream: 'info', text: 'Attached (the program keeps running; Stop only disconnects).\n' })
 
   return {
@@ -455,8 +558,9 @@ async function runDap(adapter: Adapter, started: Started, breakpointsByFile: Rec
       }
     },
     async setBreakpoints(file, bps) {
-      if (!adapter.files.test(file)) return
-      await dap.request('setBreakpoints', { source: { path: file }, breakpoints: bps.map((b) => ({ line: b.line, ...(b.condition?.trim() ? { condition: b.condition } : {}) })) })
+      const path = toAdapter(file)
+      if (!adapter.files.test(file) || !path) return
+      await dap.request('setBreakpoints', { source: { path }, breakpoints: breakpointArgs(bps) })
     },
     async scopes(frameIndex) {
       const f = frames[frameIndex]
@@ -495,7 +599,8 @@ async function runDap(adapter: Adapter, started: Started, breakpointsByFile: Rec
           // gone
         }
         if (!child) started.io.output.end()
-        if (process.platform === 'win32' && child?.pid) spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true })
+        started.dispose?.()
+        if (process.platform === 'win32' && child?.pid && !remote) spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true })
       })
     }
   }

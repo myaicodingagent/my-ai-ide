@@ -6,12 +6,28 @@ module.exports = function createSshServer(remoteRoot) {
 // ---------------- a small SFTP server over a local folder ----------------
 const { OPEN_MODE, STATUS_CODE, flagsToString } = utils.sftp
 const hostKey = crypto.generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { type: 'pkcs1', format: 'pem' }, publicKeyEncoding: { type: 'pkcs1', format: 'pem' } }).privateKey
-const local = (p) => path.join(remoteRoot, ...String(p).split('/').filter((s) => s && s !== '..'))
+// A path such as /C:/Users/x is how a Windows server writes C:\Users\x: it is used as it is, not below remoteRoot.
+const local = (p) => {
+  const drive = /^\/([A-Za-z]:)(\/.*)?$/.exec(String(p))
+  if (drive) return path.normalize(drive[1] + (drive[2] || '/'))
+  return path.join(remoteRoot, ...String(p).split('/').filter((s) => s && s !== '..'))
+}
 const attrsOf = (st) => ({ mode: st.mode, uid: 0, gid: 0, size: st.size, atime: Math.floor(st.atimeMs / 1000), mtime: Math.floor(st.mtimeMs / 1000) })
 const children = new Set()
 const server = new Server({ hostKeys: [hostKey] }, (client) => {
   client.on('authentication', (ctx) => { if (ctx.method === 'password' && ctx.username === 'tester' && ctx.password === 'secret') ctx.accept(); else ctx.reject(['password']) })
   client.on('error', () => undefined)
+  // Port forwarding (what a debugger needs): connect to the port on this machine and carry the bytes both ways.
+  client.on('tcpip', (accept, reject, info) => {
+    const sock = require('net').connect(info.destPort, '127.0.0.1')
+    sock.once('error', () => reject())
+    sock.once('connect', () => {
+      const ch = accept()
+      ch.on('error', () => sock.destroy()); sock.on('error', () => ch.close())
+      ch.pipe(sock); sock.pipe(ch)
+      ch.on('close', () => sock.destroy()); sock.on('close', () => ch.close())
+    })
+  })
   client.on('ready', () => {
     client.on('session', (accept) => {
       const session = accept()
@@ -23,6 +39,8 @@ const server = new Server({ hostKeys: [hostKey] }, (client) => {
         const cwd = local(m[1])
         const child = require('child_process').spawn('bash', ['-c', m[2]], { cwd })
         children.add(child); child.on('close', () => children.delete(child))
+        // A folder that does not exist: what `cd` would say.
+        child.on('error', () => { stream.stderr.write('cd: no such directory'); stream.exit(1); stream.end() })
         const roots = [remoteRoot, fs.realpathSync.native(remoteRoot)].map((r) => r.split(require('path').sep).join('/'))
         const fix = (d) => Buffer.from(roots.reduce((s, r) => s.split(r).join(''), d.toString('utf-8')))
         child.stdout.on('data', (d) => stream.write(fix(d)))

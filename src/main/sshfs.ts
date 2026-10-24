@@ -4,6 +4,9 @@ import { createHash } from 'crypto'
 import { join } from 'path'
 import { homedir } from 'os'
 import { Client, ConnectConfig, SFTPWrapper, Stats } from 'ssh2'
+import { EventEmitter } from 'events'
+import { PassThrough } from 'stream'
+import { createServer as createTcpServer } from 'net'
 
 // Folders on another computer over SSH. A remote folder is addressed like a network share, so the rest of the editor
 // (which passes paths around as text) needs no changes:
@@ -299,6 +302,116 @@ export function exec(
   })
 }
 
+/** A program running on the other computer, shaped like a child process (stdout, stderr, kill, 'close'). */
+export interface RemoteProcess extends EventEmitter {
+  stdout: PassThrough
+  stderr: PassThrough
+  pid: number
+  exitCode: number | null
+  kill(): boolean
+}
+
+/**
+ * Starts a program on the remote computer, in the folder `unc` names, and keeps it running until it ends or is killed.
+ * The remote shell reports its process id first, so kill() can end the program (closing an SSH channel does not).
+ */
+export function spawnRemote(unc: string, command: string[], opts: { env?: Record<string, string> } = {}): RemoteProcess {
+  const proc = new EventEmitter() as RemoteProcess
+  proc.stdout = new PassThrough()
+  proc.stderr = new PassThrough()
+  proc.pid = 0
+  proc.exitCode = null
+  let conn: Live
+  let line: string
+  try {
+    const t = target(unc)
+    conn = t.conn
+    const env = Object.entries(opts.env ?? {}).map(([k, v]) => `export ${k}=${shq(v)}`)
+    line = `cd ${shq(t.path)} && echo __MYIDE_PID__$$ && ${[...env, ''].join(' && ')}exec ${command.map(shq).join(' ')}`
+  } catch (e) {
+    setImmediate(() => proc.emit('error', e))
+    return proc
+  }
+  let closeStream: (() => void) | null = null
+  let ended = false
+  proc.kill = (): boolean => {
+    if (ended) return false
+    if (proc.pid) conn.client.exec(`cd '/' && kill ${proc.pid} 2>/dev/null || kill -9 ${proc.pid} 2>/dev/null; true`, (err, s) => (err ? undefined : s.resume()))
+    setTimeout(() => closeStream?.(), 1500)
+    return true
+  }
+  conn.client.exec(line, (err, stream) => {
+    if (err) return proc.emit('error', err)
+    closeStream = () => stream.close()
+    let head = ''
+    let gotPid = false
+    stream.on('data', (d: Buffer) => {
+      if (gotPid) return void proc.stdout.write(d)
+      head += d.toString('utf-8')
+      const nl = head.indexOf('\n')
+      if (nl < 0) return
+      const m = /__MYIDE_PID__(\d+)/.exec(head.slice(0, nl))
+      gotPid = true
+      if (m) proc.pid = Number(m[1])
+      const rest = head.slice(nl + 1)
+      if (rest) proc.stdout.write(rest)
+    })
+    stream.stderr.on('data', (d: Buffer) => proc.stderr.write(d))
+    stream.on('close', (code: number | null) => {
+      ended = true
+      proc.exitCode = code ?? -1
+      proc.stdout.end()
+      proc.stderr.end()
+      proc.emit('close', code)
+    })
+    stream.end()
+  })
+  return proc
+}
+
+/** Makes a port on the remote computer reachable on this one (127.0.0.1:<port returned>), through the SSH connection. */
+export function forwardPort(unc: string, remotePort: number): Promise<{ port: number; close(): void }> {
+  const { conn } = target(unc)
+  const sockets = new Set<import('net').Socket>()
+  const server = createTcpServer((sock) => {
+    sockets.add(sock)
+    sock.on('close', () => sockets.delete(sock))
+    sock.on('error', () => sock.destroy())
+    conn.client.forwardOut('127.0.0.1', sock.remotePort ?? 0, '127.0.0.1', remotePort, (err, stream) => {
+      if (err) return sock.destroy()
+      stream.on('error', () => sock.destroy())
+      stream.on('close', () => sock.destroy())
+      sock.pipe(stream)
+      stream.pipe(sock)
+    })
+  })
+  return new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      resolve({
+        port: (server.address() as { port: number }).port,
+        close: () => {
+          for (const x of sockets) x.destroy()
+          server.close()
+        }
+      })
+    })
+  })
+}
+
+/** The path of a place on the remote computer as the programs there write it (Windows servers: /C:/x is C:/x). */
+export function nativePath(unc: string): string | null {
+  const r = parseRemote(unc)
+  if (!r) return null
+  return /^\/[A-Za-z]:(\/|$)/.test(r.path) ? r.path.slice(1) : r.path
+}
+
+/** The editor's address for a path a program on the remote computer reported. */
+export function fromNativePath(name: string, p: string): string {
+  const q = p.replace(/\\/g, '/')
+  return remoteUnc(name, /^[A-Za-z]:(\/|$)/.test(q) ? '/' + q : q)
+}
+
 export function disconnect(name: string): void {
   const c = live.get(name)
   live.delete(name)
@@ -367,6 +480,15 @@ export async function isDir(unc: string): Promise<boolean> {
 export async function statSize(unc: string): Promise<number> {
   const { conn, path } = target(unc)
   return (await stat(conn.sftp, path).catch((e) => Promise.reject(errno(e)))).size
+}
+
+/** Throws a readable error unless the file exists (and the computer is reachable). */
+export async function requireFile(unc: string): Promise<void> {
+  try {
+    await statSize(unc)
+  } catch (e) {
+    throw (e as { code?: string }).code === 'ENOENT' ? new Error(`The file does not exist: ${unc}`) : e
+  }
 }
 
 export async function readFile(unc: string): Promise<string> {
