@@ -1,18 +1,21 @@
 import { app, BrowserWindow, ipcMain } from 'electron'
 import { ChildProcess, spawn } from 'child_process'
 import { findPython } from './pythonenv'
+import { JupyterKernel, listKernelSpecs } from './jupyter'
 import { promises as fs } from 'fs'
 import { join } from 'path'
 
 // Notebook kernels: a long-running process per notebook that runs one cell after another and keeps its variables.
 //   Python      a small driver around exec() (needs Python 3 on the PATH)
 //   JavaScript  Node, using the vm module (works with the Node inside this app, no install needed)
-// This is not the Jupyter kernel protocol (ZeroMQ), so other Jupyter kernels are not available; cells, outputs and the
-// notebook file itself follow nbformat 4 as usual.
+//   Jupyter     any installed Jupyter kernel (ipykernel, IRkernel, IJulia...), started from its kernel.json and driven with
+//               the Jupyter messaging protocol over ZeroMQ (see jupyter.ts); this is the way to get widgets
+// Cells, outputs and the notebook file itself follow nbformat 4 as usual.
 
 export interface KernelInfo {
-  id: 'python' | 'javascript'
+  id: string // python, javascript, or jupyter:<kernelspec name>
   label: string
+  kernelspec?: { name: string; display_name: string; language: string } // what a notebook records about it in its metadata
 }
 
 export type NbEvent =
@@ -183,7 +186,8 @@ process.on('unhandledRejection', (e) => { if (cur) proto({ id: cur, type: 'strea
 interface Session {
   id: number
   kernel: KernelInfo['id']
-  child: ChildProcess
+  child: ChildProcess | null // null for a Jupyter kernel
+  jupyter?: JupyterKernel
   buffer: string
   cwd: string
   alive: boolean
@@ -199,10 +203,35 @@ export async function availableKernels(): Promise<KernelInfo[]> {
   const py = await findPython()
   if (py) out.push({ id: 'python', label: `Python ${py.version}` })
   out.push({ id: 'javascript', label: `JavaScript (Node ${process.versions.node})` })
+  for (const k of listKernelSpecs()) out.push({ id: 'jupyter:' + k.name, label: `Jupyter: ${k.display_name}`, kernelspec: { name: k.name, display_name: k.display_name, language: k.language } })
   return out
 }
 
+async function startJupyter(name: string, cwd: string): Promise<{ ok: true; session: number } | { ok: false; error: string }> {
+  const spec = listKernelSpecs().find((k) => k.name === name)
+  if (!spec) return { ok: false, error: `The Jupyter kernel "${name}" is not installed on this computer.` }
+  const id = nextSession++
+  const send = (cell: string | null, ev: NbEvent): void => getWinRef()?.webContents.send('nb:event', id, cell, ev)
+  const k = new JupyterKernel(spec, cwd, join(dataDir(), 'jupyter'), {
+    event: send,
+    comm: (m) => getWinRef()?.webContents.send('nb:comm', id, m.type, m.content, m.buffers.map((b) => new Uint8Array(b)), m.parent, m.metadata),
+    exit: (code, err) => {
+      sessions.delete(id)
+      getWinRef()?.webContents.send('nb:exited', id, code, err)
+    }
+  })
+  try {
+    await k.start()
+  } catch (e) {
+    k.kill()
+    return { ok: false, error: e instanceof Error ? e.message : String(e) }
+  }
+  sessions.set(id, { id, kernel: 'jupyter:' + name, child: null, jupyter: k, buffer: '', cwd, alive: true })
+  return { ok: true, session: id }
+}
+
 async function startKernel(kernel: KernelInfo['id'], cwd: string): Promise<{ ok: true; session: number } | { ok: false; error: string }> {
+  if (kernel.startsWith('jupyter:')) return startJupyter(kernel.slice(8), cwd)
   await fs.mkdir(dataDir(), { recursive: true })
   let file: string
   let args: string[]
@@ -225,7 +254,7 @@ async function startKernel(kernel: KernelInfo['id'], cwd: string): Promise<{ ok:
     env.ELECTRON_RUN_AS_NODE = '1'
   }
   const child = spawn(file, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
-  const s: Session = { id: nextSession++, kernel, child, buffer: '', cwd, alive: true }
+  const s: Session = { id: nextSession++, kernel: kernel as 'python' | 'javascript', child, buffer: '', cwd, alive: true }
   sessions.set(s.id, s)
   const send = (cell: string | null, ev: NbEvent): void => getWinRef()?.webContents.send('nb:event', s.id, cell, ev)
   child.stdout?.on('data', (b: Buffer) => {
@@ -259,6 +288,8 @@ async function startKernel(kernel: KernelInfo['id'], cwd: string): Promise<{ ok:
 }
 
 function kill(s: Session): void {
+  if (s.jupyter) return void s.jupyter.kill()
+  if (!s.child) return
   try {
     s.child.kill()
   } catch {
@@ -271,22 +302,41 @@ export function registerNotebookHandlers(getWin: () => BrowserWindow | null): vo
   getWinRef = getWin
   ipcMain.handle('nb:kernels', () => availableKernels())
   ipcMain.handle('nb:start', (_e, kernel: string, cwd: string) => {
-    if (kernel !== 'python' && kernel !== 'javascript') return { ok: false as const, error: 'Unknown kernel.' }
+    if (kernel !== 'python' && kernel !== 'javascript' && !/^jupyter:[A-Za-z0-9._-]{1,80}$/.test(String(kernel))) return { ok: false as const, error: 'Unknown kernel.' }
     return startKernel(kernel, cwd || process.cwd())
   })
   ipcMain.handle('nb:execute', (_e, session: number, cellId: string, code: string) => {
     const s = sessions.get(session)
     if (!s || !s.alive) return { ok: false as const, error: 'The kernel is not running.' }
-    s.child.stdin?.write(JSON.stringify({ id: String(cellId), code: String(code) }) + '\n')
+    if (s.jupyter) {
+      s.jupyter.execute(String(cellId), String(code))
+      return { ok: true as const }
+    }
+    s.child?.stdin?.write(JSON.stringify({ id: String(cellId), code: String(code) }) + '\n')
     return { ok: true as const }
   })
   // The answer to an input() the Python kernel is waiting on (value null = the user cancelled).
   ipcMain.handle('nb:input', (_e, session: number, value: string | null) => {
     const s = sessions.get(session)
     if (!s || !s.alive) return
-    s.child.stdin?.write(JSON.stringify(value === null ? { cancel: true } : { value: String(value) }) + '\n')
+    if (s.jupyter) return s.jupyter.inputReply(value === null ? null : String(value))
+    s.child?.stdin?.write(JSON.stringify(value === null ? { cancel: true } : { value: String(value) }) + '\n')
   })
   // There is no way to send Ctrl+C to a process on Windows, so an interrupt stops the kernel (variables are lost).
+  // A widget in the notebook talking to its model in the kernel.
+  ipcMain.handle('nb:comm', (_e, session: number, type: string, content: Record<string, unknown>, buffers: Uint8Array[]) => {
+    const s = sessions.get(session)
+    if (!s?.jupyter || !['comm_open', 'comm_msg', 'comm_close'].includes(type)) return null
+    return s.jupyter.comm(type as 'comm_open', content ?? {}, (buffers ?? []).map((b) => Buffer.from(b)))
+  })
+  // A Jupyter kernel can be interrupted without losing its variables; the others are stopped.
+  ipcMain.handle('nb:interrupt', (_e, session: number) => {
+    const s = sessions.get(session)
+    if (!s) return
+    if (s.jupyter) {
+      if (!s.jupyter.interrupt()) kill(s) // a kernel that cannot be interrupted is stopped
+    } else kill(s)
+  })
   ipcMain.handle('nb:stop', (_e, session: number) => {
     const s = sessions.get(session)
     if (s) kill(s)

@@ -26,7 +26,16 @@ import {
   updateCell
 } from './notebookModel'
 
-type KernelInfo = { id: 'python' | 'javascript'; label: string }
+import { WIDGET_MIME, WidgetOutput, forgetWidgets, initWidgets, widgetManager } from './widgets'
+
+type KernelInfo = { id: string; label: string; kernelspec?: { name: string; display_name: string; language: string } }
+
+// The kernel a notebook asks for: a Jupyter kernel of that name if one is installed (other than the built-in stand-ins for python3 and javascript), else by language.
+function kernelFor(nb: Notebook, kernels: KernelInfo[]): string {
+  const name = String(((nb.metadata.kernelspec ?? {}) as { name?: string }).name ?? '')
+  if (name && !/^(python3?|javascript|node)$/i.test(name) && kernels.some((k) => k.id === 'jupyter:' + name)) return 'jupyter:' + name
+  return kernelLanguage(nb)
+}
 
 const baseName = (p: string): string => p.split(/[\\/]/).pop() ?? p
 const dirName = (p: string): string => p.replace(/[\\/][^\\/]*$/, '')
@@ -52,13 +61,23 @@ function HtmlOutput({ html }: { html: string }): JSX.Element {
   )
 }
 
-function OutputView({ o }: { o: NbOutput }): JSX.Element | null {
+function OutputView({ o, session }: { o: NbOutput; session: number | null }): JSX.Element | null {
   if (o.output_type === 'stream') {
     return <pre className={'nb-stream' + (o.name === 'stderr' ? ' err' : '')}>{renderStreamText(outputText(o.text))}</pre>
   }
   if (o.output_type === 'error') {
     const tb = (o.traceback ?? []).map(stripAnsi).join('\n')
     return <pre className="nb-error">{tb || `${o.ename}: ${o.evalue}`}</pre>
+  }
+  // A widget of a running Jupyter kernel is drawn live; saved without its kernel it falls back to its text.
+  const widget = (o.data ?? {})[WIDGET_MIME]
+  if (widget && widgetManager(session)) {
+    try {
+      const id = (typeof widget === 'string' ? JSON.parse(widget) : widget).model_id
+      if (typeof id === 'string') return <WidgetOutput session={session} modelId={id} />
+    } catch {
+      // not a widget description: show what else there is
+    }
   }
   const best = bestMime((o.data ?? {}) as Record<string, string | string[]>)
   if (!best) return null
@@ -185,6 +204,7 @@ export function NotebookView({
   const [error, setError] = useState<string | null>(null)
   const nbRef = useRef<Notebook | null>(null)
   const [kernels, setKernels] = useState<KernelInfo[]>([])
+  const kernelsRef = useRef<KernelInfo[]>([])
   const [kernelId, setKernelId] = useState<KernelInfo['id']>('python')
   const [kernelStatus, setKernelStatus] = useState<'idle' | 'starting' | 'ready' | 'busy' | 'stopped'>('idle')
   const [selected, setSelected] = useState<string | null>(null)
@@ -214,8 +234,7 @@ export function NotebookView({
       setNb(r.nb)
       counter.current = Math.max(counter.current, ...r.nb.cells.map((c) => c.execution_count ?? 0))
       setSelected((cur) => (cur && r.nb.cells.some((c) => c.id === cur) ? cur : (r.nb.cells[0]?.id ?? null)))
-      const lang = kernelLanguage(r.nb)
-      setKernelId(lang)
+      setKernelId(kernelFor(r.nb, kernelsRef.current))
     },
     []
   )
@@ -264,7 +283,13 @@ export function NotebookView({
 
   // ---- kernels ----
   useEffect(() => {
-    void window.api.nbKernels().then(setKernels)
+    initWidgets()
+    void window.api.nbKernels().then((list) => {
+      kernelsRef.current = list
+      setKernels(list)
+      const cur = nbRef.current
+      if (cur && session.current === null) setKernelId(kernelFor(cur, list)) // the notebook was open before the list arrived
+    })
   }, [])
 
   const stopKernel = useCallback((): void => {
@@ -336,6 +361,7 @@ export function NotebookView({
       else commit(cur, false)
     })
     const offExit = window.api.onNbExited((sid, code, err) => {
+      forgetWidgets(sid)
       if (sid !== session.current) return
       session.current = null
       const hadWork = pending.current.size > 0
@@ -380,6 +406,12 @@ export function NotebookView({
   )
 
   const restartKernel = (): void => {
+    // A Jupyter kernel running a cell is interrupted and keeps its variables; otherwise the kernel is stopped.
+    if (kernelId.startsWith('jupyter:') && session.current !== null && pending.current.size > 0) {
+      void window.api.nbInterrupt(session.current)
+      announce('Interrupting')
+      return
+    }
     stopKernel()
     pending.current.clear()
     setKernelStatus('stopped')
@@ -391,8 +423,9 @@ export function NotebookView({
     setKernelId(id)
     const cur = nbRef.current
     if (cur) {
-      const spec = id === 'python' ? { display_name: 'Python 3', language: 'python', name: 'python3' } : { display_name: 'JavaScript (Node)', language: 'javascript', name: 'javascript' }
-      commit({ ...cur, metadata: { ...cur.metadata, kernelspec: spec, language_info: { name: id } } })
+      const picked = kernelsRef.current.find((k) => k.id === id)?.kernelspec
+      const spec = picked ?? (id === 'python' ? { display_name: 'Python 3', language: 'python', name: 'python3' } : { display_name: 'JavaScript (Node)', language: 'javascript', name: 'javascript' })
+      commit({ ...cur, metadata: { ...cur.metadata, kernelspec: spec, language_info: { name: spec.language } } })
     }
     setKernelStatus('stopped')
     setNote(null)
@@ -476,7 +509,7 @@ export function NotebookView({
   }
 
   const lang = nb ? kernelLanguage(nb) : 'python'
-  const editorLanguage = kernelId === 'javascript' ? 'javascript' : 'python'
+  const editorLanguage = kernelId === 'javascript' ? 'javascript' : kernelId === 'python' ? 'python' : (kernels.find((k) => k.id === kernelId)?.kernelspec?.language || 'python')
   const statusText = kernelStatus === 'busy' ? 'Running…' : kernelStatus === 'starting' ? 'Starting the kernel…' : kernelStatus === 'ready' ? 'Kernel ready' : kernelStatus === 'stopped' ? 'Kernel stopped' : 'Kernel not started'
   void lang
   const cells = useMemo(() => nb?.cells ?? [], [nb])
@@ -517,7 +550,7 @@ export function NotebookView({
         <button data-nb-action="run" onClick={() => selected && runAndAdvance(selected, false)} disabled={!selected} title="Run the selected cell (Ctrl+Enter)">
           ▶ Run
         </button>
-        <button data-nb-action="stop" onClick={restartKernel} title="Stop the kernel (on Windows this also forgets the variables)">
+        <button data-nb-action="stop" onClick={restartKernel} title="Stop the running cell of a Jupyter kernel (it keeps its variables), or stop the kernel (on Windows this also forgets the variables)">
           ■ Stop
         </button>
         <button data-nb-action="add-code" onClick={() => add('code', selected ? 'below' : 'end', selected ?? undefined)}>
@@ -530,7 +563,7 @@ export function NotebookView({
           Clear Outputs
         </button>
         <span className="nb-spacer" />
-        <select data-nb-kernel value={kernelId} onChange={(e) => changeKernel(e.target.value as KernelInfo['id'])} aria-label="Kernel">
+        <select data-nb-kernel value={kernelId} onChange={(e) => changeKernel(e.target.value)} aria-label="Kernel">
           {(kernels.length ? kernels : [{ id: 'python', label: 'Python 3' }, { id: 'javascript', label: 'JavaScript (Node)' }]).map((k) => (
             <option key={k.id} value={k.id}>
               {k.label}
@@ -623,7 +656,7 @@ export function NotebookView({
                 {c.cell_type === 'code' && c.outputs.length > 0 && (
                   <div className="nb-outputs" data-nb-outputs role="region" aria-label={`Output of cell ${idx + 1}`}>
                     {c.outputs.map((o, i) => (
-                      <OutputView key={i} o={o} />
+                      <OutputView key={i} o={o} session={session.current} />
                     ))}
                   </div>
                 )}

@@ -161,6 +161,13 @@ const api = {
     return () => ipcRenderer.removeListener('lsp:exited', h)
   },
   nbStop: (session: number): Promise<void> => ipcRenderer.invoke('nb:stop', session),
+  nbComm: (session: number, type: string, content: Record<string, unknown>, buffers: Uint8Array[]): Promise<string | null> => ipcRenderer.invoke('nb:comm', session, type, content, buffers),
+  onNbComm: (cb: (session: number, type: string, content: Record<string, any>, buffers: Uint8Array[], parent?: string, metadata?: Record<string, unknown>) => void): (() => void) => {
+    const h = (_e: unknown, session: number, type: string, content: Record<string, any>, buffers: Uint8Array[], parent?: string, metadata?: Record<string, unknown>): void => cb(session, type, content, buffers, parent, metadata)
+    ipcRenderer.on('nb:comm', h)
+    return () => ipcRenderer.removeListener('nb:comm', h)
+  },
+  nbInterrupt: (session: number): Promise<void> => ipcRenderer.invoke('nb:interrupt', session),
   nbInput: (session: number, value: string | null): Promise<void> => ipcRenderer.invoke('nb:input', session, value),
   onNbEvent: (cb: (session: number, cell: string | null, ev: NbEvent) => void): (() => void) => {
     const h = (_e: unknown, s: number, c: string | null, ev: NbEvent): void => cb(s, c, ev)

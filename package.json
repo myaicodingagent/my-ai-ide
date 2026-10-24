@@ -34,11 +34,19 @@
     "test:ssh": "node tests/ssh-handlers.cjs",
     "test:ssh-debug": "node tests/ssh-debug.cjs",
     "test:ssh-background": "node tests/ssh-background.cjs",
-    "test:ssh-linux": "node tests/ssh-linux.cjs"
+    "test:ssh-linux": "node tests/ssh-linux.cjs",
+    "test:jupyter": "node tests/jupyter.cjs",
+    "test:jupyter-ui": "node tests/jupyter-ui.cjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.1.0",
+    "@fortawesome/fontawesome-free": "^5.15.4",
     "@huggingface/transformers": "^4.3.1",
+    "@jupyter-widgets/base": "^6.0.11",
+    "@jupyter-widgets/base-manager": "^1.0.12",
+    "@jupyter-widgets/controls": "^5.0.12",
+    "@lumino/messaging": "^2.0.5",
+    "@lumino/widgets": "^2.10.0",
     "@lydell/node-pty": "^1.2.0-beta.15",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
