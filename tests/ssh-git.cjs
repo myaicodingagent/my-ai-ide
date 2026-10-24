@@ -1,6 +1,7 @@
 // Git over SSH: the real git module (src/main/git.ts) and SSH module run against the test SSH server, which executes
 // commands with the local git in a temporary folder. `npm run test:ssh-git`: does not start the app.
 const fs = require('fs'), os = require('os'), path = require('path'), cp = require('child_process')
+const NL = String.fromCharCode(10)
 const handlers = {}
 const tmp = path.join(os.tmpdir(), 'ssh-git-test-' + process.pid)
 fs.rmSync(tmp, { recursive: true, force: true }); fs.mkdirSync(tmp, { recursive: true })
@@ -74,6 +75,17 @@ const sh = (cwd, ...args) => cp.execFileSync('git', ['-c', 'user.name=t', '-c', 
   check('agent: run_command runs on the server in the project folder', /hello-remote/.test(cmd) && /proj/.test(cmd), cmd)
   const bad = await agent.runCommand({ root: dir, toolUseId: 't3', signal: new AbortController().signal, send: () => undefined, requestApproval: approve }, { command: 'exit 3' }).then(() => 'ok', (e) => e.message)
   check('agent: a failing command reports its exit code', /Exit code: 3/.test(bad), bad)
+
+  // search by meaning (the words part; no model is downloaded here) over SSH
+  fs.mkdirSync(path.join(proj, 'util'), { recursive: true })
+  fs.writeFileSync(path.join(proj, 'util', 'greeter.js'), ['export function greetUser(name) {', '  return "hello " + name', '}', ''].join(NL))
+  fs.writeFileSync(path.join(proj, 'util', 'maths.js'), ['export function addNumbers(a, b) {', '  return a + b', '}', ''].join(NL))
+  fs.mkdirSync(path.join(proj, 'node_modules', 'dep'), { recursive: true }); fs.writeFileSync(path.join(proj, 'node_modules', 'dep', 'greeter.js'), 'function greetUser() {}' + NL)
+  const found = await agent.runTool(dir, 'search_codebase', { query: 'greet user' }).catch((e) => 'ERR ' + e.message)
+  check('agent: search_codebase finds code by its words in a folder on the server', /greeter[.]js/.test(found) && !/node_modules/.test(found), found)
+  fs.writeFileSync(path.join(proj, 'util', 'maths.js'), ['export function addNumbers(a, b) {', '  return a + b', '}', 'export function farewellUser() {}', ''].join(NL))
+  const later = await agent.runTool(dir, 'search_codebase', { query: 'farewell user' }).catch((e) => 'ERR ' + e.message)
+  check('and a file changed on the server is searched again', /maths[.]js/.test(later), later)
 
 
   ssh.disconnectAll(); server.close()

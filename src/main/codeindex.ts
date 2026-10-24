@@ -3,6 +3,7 @@ import { promises as fs } from 'fs'
 import { join, relative } from 'path'
 import * as llm from './llm'
 import { directMode } from './backend'
+import * as ssh from './sshfs'
 import { isRemotePath } from './sshfs'
 import { dot, embed, embedStatus, loadVectorCache, saveVectorCache, textHash, type EmbedStatus } from './embeddings'
 
@@ -172,6 +173,14 @@ function addFile(ix: Index, rel: string, content: string, mtime: number, size: n
 }
 
 async function listFiles(root: string): Promise<{ rel: string; abs: string; mtime: number; size: number }[]> {
+  if (isRemotePath(root)) {
+    // On another computer: one directory listing per folder gives names, sizes and times.
+    return ssh.listWithStats(root, {
+      skipDir: (name) => IGNORED_DIRS.has(name) || name.startsWith('.'),
+      skipFile: (name, size) => SKIP_EXT.has(name.split('.').pop()?.toLowerCase() ?? '') || name.endsWith('.min.js') || size > MAX_FILE_BYTES || size === 0,
+      max: MAX_FILES
+    })
+  }
   const out: { rel: string; abs: string; mtime: number; size: number }[] = []
   const walk = async (dir: string): Promise<void> => {
     if (out.length >= MAX_FILES) return
@@ -213,7 +222,7 @@ async function refresh(root: string): Promise<Index> {
       const old = index.files.get(f.rel)
       if (old && old.mtime === f.mtime && old.size === f.size) continue
       removeFile(index, f.rel)
-      const content = await fs.readFile(f.abs, 'utf-8').catch(() => null)
+      const content = await (isRemotePath(f.abs) ? ssh.readFile(f.abs) : fs.readFile(f.abs, 'utf-8')).catch(() => null)
       if (content === null || content.slice(0, 2000).includes('\u0000')) continue // binary
       addFile(index, f.rel, content, f.mtime, f.size)
     }
@@ -246,7 +255,8 @@ interface Scored {
 
 const hitOf = ({ ix, id, score }: Scored): Hit => {
   const c = ix.chunks.get(id)!
-  return { root: ix.root, rel: c.file, abs: join(ix.root, c.file), start: c.start, end: c.end, score, text: c.text }
+  const abs = isRemotePath(ix.root) ? ix.root.replace(/[\\/]+$/, '') + '\\' + c.file.replace(/\//g, '\\') : join(ix.root, c.file)
+  return { root: ix.root, rel: c.file, abs, start: c.start, end: c.end, score, text: c.text }
 }
 
 function bm25(all: Index[], weighted: Map<string, number>, limit: number): Scored[] {
@@ -452,7 +462,6 @@ export async function searchCodebase(roots: string[], query: string, opts: { lim
   const limit = Math.min(30, Math.max(1, opts.limit ?? 10))
   const empty: SearchResult = { ok: true, hits: [], indexed: { files: 0, chunks: 0 }, expanded: null, reranked: false }
   if (!query.trim() || roots.length === 0) return empty
-  if (roots.some(isRemotePath)) return { ...empty, ok: false, error: 'Search by meaning does not work in folders opened over SSH yet.' }
   try {
     const built = await Promise.all(roots.map((r) => refresh(r)))
     const indexed = { files: built.reduce((n, i) => n + i.files.size, 0), chunks: built.reduce((n, i) => n + i.chunks.size, 0) }

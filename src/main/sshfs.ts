@@ -619,6 +619,29 @@ export async function search(rootUnc: string, query: string, opts: { caseSensiti
   return { matches, truncated }
 }
 
+/** Every file below a folder with its size and modification time (from the directory listings, so no extra round trips). */
+export async function listWithStats(
+  rootUnc: string,
+  opts: { skipDir: (name: string) => boolean; skipFile: (name: string, size: number) => boolean; max: number }
+): Promise<{ rel: string; abs: string; size: number; mtime: number }[]> {
+  const out: { rel: string; abs: string; size: number; mtime: number }[] = []
+  const walk = async (dirUnc: string, relDir: string): Promise<void> => {
+    if (out.length >= opts.max) return
+    const { conn, path } = target(dirUnc)
+    const list = await new Promise<{ filename: string; attrs: Stats }[]>((resolve) => conn.sftp.readdir(path, (e, l) => resolve(e ? [] : (l as never))))
+    for (const f of list) {
+      if (out.length >= opts.max) return
+      if (f.attrs.isDirectory()) {
+        if (!opts.skipDir(f.filename)) await walk(childUnc(dirUnc, f.filename), relDir + f.filename + '/')
+      } else if (f.attrs.isFile() && !opts.skipFile(f.filename, f.attrs.size)) {
+        out.push({ rel: relDir + f.filename, abs: childUnc(dirUnc, f.filename), size: f.attrs.size, mtime: f.attrs.mtime * 1000 })
+      }
+    }
+  }
+  await walk(rootUnc, '')
+  return out
+}
+
 /** Folders only, for choosing a folder to open. */
 export async function browse(name: string, remotePath: string): Promise<{ path: string; parent: string | null; dirs: string[] }> {
   const conn = live.get(name)

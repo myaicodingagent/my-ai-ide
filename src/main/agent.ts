@@ -464,7 +464,6 @@ export async function runTool(root: string, name: string, input: unknown): Promi
     case 'find_files':
       return findFiles(root, { pattern: str('pattern') })
     case 'search_codebase': {
-      if (isRemotePath(root)) throw new Error('Search by meaning is not available in a folder opened over SSH. Use search_text or find_files.')
       const r = await searchCodebase([root], str('query'), { limit: 8 })
       if (!r.ok) throw new Error(r.error ?? 'The search failed.')
       return formatHits(r.hits, 20_000)
