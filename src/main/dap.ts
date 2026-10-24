@@ -1,6 +1,6 @@
 import { ChildProcess, spawn } from 'child_process'
 import { existsSync, realpathSync } from 'fs'
-import { createServer, connect as tcpConnect } from 'net'
+import { createServer, connect as tcpConnect, Socket } from 'net'
 import { Readable, Writable } from 'stream'
 import { homedir } from 'os'
 import { delimiter, dirname, join } from 'path'
@@ -129,7 +129,23 @@ interface Adapter {
   id: string
   label: string
   files: RegExp // the files whose breakpoints belong to this adapter
-  start(opts: DebugOptions, emit: (e: DbgEvent) => void): Promise<{ child: ChildProcess; io: { input: Readable; output: Writable }; launch: Json; stderr: () => string }>
+  start(opts: DebugOptions, emit: (e: DbgEvent) => void): Promise<Started>
+  attach?(target: AttachTarget, emit: (e: DbgEvent) => void): Promise<Started>
+}
+
+export interface AttachTarget {
+  host?: string
+  port?: number
+  pid?: number
+}
+
+interface Started {
+  child: ChildProcess | null // the adapter process we own; null when we only connected to one that is already running
+  io: { input: Readable; output: Writable }
+  launch: Json // the arguments of the launch or attach request (its `request` field says which)
+  stderr: () => string
+  closeOn?: { once(event: 'close', cb: () => void): unknown } // what ends the connection when there is no child
+  pid?: number
 }
 
 const cleanEnv = (): NodeJS.ProcessEnv => {
@@ -139,7 +155,7 @@ const cleanEnv = (): NodeJS.ProcessEnv => {
   return env
 }
 
-const pythonAdapter: Adapter = {
+export const pythonAdapter: Adapter = {
   id: 'python',
   label: 'Python',
   files: /\.pyw?$/i,
@@ -173,6 +189,28 @@ const pythonAdapter: Adapter = {
   }
 }
 
+pythonAdapter.attach = async (target) => {
+  if (!target.port) throw new Error('Give the port the program listens on (started with: python -m debugpy --listen 5678 script.py).')
+  const host = target.host || '127.0.0.1'
+  // debugpy in the program speaks the Debug Adapter Protocol itself, so there is no adapter process: connect to it.
+  const socket = await connectTo(host, target.port, 'Python')
+  return {
+    child: null,
+    io: { input: socket, output: socket },
+    closeOn: socket,
+    stderr: () => '',
+    launch: { name: 'Python attach', type: 'python', request: 'attach', justMyCode: true, redirectOutput: true }
+  }
+}
+
+function connectTo(host: string, port: number, what: string): Promise<Socket> {
+  return new Promise((resolve, reject) => {
+    const socket = tcpConnect(port, host)
+    socket.once('connect', () => resolve(socket))
+    socket.once('error', (e) => reject(new Error(`Nothing is listening for a ${what} debugger at ${host}:${port} (${e.message}).`)))
+  })
+}
+
 export const DELVE_HELP = 'Go debugging needs Delve. Install it by running:  go install github.com/go-delve/delve/cmd/dlv@latest'
 
 function findDelve(): string | null {
@@ -194,56 +232,61 @@ const freePort = (): Promise<number> =>
   })
 
 // Delve speaks the Debug Adapter Protocol over TCP: `dlv dap --listen=...`, then connect to that port.
-const goAdapter: Adapter = {
+async function spawnDelve(cwd: string, emit: (e: DbgEvent) => void): Promise<{ child: ChildProcess; socket: Socket; stderr: () => string }> {
+  const dlv = findDelve()
+  if (!dlv) throw new Error(DELVE_HELP)
+  const port = await freePort()
+  const child = spawn(dlv, ['dap', `--listen=127.0.0.1:${port}`], { cwd, env: cleanEnv(), stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+  let stderr = ''
+  let said = ''
+  let ready = false
+  child.stderr?.on('data', (b: Buffer) => {
+    stderr = (stderr + b.toString('utf-8')).slice(-2000)
+    if (ready) emit({ type: 'output', stream: 'stderr', text: b.toString('utf-8') }) // the program's own error output
+  })
+  // Before the handshake this is Delve talking; afterwards it is the program, which shares Delve's output.
+  child.stdout?.on('data', (b: Buffer) => {
+    if (!ready) said += b.toString('utf-8')
+    else emit({ type: 'output', stream: 'stdout', text: b.toString('utf-8') })
+  })
+  await new Promise<void>((resolve, reject) => {
+    const t0 = Date.now()
+    const tick = (): void => {
+      if (/listening/i.test(said)) return resolve()
+      if (child.exitCode !== null) return reject(new Error(`Delve stopped right away.${stderr ? '\n' + stderr : ''}`))
+      if (Date.now() - t0 > 15_000) return reject(new Error('Delve did not start in time.'))
+      setTimeout(tick, 50)
+    }
+    child.once('error', (e) => reject(new Error(`Could not start Delve: ${e.message}`)))
+    tick()
+  }).catch((e) => {
+    child.kill()
+    throw e
+  })
+  const socket = tcpConnect(port, '127.0.0.1')
+  await new Promise<void>((resolve, reject) => {
+    socket.once('connect', resolve)
+    socket.once('error', (e) => reject(new Error(`Could not connect to Delve: ${e.message}`)))
+  }).catch((e) => {
+    child.kill()
+    throw e
+  })
+  ready = true
+  child.once('close', () => socket.destroy())
+  return { child, socket, stderr: () => stderr }
+}
+
+export const goAdapter: Adapter = {
   id: 'go',
   label: 'Go',
   files: /\.go$/i,
   async start(opts, emit) {
-    const dlv = findDelve()
-    if (!dlv) throw new Error(DELVE_HELP)
-    const port = await freePort()
     const cwd = opts.cwd || dirname(opts.file)
-    const child = spawn(dlv, ['dap', `--listen=127.0.0.1:${port}`], { cwd, env: cleanEnv(), stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
-    let stderr = ''
-    let said = ''
-    let ready = false
-    child.stderr?.on('data', (b: Buffer) => {
-      stderr = (stderr + b.toString('utf-8')).slice(-2000)
-      if (ready) emit({ type: 'output', stream: 'stderr', text: b.toString('utf-8') }) // the program's own error output
-    })
-    // Before the handshake this is Delve talking; afterwards it is the program, which shares Delve's output.
-    child.stdout?.on('data', (b: Buffer) => {
-      if (!ready) said += b.toString('utf-8')
-      else emit({ type: 'output', stream: 'stdout', text: b.toString('utf-8') })
-    })
-    await new Promise<void>((resolve, reject) => {
-      const t0 = Date.now()
-      const tick = (): void => {
-        if (/listening/i.test(said)) return resolve()
-        if (child.exitCode !== null) return reject(new Error(`Delve stopped right away.${stderr ? '\n' + stderr : ''}`))
-        if (Date.now() - t0 > 15_000) return reject(new Error('Delve did not start in time.'))
-        setTimeout(tick, 50)
-      }
-      child.once('error', (e) => reject(new Error(`Could not start Delve: ${e.message}`)))
-      tick()
-    }).catch((e) => {
-      child.kill()
-      throw e
-    })
-    const socket = tcpConnect(port, '127.0.0.1')
-    await new Promise<void>((resolve, reject) => {
-      socket.once('connect', resolve)
-      socket.once('error', (e) => reject(new Error(`Could not connect to Delve: ${e.message}`)))
-    }).catch((e) => {
-      child.kill()
-      throw e
-    })
-    ready = true
-    child.once('close', () => socket.destroy())
+    const { child, socket, stderr } = await spawnDelve(cwd, emit)
     return {
       child,
       io: { input: socket, output: socket },
-      stderr: () => stderr,
+      stderr,
       launch: {
         name: 'Go',
         type: 'go',
@@ -257,6 +300,21 @@ const goAdapter: Adapter = {
         stopOnEntry: opts.stopOnEntry === true
       }
     }
+  },
+  // A running Go program, by process id; or one started under `dlv --headless`, by port (that server speaks DAP too).
+  async attach(target, emit) {
+    if (target.pid) {
+      try {
+        process.kill(target.pid, 0)
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'ESRCH') throw new Error(`There is no process with id ${target.pid}.`)
+      }
+      const { child, socket, stderr } = await spawnDelve(process.cwd(), emit)
+      return { child, io: { input: socket, output: socket }, stderr, pid: target.pid, launch: { name: 'Go attach', type: 'go', request: 'attach', mode: 'local', processId: target.pid } }
+    }
+    if (!target.port) throw new Error('Give a process id ("pid 1234") or the port of a Delve server (dlv attach --headless --listen=:2345).')
+    const socket = await connectTo(target.host || '127.0.0.1', target.port, 'Go')
+    return { child: null, io: { input: socket, output: socket }, closeOn: socket, stderr: () => '', launch: { name: 'Go attach', type: 'go', request: 'attach', mode: 'remote' } }
   }
 }
 
@@ -269,9 +327,18 @@ export function startPythonDebug(opts: DebugOptions, emit: (e: DbgEvent) => void
 /** Starts a program under a debug adapter. Resolves when it is running (breakpoints set), rejects with a readable message. */
 export async function startDapDebug(adapter: Adapter, opts: DebugOptions, emit: (e: DbgEvent) => void): Promise<DapSession> {
   if (!existsSync(opts.file)) throw new Error(`The file does not exist: ${opts.file}`)
-  const started = await adapter.start(opts, emit)
+  return runDap(adapter, await adapter.start(opts, emit), opts.breakpoints, [opts.file], false, emit)
+}
+
+/** Connects to a program that is already running (Python: started with debugpy --listen; Go: a process id or a Delve server). */
+export async function startDapAttach(adapter: Adapter, target: AttachTarget, breakpoints: Record<string, DbgBreakpoint[]>, emit: (e: DbgEvent) => void): Promise<DapSession> {
+  if (!adapter.attach) throw new Error(`Attaching is not supported for ${adapter.label}.`)
+  return runDap(adapter, await adapter.attach(target, emit), breakpoints, [], true, emit)
+}
+
+async function runDap(adapter: Adapter, started: Started, breakpointsByFile: Record<string, DbgBreakpoint[]>, files: string[], attached: boolean, emit: (e: DbgEvent) => void): Promise<DapSession> {
   const { child } = started
-  const dap = new Dap(started.io, child)
+  const dap = new Dap(started.io, (child ?? started.closeOn)!)
   const stderrOf = (): string => started.stderr()
   // The adapter reports long, real paths; the editor knows the files by the spelling it was given (short Windows names...).
   const spelling = new Map<string, string>()
@@ -282,7 +349,7 @@ export async function startDapDebug(adapter: Adapter, opts: DebugOptions, emit: 
       return p.replace(/\\/g, '/').toLowerCase()
     }
   }
-  for (const f of [opts.file, ...Object.keys(opts.breakpoints)]) spelling.set(key(f), f)
+  for (const f of [...files, ...Object.keys(breakpointsByFile)]) spelling.set(key(f), f)
   const spellAs = (p: string): string => spelling.get(key(p)) ?? p
   let frames: { id: number }[] = []
   let thread = 1
@@ -295,10 +362,11 @@ export async function startDapDebug(adapter: Adapter, opts: DebugOptions, emit: 
     emit({ type: 'exited', code: exitCode })
     setTimeout(() => {
       try {
-        child.kill()
+        child?.kill()
       } catch {
         // gone
       }
+      if (!child) started.io.output.end()
     }, 300)
   }
 
@@ -359,10 +427,10 @@ export async function startDapDebug(adapter: Adapter, opts: DebugOptions, emit: 
   })
   void caps
   // launch's answer comes after configurationDone, so it is not awaited here.
-  const launched = dap.request('launch', started.launch)
+  const launched = dap.request(attached ? 'attach' : 'launch', started.launch)
   launched.catch(() => undefined)
-  await Promise.race([initialized, new Promise((_r, rej) => setTimeout(() => rej(new Error(`The ${adapter.label} debugger did not start in time.` + (stderrOf() ? '\n' + stderrOf() : ''))), 30_000))])
-  for (const [file, bps] of Object.entries(opts.breakpoints)) {
+  await Promise.race([initialized, launched.then(() => initialized), new Promise((_r, rej) => setTimeout(() => rej(new Error(`The ${adapter.label} debugger did not start in time.` + (stderrOf() ? '\n' + stderrOf() : ''))), 30_000))])
+  for (const [file, bps] of Object.entries(breakpointsByFile)) {
     if (!adapter.files.test(file)) continue
     await dap.request('setBreakpoints', { source: { path: file }, breakpoints: bps.map((b) => ({ line: b.line, ...(b.condition?.trim() ? { condition: b.condition } : {}) })) }).catch(() => undefined)
   }
@@ -371,7 +439,8 @@ export async function startDapDebug(adapter: Adapter, opts: DebugOptions, emit: 
   await launched.catch((e) => {
     throw new Error(`The program could not be started: ${e.message}${stderrOf() ? '\n' + stderrOf() : ''}`)
   })
-  emit({ type: 'started', pid: child.pid ?? 0 })
+  emit({ type: 'started', pid: started.pid ?? child?.pid ?? 0 })
+  if (attached) emit({ type: 'output', stream: 'info', text: 'Attached (the program keeps running; Stop only disconnects).\n' })
 
   return {
     get active() {
@@ -417,15 +486,17 @@ export async function startDapDebug(adapter: Adapter, opts: DebugOptions, emit: 
       }
     },
     stop() {
-      void dap.request('disconnect', { terminateDebuggee: true }).catch(() => undefined)
-      setTimeout(() => {
+      // An attached program is let go, not ended. Wait for the answer so the adapter has detached before it is killed.
+      const done = dap.request('disconnect', { terminateDebuggee: !attached }).catch(() => undefined)
+      void Promise.race([done, new Promise((r) => setTimeout(r, 2000))]).then(() => {
         try {
-          child.kill()
+          child?.kill()
         } catch {
           // gone
         }
-        if (process.platform === 'win32' && child.pid) spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true })
-      }, 500)
+        if (!child) started.io.output.end()
+        if (process.platform === 'win32' && child?.pid) spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true })
+      })
     }
   }
 }

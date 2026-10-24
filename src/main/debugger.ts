@@ -6,7 +6,7 @@ import { delimiter, dirname, join, resolve as resolvePath } from 'path'
 import { fileURLToPath, pathToFileURL } from 'url'
 import WebSocket from 'ws'
 import { SourceMapIndex, parseSourceMap } from './sourcemap'
-import { DapSession, adapterFor, startDapDebug } from './dap'
+import { DapSession, adapterFor, goAdapter, pythonAdapter, startDapAttach, startDapDebug } from './dap'
 import { isRemotePath } from './sshfs'
 
 // A JavaScript debugger: the program runs under `node --inspect-brk` and this talks to Node's built-in inspector
@@ -538,12 +538,21 @@ export function registerDebugHandlers(getWin: () => BrowserWindow | null): void 
   })
   ipcMain.handle('dbg:attach', async (_e, opts) => {
     if ((session && !session.exited) || dapActive()) return { ok: false as const, error: 'A debug session is already running. Stop it first.' }
-    return attach({
+    const target = {
       host: typeof opts?.host === 'string' && /^[A-Za-z0-9.-]{1,255}$/.test(opts.host) ? opts.host : undefined,
       port: Number.isInteger(opts?.port) ? opts.port : undefined,
-      pid: Number.isInteger(opts?.pid) ? opts.pid : undefined,
-      breakpoints: opts?.breakpoints ?? {}
-    })
+      pid: Number.isInteger(opts?.pid) ? opts.pid : undefined
+    }
+    const breakpoints = opts?.breakpoints ?? {}
+    const language = opts?.language === 'python' || opts?.language === 'go' ? (opts.language as 'python' | 'go') : 'node'
+    if (language === 'node') return attach({ ...target, breakpoints })
+    try {
+      dapSession = await startDapAttach(language === 'python' ? pythonAdapter : goAdapter, target, breakpoints, emit)
+      return { ok: true as const }
+    } catch (e) {
+      dapSession = null
+      return { ok: false as const, error: e instanceof Error ? e.message : String(e) }
+    }
   })
   ipcMain.handle('dbg:stop', () => {
     dapActive()?.stop()

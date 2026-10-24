@@ -76,7 +76,7 @@ const check = (name, ok, detail = '') => { results.push(ok); console.log(`${ok ?
     Selection: ['Select All', 'Expand Selection', 'Copy Line Down', 'Move Line Down', 'Add Cursor Below'],
     View: ['Command Palette…', 'Explorer', 'Search', 'Source Control', 'Run and Debug', 'Extensions', 'Agents', 'AI Chat', 'Terminal', 'Toggle Sidebar'],
     Go: ['Go to File…', 'Go to Symbol in File…', 'Go to Line…', 'Go to Definition'],
-    Run: ['Start Debugging', 'Stop Debugging', 'Step Over', 'Toggle Breakpoint', 'Attach to Node.js Program…'],
+    Run: ['Start Debugging', 'Stop Debugging', 'Step Over', 'Toggle Breakpoint', 'Attach to Node.js Program…', 'Attach to Python Program…', 'Attach to Go Process…'],
     Terminal: ['New Terminal', 'Run Task…', 'Toggle Terminal'],
     Help: ['Show All Commands', 'Toggle Developer Tools', 'About My AI IDE']
   }

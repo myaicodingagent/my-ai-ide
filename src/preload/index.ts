@@ -115,6 +115,7 @@ const api = {
     breakpoints: Record<string, DbgBreakpoint[]>
   }): Promise<{ ok: true } | { ok: false; error: string }> => ipcRenderer.invoke('dbg:start', opts),
   dbgAttach: (opts: {
+    language?: 'node' | 'python' | 'go'
     host?: string
     port?: number
     pid?: number

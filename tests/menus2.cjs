@@ -230,6 +230,30 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
   await menu('Run', 'Stop Debugging', 1500)
   check('Run > Stop Debugging ends the session', (await frames()).length === 0 && /Start Debugging/.test(await side()))
 
+  // ---- attach to a running Python program from the Run menu
+  if (cp.spawnSync('py', ['-3', '-c', 'import debugpy'], { windowsHide: true }).status === 0) {
+    write('pyloop.py', ['import time', 'n = 0', 'def tick():', '    global n', '    n += 1', '    return n', 'while True:', '    tick()', '    time.sleep(0.1)', ''].join('\n'))
+    const pyChild = cp.spawn('py', ['-3', '-m', 'debugpy', '--listen', '127.0.0.1:19342', path.join(proj, 'pyloop.py')], { stdio: 'ignore', windowsHide: true })
+    await sleep(2500)
+    await openFile('pyloop.py')
+    await toLine(5)
+    await menu('Run', 'Toggle Breakpoint', 700)
+    await menu('Run', 'Attach to Python Program…', 700)
+    check('Run > Attach to Python Program opens its dialog', await visible('.input-dialog'))
+    await typeText('nonsense'); await press('Enter', 500)
+    check('a value that is not a port is refused in the dialog', await visible('.input-dialog'))
+    await ev(`(() => { const i = document.querySelector('.input-dialog input'); i.select() })()`)
+    await typeText('19342'); await press('Enter', 4000)
+    const pf = await frames()
+    check('attaching to the Python port stops at the breakpoint in tick', /tick pyloop\.py:5/.test(pf[0] ?? ''), JSON.stringify(pf))
+    await menu('Run', 'Remove All Breakpoints', 500)
+    await menu('Run', 'Stop Debugging', 1500)
+    check('Stop Debugging lets go of the attached Python program', (await frames()).length === 0 && pyChild.exitCode === null)
+    try { cp.execSync('taskkill /F /T /PID ' + pyChild.pid, { stdio: 'ignore' }) } catch { /* gone */ }
+    await closeAllTabs()
+    fs.rmSync(path.join(proj, 'pyloop.py'), { force: true })
+  } else console.log('SKIP  Python attach from the menu (py -3 with debugpy not found)')
+
   // ================= every shortcut the menus show =================
   check('the window has its full height again (no panel or developer tools left open)', (await ev('window.innerHeight')) === height0, `${await ev('window.innerHeight')} vs ${height0}`)
   await openFile('edit.js')

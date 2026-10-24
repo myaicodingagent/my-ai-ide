@@ -371,6 +371,87 @@ const same = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLower
     child.kill()
   }
 
+  // --- attach to a running Python program (python -m debugpy --listen)
+  {
+    events.length = 0
+    const cp = require('child_process')
+    const probe = cp.spawnSync('py', ['-3', '-c', 'import debugpy'], { windowsHide: true })
+    if (probe.status !== 0) console.log('SKIP  Python attach (py -3 with debugpy not found)')
+    else {
+      const loop = path.join(dir, 'pyloop.py')
+      fs.writeFileSync(loop, ['import time', 'n = 0', 'def tick():', '    global n', '    n += 1', '    return n', 'while True:', '    tick()', '    time.sleep(0.1)', ''].join('\n'))
+      const port = 19340
+      const child = cp.spawn('py', ['-3', '-m', 'debugpy', '--listen', `127.0.0.1:${port}`, loop], { stdio: 'ignore', windowsHide: true })
+      await sleep(2500)
+      let a = await call('dbg:attach', { language: 'python', port: 1 })
+      check('Python attach: where nothing listens there is a clear error', a.ok === false && /Nothing is listening/.test(a.error), JSON.stringify(a))
+      a = await call('dbg:attach', { language: 'python', port, breakpoints: { [loop]: [{ line: 5 }] } })
+      check('Python attach: connects to a running program', a.ok === true, JSON.stringify(a))
+      let ap = await paused('py attached breakpoint')
+      check('Python attach: a breakpoint set before attaching stops the program', ap.reason === 'breakpoint' && ap.frames[0].name === 'tick' && ap.frames[0].line === 5 && same(ap.frames[0].file, loop), JSON.stringify(ap.frames[0]))
+      const ev = await call('dbg:eval', 'n', 0)
+      check('Python attach: expressions can be evaluated in the stopped program', ev.ok === true && /^\d+$/.test(ev.value.value), JSON.stringify(ev))
+      a = await call('dbg:attach', { language: 'python', port })
+      check('Python attach: a second attach is refused while one is active', a.ok === false)
+      await call('dbg:stepOver')
+      ap = await paused('py attached step')
+      check('Python attach: stepping works', ap.reason === 'step' && ap.frames[0].line === 6, JSON.stringify([ap.reason, ap.frames[0].line]))
+      await call('dbg:setBreakpoints', loop, [])
+      await call('dbg:continue')
+      await sleep(400)
+      await call('dbg:stop')
+      await waitEvent((e) => e.type === 'exited', 'py detached')
+      await sleep(600)
+      check('Python attach: Stop only disconnects, the program keeps running', child.exitCode === null && child.signalCode === null)
+      events.length = 0
+      a = await call('dbg:attach', { language: 'python', port, breakpoints: { [loop]: [{ line: 5 }] } })
+      ap = a.ok ? await paused('py reattached') : null
+      check('Python attach: it can be attached to again after letting go', a.ok === true && !!ap && ap.reason === 'breakpoint', JSON.stringify(a))
+      await call('dbg:setBreakpoints', loop, []); await call('dbg:continue'); await sleep(300); await call('dbg:stop')
+      await waitEvent((e) => e.type === 'exited', 'py detached 2')
+      cp.spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true })
+      events.length = 0
+    }
+  }
+
+  // --- attach to a running Go program by process id
+  {
+    events.length = 0
+    const cp = require('child_process')
+    const goDir = path.join(dir, 'goloop')
+    fs.mkdirSync(goDir, { recursive: true })
+    fs.writeFileSync(path.join(goDir, 'go.mod'), 'module goloop\n\ngo 1.20\n')
+    const gloop = path.join(goDir, 'main.go')
+    fs.writeFileSync(gloop, ['package main', '', 'import "time"', '', 'var n int', '', 'func tick() int {', '	n++', '	return n', '}', '', 'func main() {', '	for {', '		tick()', '		time.Sleep(100 * time.Millisecond)', '	}', '}', ''].join('\n'))
+    const exe = path.join(goDir, 'goloop.exe')
+    const b = cp.spawnSync('go', ['build', '-gcflags=all=-N -l', '-o', exe, '.'], { cwd: goDir, windowsHide: true })
+    const dlvOk = cp.spawnSync('dlv', ['version'], { windowsHide: true }).status === 0
+    if (b.status !== 0 || !dlvOk) console.log('SKIP  Go attach (go build or dlv failed)')
+    else {
+      const child = cp.spawn(exe, [], { stdio: 'ignore', windowsHide: true })
+      await sleep(800)
+      let a = await call('dbg:attach', { language: 'go', pid: child.pid, breakpoints: { [gloop]: [{ line: 8 }] } })
+      check('Go attach: connects to a running program by process id', a.ok === true, JSON.stringify(a))
+      let ap = await paused('go attached breakpoint')
+      check('Go attach: a breakpoint set before attaching stops the program', ap.reason === 'breakpoint' && /tick/.test(ap.frames[0].name) && ap.frames[0].line === 8 && same(ap.frames[0].file, gloop), JSON.stringify(ap.frames[0]))
+      const scopes = await call('dbg:scopes', 0)
+      check('Go attach: the stopped program can be inspected', Array.isArray(scopes) && scopes.length > 0, JSON.stringify(scopes).slice(0, 160))
+      a = await call('dbg:attach', { language: 'go', pid: child.pid })
+      check('Go attach: a second attach is refused while one is active', a.ok === false)
+      await call('dbg:setBreakpoints', gloop, [])
+      await call('dbg:continue')
+      await sleep(400)
+      await call('dbg:stop')
+      await waitEvent((e) => e.type === 'exited', 'go detached')
+      await sleep(800)
+      check('Go attach: Stop only disconnects, the program keeps running', child.exitCode === null && child.signalCode === null)
+      a = await call('dbg:attach', { language: 'go', pid: 2147483000 })
+      check('Go attach: a process that does not exist gives an error', a.ok === false, JSON.stringify(a))
+      cp.spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true })
+      events.length = 0
+    }
+  }
+
   await sleep(800)
   try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }) } catch { /* a debuggee may still be closing; it is only a temp folder */ }
   const failed = results.filter((x) => !x).length

@@ -1654,6 +1654,22 @@ export function App(): JSX.Element {
       setTimeout(go, 80)
     }
 
+  // Asks what to attach to (a port, host:port, or "pid N" where the language allows it), then attaches.
+  const askAttach = (language: 'node' | 'python' | 'go', title: string, placeholder: string, allowPid: boolean): void =>
+    setInputRequest({
+      title,
+      placeholder,
+      confirmLabel: 'Attach',
+      validate: (v) => ((allowPid ? /^\s*(pid\s+\d+|\d{2,5}|[A-Za-z0-9.-]+:\d{2,5})\s*$/i : /^\s*(\d{2,5}|[A-Za-z0-9.-]+:\d{2,5})\s*$/).test(v) ? null : `Use a port like 5678, host:port${allowPid ? ', or "pid 12345"' : ''}.`),
+      onSubmit: (v) => {
+        const t = v.trim()
+        const pid = /^pid\s+(\d+)$/i.exec(t)
+        const hp = /^(?:([A-Za-z0-9.-]+):)?(\d+)$/.exec(t)
+        showDebug()
+        void attachDebugging(pid ? { language, pid: Number(pid[1]) } : { language, host: hp?.[1], port: Number(hp?.[2]) }).then((err) => err && showToast(err, 'error'))
+      }
+    })
+
   const buildCommands = (): PickItem[] => [
       { label: 'File: Open Folder', run: () => void openFolder() },
       { label: 'File: Save', run: () => void save() },
@@ -1688,20 +1704,15 @@ export function App(): JSX.Element {
       },
       {
         label: 'Debug: Attach to Node.js Program…',
-        run: () =>
-          setInputRequest({
-            title: 'Attach to a running Node.js program: a port (9229, or host:port) or a process id with "pid "',
-            placeholder: '9229   or   pid 12345',
-            confirmLabel: 'Attach',
-            validate: (v) => (/^\s*(pid\s+\d+|\d{2,5}|[A-Za-z0-9.-]+:\d{2,5})\s*$/i.test(v) ? null : 'Use a port like 9229, host:port, or "pid 12345".'),
-            onSubmit: (v) => {
-              const t = v.trim()
-              const pid = /^pid\s+(\d+)$/i.exec(t)
-              const hp = /^(?:([A-Za-z0-9.-]+):)?(\d+)$/.exec(t)
-              showDebug()
-              void attachDebugging(pid ? { pid: Number(pid[1]) } : { host: hp?.[1], port: Number(hp?.[2]) }).then((err) => err && showToast(err, 'error'))
-            }
-          })
+        run: () => askAttach('node', 'Attach to a running Node.js program: a port (9229, or host:port) or a process id with "pid "', '9229   or   pid 12345', true)
+      },
+      {
+        label: 'Debug: Attach to Python Program…',
+        run: () => askAttach('python', 'Attach to a Python program started with: python -m debugpy --listen 5678 script.py. Give its port (or host:port)', '5678   or   host:5678', false)
+      },
+      {
+        label: 'Debug: Attach to Go Process…',
+        run: () => askAttach('go', 'Attach to a running Go program: "pid 12345", or the port (or host:port) of a Delve server (dlv attach --headless --listen=:2345)', 'pid 12345   or   2345', true)
       },
       { label: 'Debug: Stop (Shift+F5)', run: () => void stopDebugging() },
       { label: 'Debug: Toggle Breakpoint (F9)', run: () => toggleBreakpointAtCaret(focusedEditor()) },
@@ -1984,6 +1995,8 @@ export function App(): JSX.Element {
         { label: 'Toggle Breakpoint', shortcut: 'F9', run: () => toggleBreakpointAtCaret(focusedEditor()), separator: true },
         { label: 'Remove All Breakpoints', run: () => clearAllBreakpoints() },
         { label: 'Attach to Node.js Program…', run: cmd('Debug: Attach to Node.js Program'), separator: true },
+        { label: 'Attach to Python Program…', run: cmd('Debug: Attach to Python Program') },
+        { label: 'Attach to Go Process…', run: cmd('Debug: Attach to Go Process') },
         { label: 'Open Launch Configurations', run: () => void openConfigFile('launch') }
       ]
     },
