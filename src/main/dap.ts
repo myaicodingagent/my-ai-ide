@@ -147,6 +147,7 @@ export interface AttachTarget {
   host?: string
   port?: number
   pid?: number
+  roots?: string[] // the open folders (where the source files are looked for)
 }
 
 interface Started {
@@ -560,6 +561,43 @@ export const javaAdapter: Adapter = {
       launch: { name: 'Java', request: 'launch', javaExe: jdk.java, mainClass: prog.mainClass, classpath: [prog.classes], sourceRoots: [prog.sourceRoot], args: opts.args ?? [], cwd, env: opts.env ?? {}, stopOnEntry: opts.stopOnEntry === true }
     }
   }
+}
+
+javaAdapter.attach = async (target) => {
+  if (!target.port) throw new Error('Give the port the program listens on for a debugger (start it with: java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=5005 ...).')
+  const jdk = findJdk()
+  if (!jdk) throw new Error(JAVA_HELP)
+  const adapterDir = await ensureJavaAdapter(jdk.javac)
+  const child = spawn(jdk.java, ['-cp', adapterDir, 'JavaDap'], { env: cleanEnv(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+  let stderr = ''
+  child.stderr?.on('data', (b: Buffer) => (stderr = (stderr + b.toString('utf-8')).slice(-2000)))
+  return {
+    child,
+    io: { input: child.stdout!, output: child.stdin! },
+    stderr: () => stderr,
+    launch: { name: 'Java attach', request: 'attach', host: target.host || '127.0.0.1', port: target.port, sourceRoots: target.roots ?? [] }
+  }
+}
+
+// C and C++: lldb-dap attaches to a process by its id. netcoredbg (below) does the same for .NET programs.
+cppAdapter.attach = async (target) => {
+  if (!target.pid) throw new Error('Give the id of the process: "pid 1234".')
+  const dbg = findCppDebugger()
+  if (!dbg) throw new Error(CPP_HELP)
+  const child = spawn(dbg, [], { env: cleanEnv(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+  let stderr = ''
+  child.stderr?.on('data', (b: Buffer) => (stderr = (stderr + b.toString('utf-8')).slice(-2000)))
+  return { child, io: { input: child.stdout!, output: child.stdin! }, stderr: () => stderr, launch: { name: 'C/C++ attach', request: 'attach', pid: target.pid } }
+}
+
+csharpAdapter.attach = async (target) => {
+  if (!target.pid) throw new Error('Give the id of the .NET process: "pid 1234".')
+  const dbg = findNetcoredbg()
+  if (!dbg) throw new Error(NETCOREDBG_HELP)
+  const child = spawn(dbg, ['--interpreter=vscode'], { env: cleanEnv(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+  let stderr = ''
+  child.stderr?.on('data', (b: Buffer) => (stderr = (stderr + b.toString('utf-8')).slice(-2000)))
+  return { child, io: { input: child.stdout!, output: child.stdin! }, stderr: () => stderr, launch: { name: 'C# attach', type: 'coreclr', request: 'attach', processId: target.pid } }
 }
 
 export const adapterFor = (file: string): Adapter | null => [pythonAdapter, goAdapter, csharpAdapter, cppAdapter, javaAdapter].find((a) => a.files.test(file)) ?? null

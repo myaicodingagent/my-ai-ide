@@ -188,7 +188,7 @@ export async function startDebugging(
 }
 
 // Connects to a program (Node, Python or Go) that is already running: by inspector port (started with --inspect) or by process id.
-export async function attachDebugging(target: { language?: 'node' | 'python' | 'go'; host?: string; port?: number; pid?: number }): Promise<string | null> {
+export async function attachDebugging(target: { language?: 'node' | 'python' | 'go' | 'java' | 'cpp' | 'csharp'; host?: string; port?: number; pid?: number; roots?: string[] }): Promise<string | null> {
   if (isActive()) return 'A debug session is already running.'
   const breakpoints: Record<string, DbgBreakpoint[]> = {}
   for (const v of Object.values(snap.breakpoints)) breakpoints[v.path] = v.bps

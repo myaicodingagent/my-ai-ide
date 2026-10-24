@@ -736,6 +736,112 @@ const same = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLower
     }
   }
 
+  // --- attach to a running Java, C/C++ and .NET program
+  {
+    events.length = 0
+    const cp = require('child_process')
+    const adir = path.join(dir, 'attach progs')
+    fs.mkdirSync(adir, { recursive: true })
+    const isAlive = (pid) => { try { process.kill(pid, 0); return true } catch { return false } }
+    const NL = String.fromCharCode(10)
+    // Java: a JVM that listens for a debugger without waiting for one
+    if (cp.spawnSync('javac', ['-version'], { windowsHide: true }).status === 0) {
+      const jl = path.join(adir, 'Loop.java')
+      fs.writeFileSync(jl, ['public class Loop {', '    static int n;', '    static int tick() {', '        n++;', '        return n;', '    }', '    public static void main(String[] args) throws Exception {', '        while (true) {', '            tick();', '            Thread.sleep(100);', '        }', '    }', '}', ''].join(NL))
+      fs.mkdirSync(path.join(adir, 'jout'), { recursive: true })
+      cp.spawnSync('javac', ['-g', '-d', path.join(adir, 'jout'), jl], { windowsHide: true })
+      const jport = 19350
+      const jvm = cp.spawn('java', [`-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=127.0.0.1:${jport}`, '-cp', path.join(adir, 'jout'), 'Loop'], { stdio: 'ignore', windowsHide: true })
+      await sleep(2000)
+      let a = await call('dbg:attach', { language: 'java', port: 1 })
+      check('Java attach: where nothing listens there is a clear error', a.ok === false && /Nothing is listening for a Java debugger/.test(a.error), JSON.stringify(a))
+      a = await call('dbg:attach', { language: 'java', port: jport, roots: [adir], breakpoints: { [jl]: [{ line: 4 }] } })
+      check('Java attach: connects to a running program', a.ok === true, JSON.stringify(a))
+      const ap = a.ok ? await paused('java attached breakpoint') : null
+      check('Java attach: a breakpoint set before attaching stops the program, at its source file', !!ap && ap.reason === 'breakpoint' && /Loop\.tick/.test(ap.frames[0].name) && ap.frames[0].line === 4 && same(ap.frames[0].file, jl), JSON.stringify(ap && ap.frames[0]))
+      const ev = await call('dbg:eval', 'n', 0)
+      check('Java attach: a static field can be read', ev.ok && /^\d+$/.test(ev.value.value), JSON.stringify(ev))
+      a = await call('dbg:attach', { language: 'java', port: jport })
+      check('Java attach: a second attach is refused while one is active', a.ok === false)
+      await call('dbg:setBreakpoints', jl, [])
+      await call('dbg:continue')
+      await sleep(400)
+      await call('dbg:stop')
+      await waitEvent((e) => e.type === 'exited', 'java detached')
+      await sleep(600)
+      check('Java attach: Stop only disconnects, the program keeps running', isAlive(jvm.pid))
+      events.length = 0
+      a = await call('dbg:attach', { language: 'java', port: jport, roots: [adir], breakpoints: { [jl]: [{ line: 4 }] } })
+      const ap2 = a.ok ? await paused('java reattached') : null
+      check('Java attach: it can be attached to again', a.ok === true && !!ap2 && ap2.reason === 'breakpoint', JSON.stringify(a))
+      await call('dbg:setBreakpoints', jl, []); await call('dbg:continue'); await sleep(300); await call('dbg:stop')
+      await waitEvent((e) => e.type === 'exited', 'java detached 2')
+      try { cp.execSync('taskkill /F /T /PID ' + jvm.pid, { stdio: 'ignore' }) } catch { /* gone */ }
+      events.length = 0
+    } else console.log('SKIP  Java attach (no JDK)')
+
+    // C++: lldb-dap attaches to the process by its id
+    const wingetBin = () => { try { const base = path.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'WinGet', 'Packages'); for (const n of fs.readdirSync(base)) if (/LLVM-MinGW/i.test(n)) { for (const m of fs.readdirSync(path.join(base, n))) { const b = path.join(base, n, m, 'bin'); if (fs.existsSync(path.join(b, 'clang++.exe'))) return b } } } catch { /* none */ } return null }
+    const llvm = wingetBin()
+    const haveCpp = process.platform === 'win32' && !!llvm && fs.existsSync(path.join(llvm, 'lldb-dap.exe'))
+    if (haveCpp) {
+      const cl = path.join(adir, 'loop.cpp')
+      fs.writeFileSync(cl, ['#include <chrono>', '#include <thread>', 'int counter = 0;', 'int tick() {', '    counter++;', '    return counter;', '}', 'int main() {', '    for (;;) {', '        tick();', '        std::this_thread::sleep_for(std::chrono::milliseconds(100));', '    }', '}', ''].join(NL))
+      const exe = path.join(adir, 'loop.exe')
+      const built = cp.spawnSync(path.join(llvm, 'clang++.exe'), ['-g', '-O0', '-static', fs.realpathSync.native(cl), '-o', exe], { windowsHide: true })
+      const proc = cp.spawn(exe, [], { stdio: 'ignore', windowsHide: true })
+      await sleep(800)
+      let a = await call('dbg:attach', { language: 'cpp', breakpoints: {} })
+      check('C/C++ attach: without a process id there is a clear error', a.ok === false && /pid/.test(a.error), JSON.stringify(a))
+      a = await call('dbg:attach', { language: 'cpp', pid: proc.pid, breakpoints: { [cl]: [{ line: 5 }] } })
+      check('C/C++ attach: connects to a running process by its id', built.status === 0 && a.ok === true, JSON.stringify(a) + ' ' + String(built.stderr).slice(0, 200))
+      const ap = a.ok ? await paused('cpp attached breakpoint') : null
+      check('C/C++ attach: a breakpoint set before attaching stops the process', !!ap && ap.reason === 'breakpoint' && /tick/.test(ap.frames[0].name) && ap.frames[0].line === 5 && same(ap.frames[0].file, cl), JSON.stringify(ap && ap.frames[0]))
+      const ev = await call('dbg:eval', 'counter', 0)
+      check('C/C++ attach: a global variable can be read', ev.ok && /^\d+$/.test(ev.value.value), JSON.stringify(ev))
+      await call('dbg:setBreakpoints', cl, [])
+      await call('dbg:continue')
+      await sleep(500)
+      await call('dbg:stop')
+      await waitEvent((e) => e.type === 'exited', 'cpp detached')
+      await sleep(800)
+      check('C/C++ attach: Stop only disconnects, the process keeps running', isAlive(proc.pid))
+      try { cp.execSync('taskkill /F /T /PID ' + proc.pid, { stdio: 'ignore' }) } catch { /* gone */ }
+      events.length = 0
+    } else console.log('SKIP  C/C++ attach (no LLVM-MinGW)')
+
+    // .NET: netcoredbg attaches to a dotnet process by its id
+    if (cp.spawnSync('dotnet', ['--version'], { windowsHide: true }).status === 0) {
+      const inst = await call('dbg:installCsharp')
+      if (!inst.ok) console.log('SKIP  .NET attach (netcoredbg unavailable)')
+      else {
+        const nd = path.join(adir, 'netloop')
+        fs.mkdirSync(nd, { recursive: true })
+        fs.writeFileSync(path.join(nd, 'netloop.csproj'), ['<Project Sdk="Microsoft.NET.Sdk">', '  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>', '</Project>', ''].join(NL))
+        const np = path.join(nd, 'Program.cs')
+        fs.writeFileSync(np, ['static int Tick(ref int n)', '{', '    n++;', '    return n;', '}', 'int counter = 0;', 'while (true)', '{', '    Tick(ref counter);', '    Thread.Sleep(100);', '}', ''].join(NL))
+        const built = cp.spawnSync('dotnet', ['build', nd, '-c', 'Debug', '-o', path.join(nd, 'out'), '--nologo', '-v', 'q'], { windowsHide: true, encoding: 'utf-8' })
+        const proc = cp.spawn('dotnet', ['exec', path.join(nd, 'out', 'netloop.dll')], { stdio: 'ignore', windowsHide: true })
+        await sleep(1500)
+        let a = await call('dbg:attach', { language: 'csharp', breakpoints: {} })
+        check('.NET attach: without a process id there is a clear error', a.ok === false && /pid/.test(a.error), JSON.stringify(a))
+        a = await call('dbg:attach', { language: 'csharp', pid: proc.pid, breakpoints: { [np]: [{ line: 3 }] } })
+        check('.NET attach: connects to a running process by its id', built.status === 0 && a.ok === true, JSON.stringify(a) + ' ' + String(built.stdout).slice(-300))
+        const ap = a.ok ? await paused('net attached breakpoint') : null
+        check('.NET attach: a breakpoint set before attaching stops the process', !!ap && ap.reason === 'breakpoint' && ap.frames[0].line === 3 && same(ap.frames[0].file, np), JSON.stringify(ap && ap.frames[0]))
+        await call('dbg:setBreakpoints', np, [])
+        await call('dbg:continue')
+        await sleep(500)
+        await call('dbg:stop')
+        await waitEvent((e) => e.type === 'exited', 'net detached')
+        await sleep(800)
+        check('.NET attach: Stop only disconnects, the process keeps running', isAlive(proc.pid))
+        try { cp.execSync('taskkill /F /T /PID ' + proc.pid, { stdio: 'ignore' }) } catch { /* gone */ }
+        events.length = 0
+      }
+    } else console.log('SKIP  .NET attach (no dotnet)')
+  }
+
   // No program started by a debug session may outlive it (an adapter killed before its program used to leave the program running).
   if (process.platform === 'win32') {
     await sleep(2500)

@@ -188,6 +188,7 @@ public class JavaDap {
                     "exceptionBreakpointFilters", Arrays.asList(obj("filter", "uncaught", "label", "Uncaught Exceptions", "default", true), obj("filter", "all", "label", "All Exceptions", "default", false))), null);
                 break;
             case "launch": launch(req, a); break;
+            case "attach": attach(req, a); break;
             case "setBreakpoints": setBreakpoints(req, a); break;
             case "setExceptionBreakpoints": setExceptionBreakpoints(req, a); break;
             case "configurationDone": configurationDone(req); break;
@@ -207,6 +208,7 @@ public class JavaDap {
                 break;
             case "disconnect": case "terminate":
                 respond(req, true, null, null);
+                if (Boolean.FALSE.equals(a.get("terminateDebuggee"))) attached = true; // let the program go on
                 shutdown();
                 System.exit(0);
                 break;
@@ -214,9 +216,17 @@ public class JavaDap {
         }
     }
 
+    static boolean attached;
+
     static void shutdown() {
-        try { if (vm != null) { try { vm.exit(0); } catch (Exception e) { vm.dispose(); } } } catch (Exception ignored) { }
-        if (proc != null && proc.isAlive()) proc.destroyForcibly();
+        try {
+            if (vm != null) {
+                // A program that was attached to is let go; one that was started here ends with the session.
+                if (attached) { vm.eventRequestManager().deleteAllBreakpoints(); vm.dispose(); }
+                else { try { vm.exit(0); } catch (Exception e) { vm.dispose(); } }
+            }
+        } catch (Exception ignored) { }
+        if (!attached && proc != null && proc.isAlive()) proc.destroyForcibly();
     }
 
     // ---------------------------------------------------------------- launching
@@ -252,13 +262,31 @@ public class JavaDap {
         String port = m.group(1);
         pump(err, "stderr");
         pump(out, "stdout");
+        connect(req, "127.0.0.1", port);
+    }
+
+    // Attaching to a program that is already running (started with -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=PORT).
+    static void attach(Map<String, Object> req, Map<String, Object> a) throws Exception {
+        launchArgs = a;
+        attached = true;
+        for (Object r : list(a.get("sourceRoots"))) sourceRoots.add(String.valueOf(r));
+        String host = str(a.get("host")) == null ? "127.0.0.1" : str(a.get("host"));
+        if (a.get("port") == null) throw new IOException("Give the port the program listens on for a debugger.");
+        connect(req, host, String.valueOf(num(a.get("port"), 0)));
+    }
+
+    static void connect(Map<String, Object> req, String host, String port) throws Exception {
         AttachingConnector sock = null;
         for (AttachingConnector c : Bootstrap.virtualMachineManager().attachingConnectors()) if (c.name().equals("com.sun.jdi.SocketAttach")) sock = c;
         if (sock == null) throw new IOException("This JDK has no socket debugger connection.");
         Map<String, Connector.Argument> ca = sock.defaultArguments();
-        ca.get("hostname").setValue("127.0.0.1");
+        ca.get("hostname").setValue(host);
         ca.get("port").setValue(port);
-        vm = sock.attach(ca);
+        try {
+            vm = sock.attach(ca);
+        } catch (IOException e) {
+            throw new IOException("Nothing is listening for a Java debugger at " + host + ":" + port + " (" + e.getMessage() + ").");
+        }
         vm.setDebugTraceMode(0);
         EventRequestManager erm = vm.eventRequestManager();
         // Classes loaded from now on may hold a breakpoint that was set before they existed.
@@ -287,7 +315,7 @@ public class JavaDap {
             respond(pendingLaunch, true, null, null);
             pendingLaunch = null;
         }
-        vm.resume();
+        if (!attached) vm.resume(); // a program that was attached to is running already (and may have stopped at a breakpoint by now)
     }
 
     // ---------------------------------------------------------------- breakpoints
@@ -494,8 +522,35 @@ public class JavaDap {
             for (String root : sourceRoots) { File f = new File(root, rel); if (f.exists()) return f.getPath(); }
             String cwd = str(launchArgs.get("cwd"));
             if (cwd != null) { File f = new File(cwd, l.sourceName()); if (f.exists()) return f.getPath(); }
+            return searchSource(rel);
         } catch (AbsentInformationException ignored) { }
         return null;
+    }
+
+    // The files of the project are looked through once (an attached program says only "pkg/Main.java"): the one whose path ends so.
+    static List<String> sourceIndex;
+    static final Map<String, String> sourceFound = new HashMap<>();
+    static String searchSource(String rel) {
+        if (sourceFound.containsKey(rel)) return sourceFound.get(rel);
+        if (sourceIndex == null) {
+            sourceIndex = new ArrayList<>();
+            for (String root : sourceRoots) walk(new File(root), 0);
+        }
+        String want = "/" + rel.replace((char) 92, '/');
+        String hit = null;
+        for (String p : sourceIndex) if (p.replace((char) 92, '/').endsWith(want)) { hit = p; break; }
+        sourceFound.put(rel, hit);
+        return hit;
+    }
+    static void walk(File dir, int depth) {
+        if (depth > 12 || sourceIndex.size() > 50000) return;
+        File[] kids = dir.listFiles();
+        if (kids == null) return;
+        for (File f : kids) {
+            String n = f.getName();
+            if (f.isDirectory()) { if (!n.startsWith(".") && !n.equals("node_modules") && !n.equals("build") && !n.equals("target")) walk(f, depth + 1); }
+            else if (n.endsWith(".java")) sourceIndex.add(f.getPath());
+        }
     }
 
     static void stackTrace(Map<String, Object> req, Map<String, Object> a) throws Exception {

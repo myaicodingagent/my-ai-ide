@@ -1675,18 +1675,18 @@ export function App(): JSX.Element {
     }
 
   // Asks what to attach to (a port, host:port, or "pid N" where the language allows it), then attaches.
-  const askAttach = (language: 'node' | 'python' | 'go', title: string, placeholder: string, allowPid: boolean): void =>
+  const askAttach = (language: 'node' | 'python' | 'go' | 'java' | 'cpp' | 'csharp', title: string, placeholder: string, allowPid: boolean, pidOnly = false): void =>
     setInputRequest({
       title,
       placeholder,
       confirmLabel: 'Attach',
-      validate: (v) => ((allowPid ? /^\s*(pid\s+\d+|\d{2,5}|[A-Za-z0-9.-]+:\d{2,5})\s*$/i : /^\s*(\d{2,5}|[A-Za-z0-9.-]+:\d{2,5})\s*$/).test(v) ? null : `Use a port like 5678, host:port${allowPid ? ', or "pid 12345"' : ''}.`),
+      validate: (v) => (pidOnly ? (/^\s*pid\s+\d+\s*$/i.test(v) ? null : 'Use "pid 12345".') : (allowPid ? /^\s*(pid\s+\d+|\d{2,5}|[A-Za-z0-9.-]+:\d{2,5})\s*$/i : /^\s*(\d{2,5}|[A-Za-z0-9.-]+:\d{2,5})\s*$/).test(v) ? null : `Use a port like 5678, host:port${allowPid ? ', or "pid 12345"' : ''}.`),
       onSubmit: (v) => {
         const t = v.trim()
         const pid = /^pid\s+(\d+)$/i.exec(t)
         const hp = /^(?:([A-Za-z0-9.-]+):)?(\d+)$/.exec(t)
         showDebug()
-        void attachDebugging(pid ? { language, pid: Number(pid[1]) } : { language, host: hp?.[1], port: Number(hp?.[2]) }).then((err) => err && showToast(err, 'error'))
+        void attachDebugging(pid ? { language, pid: Number(pid[1]), roots: rootsRef.current } : { language, host: hp?.[1], port: Number(hp?.[2]), roots: rootsRef.current }).then((err) => err && showToast(err, 'error'))
       }
     })
 
@@ -1750,6 +1750,18 @@ export function App(): JSX.Element {
       {
         label: 'Debug: Attach to Python Program…',
         run: () => askAttach('python', 'Attach to a Python program started with: python -m debugpy --listen 5678 script.py. Give its port (or host:port)', '5678   or   host:5678', false)
+      },
+      {
+        label: 'Debug: Attach to Java Program…',
+        run: () => askAttach('java', 'Attach to a Java program started with -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=5005 . Give its port (or host:port)', '5005   or   host:5005', false)
+      },
+      {
+        label: 'Debug: Attach to C/C++ Process…',
+        run: () => askAttach('cpp', 'Attach to a running C or C++ program (it needs debug information): "pid 12345"', 'pid 12345', true, true)
+      },
+      {
+        label: 'Debug: Attach to .NET Process…',
+        run: () => askAttach('csharp', 'Attach to a running .NET program: "pid 12345"', 'pid 12345', true, true)
       },
       {
         label: 'Debug: Attach to Go Process…',
@@ -2038,6 +2050,9 @@ export function App(): JSX.Element {
         { label: 'Attach to Node.js Program…', run: cmd('Debug: Attach to Node.js Program'), separator: true },
         { label: 'Attach to Python Program…', run: cmd('Debug: Attach to Python Program') },
         { label: 'Attach to Go Process…', run: cmd('Debug: Attach to Go Process') },
+        { label: 'Attach to Java Program…', run: cmd('Debug: Attach to Java Program') },
+        { label: 'Attach to C/C++ Process…', run: cmd('Debug: Attach to C/C++ Process') },
+        { label: 'Attach to .NET Process…', run: cmd('Debug: Attach to .NET Process') },
         { label: 'Open Launch Configurations', run: () => void openConfigFile('launch') }
       ]
     },

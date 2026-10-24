@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'url'
 import WebSocket from 'ws'
 import { SourceMapIndex, parseSourceMap } from './sourcemap'
 import { installNetcoredbg } from './netcoredbg'
-import { DapSession, adapterFor, goAdapter, killTree, pythonAdapter, startDapAttach, startDapDebug } from './dap'
+import { DapSession, adapterFor, cppAdapter, csharpAdapter, goAdapter, javaAdapter, killTree, pythonAdapter, startDapAttach, startDapDebug } from './dap'
 import * as ssh from './sshfs'
 import { isRemotePath } from './sshfs'
 
@@ -587,13 +587,15 @@ export function registerDebugHandlers(getWin: () => BrowserWindow | null): void 
     const target = {
       host: typeof opts?.host === 'string' && /^[A-Za-z0-9.-]{1,255}$/.test(opts.host) ? opts.host : undefined,
       port: Number.isInteger(opts?.port) ? opts.port : undefined,
-      pid: Number.isInteger(opts?.pid) ? opts.pid : undefined
+      pid: Number.isInteger(opts?.pid) ? opts.pid : undefined,
+      roots: Array.isArray(opts?.roots) ? (opts.roots as unknown[]).filter((r): r is string => typeof r === 'string').slice(0, 20) : undefined
     }
     const breakpoints = opts?.breakpoints ?? {}
-    const language = opts?.language === 'python' || opts?.language === 'go' ? (opts.language as 'python' | 'go') : 'node'
+    const adapters = { python: pythonAdapter, go: goAdapter, java: javaAdapter, cpp: cppAdapter, csharp: csharpAdapter } as const
+    const language = typeof opts?.language === 'string' && opts.language in adapters ? (opts.language as keyof typeof adapters) : 'node'
     if (language === 'node') return attach({ ...target, breakpoints })
     try {
-      dapSession = await startDapAttach(language === 'python' ? pythonAdapter : goAdapter, target, breakpoints, emit)
+      dapSession = await startDapAttach(adapters[language], target, breakpoints, emit)
       return { ok: true as const }
     } catch (e) {
       dapSession = null
