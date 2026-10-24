@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'url'
 import WebSocket from 'ws'
 import { SourceMapIndex, parseSourceMap } from './sourcemap'
 import { installNetcoredbg } from './netcoredbg'
-import { DapSession, adapterFor, goAdapter, pythonAdapter, startDapAttach, startDapDebug } from './dap'
+import { DapSession, adapterFor, goAdapter, killTree, pythonAdapter, startDapAttach, startDapDebug } from './dap'
 import * as ssh from './sshfs'
 import { isRemotePath } from './sshfs'
 
@@ -606,12 +606,7 @@ export function registerDebugHandlers(getWin: () => BrowserWindow | null): void 
     const s = session
     if (!s) return
     if (!s.child) return void s.ws?.close() // attached: let go, the program keeps running
-    try {
-      s.child.kill()
-    } catch {
-      // already gone
-    }
-    if (process.platform === 'win32' && s.child.pid && !s.remote) spawn('taskkill', ['/pid', String(s.child.pid), '/T', '/F'], { windowsHide: true })
+    killTree(s.child, s.remote)
   })
   for (const [name, method] of [
     ['dbg:continue', 'Debugger.resume'],
@@ -680,9 +675,9 @@ export function registerDebugHandlers(getWin: () => BrowserWindow | null): void 
 }
 
 export function stopDebugging(): void {
-  if (dapSession && dapSession.active) dapSession.stop()
+  if (dapSession && dapSession.active) dapSession.kill()
   try {
-    if (session?.child) session.child.kill()
+    if (session?.child) killTree(session.child, session.remote)
     else session?.ws?.close()
   } catch {
     // already gone

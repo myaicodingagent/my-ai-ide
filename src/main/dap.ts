@@ -107,6 +107,8 @@ export interface DapSession {
   props(ref: string): Promise<DbgVar[]>
   evaluate(expression: string, frameIndex: number | null): Promise<{ ok: true; value: DbgVar } | { ok: false; error: string }>
   stop(): void
+  /** Ends the program at once, without asking the debugger (the editor is closing). */
+  kill(): void
   readonly active: boolean
 }
 
@@ -134,6 +136,7 @@ interface Adapter {
   label: string
   files: RegExp // the files whose breakpoints belong to this adapter
   exceptionFilters?: string[] // what to ask the adapter to stop on (default: uncaught exceptions)
+  frameName?(name: string): string // a readable name for a call stack entry
   evalContext?: string // the `context` of evaluate requests (default repl); lldb answers repl with `(int) $1 = 5`, watch with `5`
   adapterPath?(file: string): string // how the adapter must be told a file's path (the spelling its symbols use)
   start(opts: DebugOptions, emit: (e: DbgEvent) => void): Promise<Started>
@@ -155,6 +158,30 @@ interface Started {
   pid?: number
   remote?: string // the computer the program runs on (over SSH): file paths are translated both ways
   dispose?: () => void // closes what was opened for the connection (an SSH tunnel)
+}
+
+/**
+ * Ends a process and everything it started (the adapter's program). On Windows the tree is ended by taskkill, and it must
+ * happen BEFORE the adapter itself is killed: once the parent is gone its children cannot be found any more and live on.
+ */
+export function killTree(child: ChildProcess, remote?: string): void {
+  if (process.platform === 'win32' && child.pid && !remote) {
+    const t = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true })
+    t.on('error', () => child.kill())
+    t.on('close', () => {
+      try {
+        child.kill()
+      } catch {
+        // gone
+      }
+    })
+    return
+  }
+  try {
+    child.kill()
+  } catch {
+    // gone
+  }
 }
 
 const cleanEnv = (): NodeJS.ProcessEnv => {
@@ -435,6 +462,8 @@ function runDotnet(args: string[], cwd: string, onData?: (t: string) => void): P
 export const csharpAdapter: Adapter = {
   id: 'coreclr',
   label: 'C#',
+  // The compiler's names for top-level statements and local functions: Program.<<Main>$>g__Add|0_0() is the local function Add.
+  frameName: (n) => n.replace(/^(?:[A-Za-z0-9_.]+)?<<([^>]+)>[$]>g__([A-Za-z0-9_]+)\|\d+_\d+\(.*\)$/, '$2').replace(/^([A-Za-z0-9_]+)\.<Main>[$]\(.*\)$/, '$1.Main (top-level statements)'),
   files: /\.cs$/i,
   exceptionFilters: ['user-unhandled'],
   adapterPath: (file) => {
@@ -587,11 +616,7 @@ async function runDap(adapter: Adapter, started: Started, breakpointsByFile: Rec
     announced = true
     emit({ type: 'exited', code: exitCode })
     setTimeout(() => {
-      try {
-        child?.kill()
-      } catch {
-        // gone
-      }
+      if (child) killTree(child, remote)
       if (!child) started.io.output.end()
       started.dispose?.()
     }, 300)
@@ -633,7 +658,7 @@ async function runDap(adapter: Adapter, started: Started, breakpointsByFile: Rec
       frames = st.stackFrames.map((f) => ({ id: f.id as number }))
       const list: DbgFrame[] = st.stackFrames.map((f, i) => ({
         index: i,
-        name: String(f.name),
+        name: adapter.frameName ? adapter.frameName(String(f.name)) : String(f.name),
         file: f.source?.path ? (remote ? ssh.fromNativePath(remote, String(f.source.path)) : existsSync(String(f.source.path)) ? spellAs(String(f.source.path)) : null) : null,
         url: String(f.source?.path ?? ''),
         line: Number(f.line) || 1,
@@ -726,18 +751,20 @@ async function runDap(adapter: Adapter, started: Started, breakpointsByFile: Rec
         return { ok: false, error: e instanceof Error ? e.message : String(e) }
       }
     },
+    kill() {
+      if (child) {
+        if (attached) child.kill() // the program that was attached to keeps running
+        else killTree(child, remote)
+      }
+      started.dispose?.()
+    },
     stop() {
       // An attached program is let go, not ended. Wait for the answer so the adapter has detached before it is killed.
       const done = dap.request('disconnect', { terminateDebuggee: !attached }).catch(() => undefined)
       void Promise.race([done, new Promise((r) => setTimeout(r, 2000))]).then(() => {
-        try {
-          child?.kill()
-        } catch {
-          // gone
-        }
+        if (child) killTree(child, remote)
         if (!child) started.io.output.end()
         started.dispose?.()
-        if (process.platform === 'win32' && child?.pid && !remote) spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true })
       })
     }
   }

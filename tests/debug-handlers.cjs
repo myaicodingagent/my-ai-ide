@@ -736,6 +736,13 @@ const same = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLower
     }
   }
 
+  // No program started by a debug session may outlive it (an adapter killed before its program used to leave the program running).
+  if (process.platform === 'win32') {
+    await sleep(2500)
+    const left = require('child_process').spawnSync('powershell', ['-NoProfile', '-Command', "Get-CimInstance Win32_Process | Where-Object { ($_.Name -eq 'java.exe' -and $_.CommandLine -like '*jdwp=transport=dt_socket,server=y,suspend=y,address=127.0.0.1:0*') -or $_.ExecutablePath -like '*cppbuild*' } | ForEach-Object { $_.ProcessId.ToString() + ' ' + $_.Name }"], { encoding: 'utf-8', windowsHide: true }).stdout.trim()
+    check('no program started by a debug session is left running', left === '', left)
+    if (left) for (const line of left.split(String.fromCharCode(10))) { try { process.kill(Number(line.trim().split(' ')[0])) } catch { /* gone */ } }
+  }
   await sleep(800)
   try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }) } catch { /* a debuggee may still be closing; it is only a temp folder */ }
   const failed = results.filter((x) => !x).length

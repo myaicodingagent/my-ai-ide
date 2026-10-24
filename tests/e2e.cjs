@@ -5,7 +5,9 @@ const WebSocket = require('ws')
 
 const PROJ = path.join(os.tmpdir(), 'my-ai-ide-e2e-project')
 const PROFILE = path.join(os.tmpdir(), 'my-ai-ide-e2e-profile') // isolated app data, so the test never touches your real settings
-const EXE = path.join(__dirname, '..', 'release', 'win-unpacked', 'My AI IDE.exe')
+// MY_AI_IDE_EXE: another build of the packaged app (when an editor that has the project open keeps release\win-unpacked locked, build elsewhere:
+//   npx electron-builder --win --dir -c.directories.output=C:\somewhere   and point this at C:\somewhere\win-unpacked\My AI IDE.exe).
+const EXE = process.env.MY_AI_IDE_EXE || path.join(__dirname, '..', 'release', 'win-unpacked', 'My AI IDE.exe')
 const API_PORT = 8765, CDP_PORT = 9333
 
 // ---------- fake Anthropic API ----------

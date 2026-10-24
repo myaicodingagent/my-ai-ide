@@ -38,7 +38,8 @@
     "test:jupyter": "node tests/jupyter.cjs",
     "test:jupyter-ui": "node tests/jupyter-ui.cjs",
     "test:ext-restore": "node tests/ext-restore.cjs",
-    "test:when": "node tests/when-clause.cjs"
+    "test:when": "node tests/when-clause.cjs",
+    "test:packaged-debug": "node tests/packaged-debug.cjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^1.1.0",
