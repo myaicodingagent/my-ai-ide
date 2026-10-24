@@ -6,6 +6,7 @@ import { delimiter, dirname, join, resolve as resolvePath } from 'path'
 import { fileURLToPath, pathToFileURL } from 'url'
 import WebSocket from 'ws'
 import { SourceMapIndex, parseSourceMap } from './sourcemap'
+import { installNetcoredbg } from './netcoredbg'
 import { DapSession, adapterFor, goAdapter, pythonAdapter, startDapAttach, startDapDebug } from './dap'
 import * as ssh from './sshfs'
 import { isRemotePath } from './sshfs'
@@ -599,6 +600,7 @@ export function registerDebugHandlers(getWin: () => BrowserWindow | null): void 
       return { ok: false as const, error: e instanceof Error ? e.message : String(e) }
     }
   })
+  ipcMain.handle('dbg:installCsharp', () => installNetcoredbg())
   ipcMain.handle('dbg:stop', () => {
     dapActive()?.stop()
     const s = session

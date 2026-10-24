@@ -121,6 +121,7 @@ const api = {
     pid?: number
     breakpoints: Record<string, DbgBreakpoint[]>
   }): Promise<{ ok: true } | { ok: false; error: string }> => ipcRenderer.invoke('dbg:attach', opts),
+  dbgInstallCsharp: (): Promise<{ ok: true; path: string; version: string } | { ok: false; error: string }> => ipcRenderer.invoke('dbg:installCsharp'),
   dbgStop: (): Promise<void> => ipcRenderer.invoke('dbg:stop'),
   dbgStep: (kind: 'continue' | 'stepOver' | 'stepInto' | 'stepOut' | 'pause'): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('dbg:' + kind),

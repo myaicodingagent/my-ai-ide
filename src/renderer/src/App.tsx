@@ -517,14 +517,14 @@ export function App(): JSX.Element {
     void reloadTasks()
   }, [])
   // Files the debugger can run: JavaScript and TypeScript (Node), Python.
-  const isRunnable = (p: string | null): p is string => !!p && /[.]((c|m)?(j|t)sx?|pyw?|go)$/i.test(p)
+  const isRunnable = (p: string | null): p is string => !!p && /[.]((c|m)?(j|t)sx?|pyw?|go|cs)$/i.test(p)
   // Saves the file first (the program runs from disk), then starts it under the debugger.
   const startDebug = useCallback(async (): Promise<string | null> => {
     const file = focusedPath()
     const r = rootRef.current
     const cfg = tasksInfoRef.current?.launch.find((l) => l.name === launchSelRef.current)
     // A launch configuration names its own program; only the plain "Current file" choice needs an open file.
-    if (!(cfg && r) && !isRunnable(file)) return 'Open a .js, .ts, .py or .go file to debug it.'
+    if (!(cfg && r) && !isRunnable(file)) return 'Open a .js, .ts, .py, .go or .cs file to debug it.'
     const tab = tabsRef.current.find((t) => t.path === file)
     if (tab?.dirty) await saveTab(tab)
     showDebug()
@@ -1697,6 +1697,13 @@ export function App(): JSX.Element {
       {
         label: 'Debug: Install the Go Debugger (Delve)',
         run: () => newTerminal(undefined, { title: 'Install Delve', command: 'go install github.com/go-delve/delve/cmd/dlv@latest', cwd: rootRef.current })
+      },
+      {
+        label: 'Debug: Install the C# Debugger (netcoredbg)',
+        run: () => {
+          showToast('Downloading netcoredbg from GitHub...', 'info')
+          void window.api.dbgInstallCsharp().then((r) => showToast(r.ok ? (r.version === 'already installed' ? 'netcoredbg is already installed.' : `netcoredbg ${r.version} installed.`) : r.error, r.ok ? 'info' : 'error'))
+        }
       },
       {
         label: 'Debug: Install the Python Debugger (debugpy)',

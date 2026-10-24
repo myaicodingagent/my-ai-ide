@@ -1,12 +1,13 @@
 import { ChildProcess, spawn } from 'child_process'
-import { existsSync, realpathSync } from 'fs'
+import { existsSync, readdirSync, realpathSync } from 'fs'
 import { createServer, connect as tcpConnect, Socket } from 'net'
 import { Readable, Writable } from 'stream'
 import { homedir } from 'os'
-import { delimiter, dirname, join } from 'path'
+import { basename, delimiter, dirname, join } from 'path'
 import type { DbgBreakpoint, DbgEvent, DbgFrame, DbgScope, DbgVar } from './debugger'
 import { findPython, hasDebugpy } from './pythonenv'
 import * as ssh from './sshfs'
+import { NETCOREDBG_HELP, findNetcoredbg } from './netcoredbg'
 
 // A client for the Debug Adapter Protocol (the protocol VS Code uses to talk to debuggers), and the Python debugger
 // built on it: `python -m debugpy.adapter` is started and driven over stdin/stdout.
@@ -130,6 +131,8 @@ interface Adapter {
   id: string
   label: string
   files: RegExp // the files whose breakpoints belong to this adapter
+  exceptionFilters?: string[] // what to ask the adapter to stop on (default: uncaught exceptions)
+  adapterPath?(file: string): string // how the adapter must be told a file's path (the spelling its symbols use)
   start(opts: DebugOptions, emit: (e: DbgEvent) => void): Promise<Started>
   attach?(target: AttachTarget, emit: (e: DbgEvent) => void): Promise<Started>
 }
@@ -396,7 +399,77 @@ export const goAdapter: Adapter = {
   }
 }
 
-export const adapterFor = (file: string): Adapter | null => [pythonAdapter, goAdapter].find((a) => a.files.test(file)) ?? null
+
+// C#: netcoredbg (a debug adapter for .NET) debugs the program that `dotnet build` makes from the nearest project.
+function findProject(dir: string): string | null {
+  for (let d = dir; ; d = dirname(d)) {
+    try {
+      const found = readdirSync(d).filter((f) => /\.csproj$/i.test(f)).sort()
+      if (found.length) return join(d, found[0])
+    } catch {
+      // unreadable: keep looking upwards
+    }
+    if (dirname(d) === d) return null
+  }
+}
+
+function runDotnet(args: string[], cwd: string, onData?: (t: string) => void): Promise<{ code: number; out: string }> {
+  return new Promise((resolve, reject) => {
+    const c = spawn('dotnet', args, { cwd, env: { ...cleanEnv(), DOTNET_NOLOGO: '1', DOTNET_CLI_TELEMETRY_OPTOUT: '1', MSBUILDDISABLENODEREUSE: '1' }, windowsHide: true })
+    let out = ''
+    const take = (b: Buffer): void => {
+      const t = b.toString('utf-8')
+      out = (out + t).slice(-20000)
+      onData?.(t)
+    }
+    c.stdout.on('data', take)
+    c.stderr.on('data', take)
+    c.on('error', (e: NodeJS.ErrnoException) => reject(new Error(e.code === 'ENOENT' ? 'The .NET SDK was not found. Install it from dot.net (the "dotnet" command must work in a terminal).' : e.message)))
+    c.on('close', (code) => resolve({ code: code ?? -1, out }))
+  })
+}
+
+export const csharpAdapter: Adapter = {
+  id: 'coreclr',
+  label: 'C#',
+  files: /\.cs$/i,
+  exceptionFilters: ['user-unhandled'],
+  adapterPath: (file) => {
+    try {
+      return realpathSync.native(file)
+    } catch {
+      return file
+    }
+  },
+  async start(opts, emit) {
+    if (ssh.isRemotePath(opts.file)) throw new Error('C# programs on another computer cannot be debugged yet.')
+    const dbg = findNetcoredbg()
+    if (!dbg) throw new Error(NETCOREDBG_HELP)
+    const proj = findProject(dirname(opts.file))
+    if (!proj) throw new Error('No .csproj file was found next to this file or above it. Create a project with: dotnet new console')
+    emit({ type: 'output', stream: 'info', text: `Building ${basename(proj)}...\n` })
+    const build = await runDotnet(['build', proj, '-c', 'Debug', '--nologo', '-v', 'q', '-clp:NoSummary'], dirname(proj))
+    if (build.code !== 0) {
+      const errors = build.out.split(/\r?\n/).filter((l) => /\berror\b/i.test(l))
+      throw new Error('The project did not build:\n' + (errors.length ? [...new Set(errors)].slice(0, 8).join('\n') : build.out.trim().slice(-800)))
+    }
+    const target = await runDotnet(['msbuild', proj, '-getProperty:TargetPath', '-p:Configuration=Debug'], dirname(proj))
+    const dll = target.out.trim().split(/\r?\n/).pop()?.trim() ?? ''
+    if (target.code !== 0 || !dll || !existsSync(dll)) throw new Error('The project built, but its program file could not be found.')
+    const cwd = opts.cwd || dirname(proj)
+    const child = spawn(dbg, ['--interpreter=vscode'], { cwd, env: cleanEnv(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+    let stderr = ''
+    child.stderr?.on('data', (b: Buffer) => (stderr = (stderr + b.toString('utf-8')).slice(-2000)))
+    return {
+      child,
+      io: { input: child.stdout!, output: child.stdin! },
+      stderr: () => stderr,
+      launch: { name: 'C#', type: 'coreclr', request: 'launch', program: dll, args: opts.args ?? [], cwd, env: opts.env ?? {}, stopAtEntry: opts.stopOnEntry === true }
+    }
+  }
+}
+
+export const adapterFor = (file: string): Adapter | null => [pythonAdapter, goAdapter, csharpAdapter].find((a) => a.files.test(file)) ?? null
 
 export function startPythonDebug(opts: DebugOptions, emit: (e: DbgEvent) => void): Promise<DapSession> {
   return startDapDebug(pythonAdapter, opts, emit)
@@ -435,7 +508,7 @@ async function runDap(adapter: Adapter, started: Started, breakpointsByFile: Rec
   // reports is turned back into the editor's address.
   const remote = started.remote
   const toAdapter = (file: string): string | null => {
-    if (!remote) return ssh.isRemotePath(file) ? null : file
+    if (!remote) return ssh.isRemotePath(file) ? null : (adapter.adapterPath?.(file) ?? file)
     return ssh.parseRemote(file)?.name === remote ? ssh.nativePath(file) : null
   }
   const breakpointArgs = (bps: DbgBreakpoint[]): Json[] => bps.map((b) => ({ line: b.line, ...(b.condition?.trim() ? { condition: b.condition } : {}) }))
@@ -537,7 +610,7 @@ async function runDap(adapter: Adapter, started: Started, breakpointsByFile: Rec
     if (!adapter.files.test(file) || !path) continue
     await dap.request('setBreakpoints', { source: { path }, breakpoints: breakpointArgs(bps) }).catch(() => undefined)
   }
-  await dap.request('setExceptionBreakpoints', { filters: ['uncaught'] }).catch(() => undefined)
+  await dap.request('setExceptionBreakpoints', { filters: adapter.exceptionFilters ?? ['uncaught'] }).catch(() => undefined)
   await dap.request('configurationDone').catch(() => undefined)
   await launched.catch((e) => {
     throw new Error(`The program could not be started: ${e.message}${stderrOf() ? '\n' + stderrOf() : ''}`)

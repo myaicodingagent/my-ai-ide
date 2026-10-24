@@ -348,6 +348,84 @@ const same = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLower
     }
   }
 
+  // --- C# (netcoredbg + the .NET SDK)
+  {
+    events.length = 0
+    const cp = require('child_process')
+    const haveDotnet = cp.spawnSync('dotnet', ['--version'], { windowsHide: true }).status === 0
+    if (!haveDotnet) console.log('SKIP  C# (dotnet not found)')
+    else {
+      const inst = await call('dbg:installCsharp')
+      check('C#: netcoredbg is found or downloaded', inst.ok === true && fs.existsSync(inst.path), JSON.stringify(inst))
+      const csDir = path.join(dir, 'cs app')
+      fs.mkdirSync(csDir, { recursive: true })
+      const loose = path.join(dir, 'loose.cs')
+      fs.writeFileSync(loose, 'class A {}\n')
+      let r = await call('dbg:start', { file: loose, breakpoints: {} })
+      check('C#: a file with no project gives a clear message', r.ok === false && /\.csproj/.test(r.error), JSON.stringify(r))
+      fs.writeFileSync(path.join(csDir, 'app.csproj'), ['<Project Sdk="Microsoft.NET.Sdk">', '  <PropertyGroup>', '    <OutputType>Exe</OutputType>', '    <TargetFramework>net8.0</TargetFramework>', '    <ImplicitUsings>enable</ImplicitUsings>', '  </PropertyGroup>', '</Project>', ''].join('\n'))
+      const prog = path.join(csDir, 'Program.cs')
+      fs.writeFileSync(prog, 'this is not C#\n')
+      r = await call('dbg:start', { file: prog, breakpoints: {} })
+      check('C#: a program that does not build reports the compiler error', r.ok === false && /did not build/.test(r.error) && /error CS/.test(r.error), JSON.stringify(r).slice(0, 300))
+      fs.writeFileSync(prog, [
+        'int Add(int a, int b)',                                            // 1
+        '{',                                                                // 2
+        '    int sum = a + b;',                                             // 3
+        '    return sum;',                                                  // 4
+        '}',                                                                // 5
+        'var total = Add(2, 3);',                                           // 6
+        'Console.WriteLine("cs result " + total + " " + Environment.GetEnvironmentVariable("MYVAR") + " " + string.Join(",", args));', // 7
+        'var items = new List<int> { 1, 2, 3 };',                           // 8
+        'Console.WriteLine(items.Count);',                                  // 9
+        ''
+      ].join('\n'))
+      r = await call('dbg:start', { file: prog, args: ['x', 'y'], env: { MYVAR: 'hi' }, breakpoints: { [prog]: [{ line: 3 }] } })
+      check('C#: the program is built and started under the debugger', r.ok === true, JSON.stringify(r).slice(0, 400))
+      let p = r.ok ? await paused('cs breakpoint') : null
+      check('C#: it stops at the breakpoint in Add', !!p && p.reason === 'breakpoint' && p.frames[0].line === 3 && /Add/.test(p.frames[0].name) && same(p.frames[0].file, prog), JSON.stringify(p && p.frames[0]))
+      let scopes = await call('dbg:scopes', 0)
+      const names = scopes.flatMap((s) => s.vars).map((v) => v.name + '=' + v.value)
+      check('C#: local variables are shown', names.includes('a=2') && names.includes('b=3'), names.join())
+      let ev = await call('dbg:eval', 'a + b', 0)
+      check('C#: an expression is evaluated in the stopped frame', ev.ok && ev.value.value === '5', JSON.stringify(ev))
+      await call('dbg:stepOver')
+      p = await paused('cs step')
+      check('C#: step over goes to the next line', p.frames[0].line === 4, JSON.stringify(p.frames[0]))
+      await call('dbg:stepOut')
+      p = await paused('cs step out')
+      check('C#: step out returns to the caller', p.frames[0].line >= 6 && p.frames[0].line <= 7, JSON.stringify(p.frames[0]))
+      await call('dbg:setBreakpoints', prog, [{ line: 9 }])
+      await call('dbg:continue')
+      p = await paused('cs breakpoint added while stopped')
+      check('C#: a breakpoint added while stopped is used', p.reason === 'breakpoint' && p.frames[0].line === 9, JSON.stringify([p.reason, p.frames[0].line]))
+      scopes = await call('dbg:scopes', 0)
+      const iv = scopes.flatMap((s) => s.vars).find((v) => v.name === 'items')
+      const kids = iv && iv.objectId ? await call('dbg:props', iv.objectId) : []
+      check('C#: a list can be expanded', !!iv && kids.length > 0, JSON.stringify([iv, kids]).slice(0, 300))
+      await call('dbg:continue')
+      const end = await waitEvent((e) => e.type === 'exited', 'cs exit')
+      const out = events.filter((e) => e.type === 'output').map((e) => e.text).join('')
+      check('C#: it finishes with code 0; arguments, environment and output arrive', end.code === 0 && /cs result 5 hi x,y/.test(out), JSON.stringify([end.code, out]))
+      events.length = 0
+      r = await call('dbg:start', { file: prog, breakpoints: { [prog]: [{ line: 3, condition: 'a == 100' }] } })
+      const end2 = await waitEvent((e) => e.type === 'exited', 'cs no stop')
+      check('C#: a conditional breakpoint whose condition is false does not stop it', r.ok && end2.code === 0 && !events.some((e) => e.type === 'paused'))
+      events.length = 0
+      r = await call('dbg:start', { file: prog, breakpoints: { [prog]: [{ line: 3 }] } })
+      await paused('cs for stop')
+      await call('dbg:stop')
+      await waitEvent((e) => e.type === 'exited', 'cs stopped')
+      check('C#: Stop ends the session', true)
+      events.length = 0
+      fs.writeFileSync(prog, ['int Boom() { throw new InvalidOperationException("kaboom"); }', 'Boom();', ''].join('\n'))
+      r = await call('dbg:start', { file: prog, breakpoints: {} })
+      p = r.ok ? await paused('cs exception') : null
+      check('C#: an unhandled exception stops the program where it happened', !!p && p.reason === 'exception' && /kaboom|InvalidOperation/.test(p.exception || '') , JSON.stringify(p && [p.reason, p.exception, p.frames[0] && p.frames[0].line]))
+      await call('dbg:stop'); await waitEvent((e) => e.type === 'exited', 'cs exc stop'); events.length = 0
+    }
+  }
+
   // --- attach to a program that is already running
   {
     events.length = 0
