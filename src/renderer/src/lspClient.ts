@@ -19,7 +19,8 @@ interface Live {
   language: string
   label: string
   root: string // the folder as the editor spells it
-  realRoot: string // as the operating system spells it (long names, real case): what servers insist on
+  realRoot: string // as the operating system spells it (long names, real case): what servers insist on; on another computer, the folder's path there
+  remote: string | null // the name of the computer, when the server runs on another one (over SSH)
   caps: Json
 }
 
@@ -57,8 +58,18 @@ export const useLspServers = (): { label: string; root: string }[] => useSyncExt
 
 const uriOf = (model: monaco.editor.ITextModel): string => model.uri.toString()
 const norm = (p: string): string => p.split('\\').join('/').toLowerCase()
-const toServerPath = (l: Live, p: string): string => (norm(p).startsWith(norm(l.root) + '/') ? l.realRoot + p.slice(l.root.length) : p)
-const fromServerPath = (l: Live, p: string): string => (norm(p).startsWith(norm(l.realRoot) + '/') ? l.root + p.slice(l.realRoot.length) : p)
+// A folder on another computer is addressed as \\ssh.<name>\home\me\proj here and as /home/me/proj (or C:/x) there.
+const remoteName = (p: string): string | null => /^\\\\ssh\.([A-Za-z0-9-]+)/i.exec(p)?.[1].toLowerCase() ?? null
+const uncToNative = (p: string): string => p.replace(/^\\\\ssh\.[A-Za-z0-9-]+/i, '').split('\\').join('/').replace(/^\/(?=[A-Za-z]:)/, '') || '/'
+const nativeToUnc = (name: string, p: string): string => '\\\\ssh.' + name + (/^[A-Za-z]:/.test(p) ? '\\' : '') + p.split('/').join('\\')
+const toServerPath = (l: Live, p: string): string => {
+  if (norm(p).startsWith(norm(l.root) + '/')) return l.realRoot + p.slice(l.root.length)
+  return l.remote ? uncToNative(p) : p
+}
+const fromServerPath = (l: Live, p: string): string => {
+  if (norm(p).startsWith(norm(l.realRoot) + '/')) return l.root + p.slice(l.realRoot.length)
+  return l.remote ? nativeToUnc(l.remote, p.split('\\').join('/')) : p
+}
 // The address a server knows a file by, and back to the editor's.
 const sUri = (l: Live, model: monaco.editor.ITextModel): string => monaco.Uri.file(toServerPath(l, model.uri.fsPath)).toString()
 const fromServerUri = (l: Live, uri: string): monaco.Uri => {
@@ -137,7 +148,7 @@ async function ensureServer(language: string, root: string): Promise<Live | null
       }
       return null
     }
-    const l: Live = { key, server: r.server, language, label: r.label, root, realRoot: r.realRoot, caps: r.capabilities }
+    const l: Live = { key, server: r.server, language, label: r.label, root, realRoot: r.realRoot, remote: remoteName(root), caps: r.capabilities }
     liveByServer.set(l.server, l)
     appendOutput(LSP_CHANNEL, `${r.label} started for ${root}`)
     emitStatus()

@@ -4,6 +4,7 @@ import { existsSync, promises as fsp } from 'fs'
 import { homedir } from 'os'
 import { delimiter, join } from 'path'
 import { pathToFileURL } from 'url'
+import * as ssh from './sshfs'
 import { isRemotePath } from './sshfs'
 
 // Language servers (the Language Server Protocol): one process per language and project folder, spoken to over stdin and
@@ -95,6 +96,8 @@ interface Server {
   pending: Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>
   ready: Promise<{ capabilities: unknown }>
   dead: boolean
+  remote: boolean // runs on another computer over SSH: its pid and its paths are that computer's
+  rootUri: string // the folder as the server knows it
 }
 
 const servers = new Map<string, Server>()
@@ -126,7 +129,7 @@ function answerServerRequest(s: Server, msg: { id: number | string; method: stri
     case 'workspace/configuration':
       return write(s, { id: msg.id, result: (msg.params?.items ?? []).map(() => null) })
     case 'workspace/workspaceFolders':
-      return write(s, { id: msg.id, result: [{ uri: pathToFileURL(s.root).href, name: s.root }] })
+      return write(s, { id: msg.id, result: [{ uri: s.rootUri, name: s.root }] })
     case 'client/registerCapability':
     case 'client/unregisterCapability':
     case 'window/workDoneProgress/create':
@@ -195,30 +198,50 @@ const CLIENT_CAPABILITIES = {
   }
 }
 
+const REMOTE_PATH = 'PATH="$PATH:$HOME/go/bin:$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/go/bin:/usr/local/bin"'
+
+/** The first candidate that the other computer has (looked for on its PATH and in the usual install folders). */
+async function resolveRemote(language: string, unc: string): Promise<{ spec: Spec; exe: string; args: string[] } | { spec: Spec; missing: true } | { error: string } | null> {
+  const spec = SPECS.find((s) => s.language === language)
+  if (!spec) return null
+  const r = await ssh.exec(unc, ['sh', '-c', REMOTE_PATH + '; i=0; for c in "$@"; do if command -v "$c" >/dev/null 2>&1; then echo $i; exit 0; fi; i=$((i+1)); done; exit 1', 'sh', ...spec.candidates.map((c) => c.exe)], { timeout: 20_000 })
+  if (r.code === -1) return { error: r.stderr || 'Could not reach the other computer.' }
+  const i = r.code === 0 ? Number(r.stdout.trim()) : -1
+  return i >= 0 && spec.candidates[i] ? { spec, exe: spec.candidates[i].exe, args: spec.candidates[i].args } : { spec, missing: true }
+}
+
+const fileUriOf = (nativePath: string): string => 'file://' + (nativePath.startsWith('/') ? '' : '/') + nativePath.split('/').map((seg, k) => (k === 0 && /^[A-Za-z]:$/.test(seg) ? seg : encodeURIComponent(seg))).join('/')
+
 async function start(language: string, appRoot: string): Promise<{ ok: true; server: string; capabilities: unknown; label: string; realRoot: string } | { ok: false; error: string }> {
   // Servers insist on the folder's real spelling (long names, true capitals), which the editor's path may not have.
-  const root = await fsp.realpath(appRoot).catch(() => appRoot)
+  const remote = isRemotePath(appRoot)
+  const root = remote ? appRoot.replace(/\\+$/, '') : await fsp.realpath(appRoot).catch(() => appRoot)
+  const nativeRoot = remote ? (ssh.nativePath(root) as string) : root
   const key = language + '|' + root.toLowerCase()
   const existing = servers.get(key)
   if (existing && !existing.dead) {
     const r = await existing.ready.catch(() => null)
-    if (r) return { ok: true, server: existing.id, capabilities: r.capabilities, label: SPECS.find((s) => s.language === language)?.label ?? language, realRoot: root }
+    if (r) return { ok: true, server: existing.id, capabilities: r.capabilities, label: SPECS.find((s) => s.language === language)?.label ?? language, realRoot: nativeRoot }
   }
-  if (isRemotePath(appRoot)) return { ok: false, error: 'Language servers do not run for folders opened over SSH yet.' }
-  const found = resolve(language)
+  const found = remote ? await resolveRemote(language, root) : resolve(language)
   if (!found) return { ok: false, error: 'No language server is known for ' + language }
-  if ('missing' in found) return { ok: false, error: found.spec.help }
+  if ('error' in found) return { ok: false, error: found.error }
+  if ('missing' in found) return { ok: false, error: found.spec.help + (remote ? '  (on the other computer)' : '') }
   const env = { ...process.env }
   delete env.ANTHROPIC_API_KEY
   delete env.ANTHROPIC_AUTH_TOKEN
   delete env.ELECTRON_RUN_AS_NODE
   let child: ChildProcess
   try {
-    child = spawn(found.file, found.args, { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: /\.(cmd|bat)$/i.test(found.file) })
+    child =
+      'exe' in found
+        ? (ssh.spawnRemote(root, ['sh', '-c', REMOTE_PATH + '; exec "$@"', 'sh', found.exe, ...found.args], { stdin: true }) as unknown as ChildProcess)
+        : spawn(found.file, found.args, { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: /\.(cmd|bat)$/i.test(found.file) })
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) }
   }
-  const s: Server = { id: key, language, root, child, buf: Buffer.alloc(0), seq: 0, pending: new Map(), dead: false, ready: Promise.resolve({ capabilities: null }) }
+  const rootUri = remote ? fileUriOf(nativeRoot) : pathToFileURL(root).href
+  const s: Server = { id: key, language, root, child, buf: Buffer.alloc(0), seq: 0, pending: new Map(), dead: false, ready: Promise.resolve({ capabilities: null }), remote, rootUri }
   servers.set(key, s)
   let stderrTail = ''
   child.stdout?.on('data', (b: Buffer) => feed(s, b))
@@ -240,11 +263,11 @@ async function start(language: string, appRoot: string): Promise<{ ok: true; ser
   child.on('close', die)
   child.on('error', () => die(null))
   s.ready = request(s, 'initialize', {
-    processId: process.pid,
+    processId: remote ? null : process.pid,
     clientInfo: { name: 'My AI IDE' },
-    rootUri: pathToFileURL(root).href,
-    rootPath: root,
-    workspaceFolders: [{ uri: pathToFileURL(root).href, name: root.split(/[\\/]/).pop() ?? root }],
+    rootUri,
+    rootPath: nativeRoot,
+    workspaceFolders: [{ uri: rootUri, name: root.split(/[\\/]/).pop() ?? root }],
     capabilities: CLIENT_CAPABILITIES
   }, 60_000).then((r) => {
     write(s, { method: 'initialized', params: {} })
@@ -252,7 +275,7 @@ async function start(language: string, appRoot: string): Promise<{ ok: true; ser
   })
   try {
     const r = await s.ready
-    return { ok: true, server: s.id, capabilities: r.capabilities, label: found.spec.label, realRoot: root }
+    return { ok: true, server: s.id, capabilities: r.capabilities, label: found.spec.label, realRoot: nativeRoot }
   } catch (e) {
     try {
       child.kill()
@@ -276,7 +299,7 @@ function stopServer(s: Server): void {
         } catch {
           // gone
         }
-        if (process.platform === 'win32' && s.child.pid) spawn('taskkill', ['/pid', String(s.child.pid), '/T', '/F'], { windowsHide: true })
+        if (process.platform === 'win32' && s.child.pid && !s.remote) spawn('taskkill', ['/pid', String(s.child.pid), '/T', '/F'], { windowsHide: true })
       }, 300)
     })
 }
@@ -289,7 +312,7 @@ export function stopAllLanguageServers(): void {
     } catch {
       // gone
     }
-    if (process.platform === 'win32' && s.child.pid) spawn('taskkill', ['/pid', String(s.child.pid), '/T', '/F'], { windowsHide: true })
+    if (process.platform === 'win32' && s.child.pid && !s.remote) spawn('taskkill', ['/pid', String(s.child.pid), '/T', '/F'], { windowsHide: true })
   }
   servers.clear()
 }

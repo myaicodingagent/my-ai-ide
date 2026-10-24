@@ -304,6 +304,7 @@ export function exec(
 
 /** A program running on the other computer, shaped like a child process (stdout, stderr, kill, 'close'). */
 export interface RemoteProcess extends EventEmitter {
+  stdin: PassThrough // what is written here reaches the program (when started with stdin: true)
   stdout: PassThrough
   stderr: PassThrough
   pid: number
@@ -315,8 +316,9 @@ export interface RemoteProcess extends EventEmitter {
  * Starts a program on the remote computer, in the folder `unc` names, and keeps it running until it ends or is killed.
  * The remote shell reports its process id first, so kill() can end the program (closing an SSH channel does not).
  */
-export function spawnRemote(unc: string, command: string[], opts: { env?: Record<string, string> } = {}): RemoteProcess {
+export function spawnRemote(unc: string, command: string[], opts: { env?: Record<string, string>; stdin?: boolean } = {}): RemoteProcess {
   const proc = new EventEmitter() as RemoteProcess
+  proc.stdin = new PassThrough()
   proc.stdout = new PassThrough()
   proc.stderr = new PassThrough()
   proc.pid = 0
@@ -343,18 +345,19 @@ export function spawnRemote(unc: string, command: string[], opts: { env?: Record
   conn.client.exec(line, (err, stream) => {
     if (err) return proc.emit('error', err)
     closeStream = () => stream.close()
-    let head = ''
+    // The first line is the shell saying its process id; the rest is the program's output, passed on as the bytes it is.
+    let head: Buffer = Buffer.alloc(0)
     let gotPid = false
     stream.on('data', (d: Buffer) => {
       if (gotPid) return void proc.stdout.write(d)
-      head += d.toString('utf-8')
-      const nl = head.indexOf('\n')
+      head = Buffer.concat([head, d])
+      const nl = head.indexOf(10)
       if (nl < 0) return
-      const m = /__MYIDE_PID__(\d+)/.exec(head.slice(0, nl))
+      const m = /__MYIDE_PID__(\d+)/.exec(head.subarray(0, nl).toString('latin1'))
       gotPid = true
       if (m) proc.pid = Number(m[1])
-      const rest = head.slice(nl + 1)
-      if (rest) proc.stdout.write(rest)
+      const rest = head.subarray(nl + 1)
+      if (rest.length) proc.stdout.write(rest)
     })
     stream.stderr.on('data', (d: Buffer) => proc.stderr.write(d))
     stream.on('close', (code: number | null) => {
@@ -364,7 +367,8 @@ export function spawnRemote(unc: string, command: string[], opts: { env?: Record
       proc.stderr.end()
       proc.emit('close', code)
     })
-    stream.end()
+    if (opts.stdin) proc.stdin.pipe(stream)
+    else stream.end()
   })
   return proc
 }

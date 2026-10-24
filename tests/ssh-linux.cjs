@@ -1,7 +1,7 @@
 // The debugger and background agents against a REAL Linux SSH server (the other SSH tests use a stand-in server).
 // `npm run test:ssh-linux`: skipped unless something answers on 127.0.0.1:2222. Start the server with Docker:
 //   docker run -d --name sshtest -p 2222:22 ubuntu:24.04 bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && \
-//     apt-get install -y -qq openssh-server git nodejs python3 python3-pip tar golang-go && pip3 install --break-system-packages debugpy; \
+//     apt-get install -y -qq openssh-server git nodejs python3 python3-pip tar golang-go && pip3 install --break-system-packages debugpy "python-lsp-server[all]"; \
 //     useradd -m -s /bin/bash tester && echo 'tester:secret' | chpasswd; mkdir -p /run/sshd; touch /tmp/ready; exec /usr/sbin/sshd -D -e"
 // (wait until `docker exec sshtest ls /tmp/ready` works). Go checks also need Delve in the container; they are skipped without it.
 const fs = require('fs'), os = require('os'), path = require('path'), net = require('net'), cp = require('child_process')
@@ -19,7 +19,7 @@ const posix = (p) => p.split(path.sep).join('/')
 fs.mkdirSync(cache, { recursive: true })
 const stub = path.join(cache, 'ssh-linux-stub.cjs'), bundle = path.join(cache, 'ssh-linux-bundle.cjs'), entry = path.join(cache, 'ssh-linux-entry.ts'), agentStub = path.join(cache, 'ssh-linux-agent.ts')
 fs.writeFileSync(stub, 'module.exports = global.__electronStub')
-fs.writeFileSync(entry, `export * as ssh from ${JSON.stringify(posix(path.join(root, 'src/main/sshfs.ts')))}\nexport * as dbg from ${JSON.stringify(posix(path.join(root, 'src/main/debugger.ts')))}\nexport * as bg from ${JSON.stringify(posix(path.join(root, 'src/main/background.ts')))}\n`)
+fs.writeFileSync(entry, `export * as ssh from ${JSON.stringify(posix(path.join(root, 'src/main/sshfs.ts')))}\nexport * as dbg from ${JSON.stringify(posix(path.join(root, 'src/main/debugger.ts')))}\nexport * as bg from ${JSON.stringify(posix(path.join(root, 'src/main/background.ts')))}\nexport * as lsp from ${JSON.stringify(posix(path.join(root, 'src/main/lsp.ts')))}\n`)
 fs.writeFileSync(agentStub, `import * as real from ${JSON.stringify(posix(path.join(root, 'src/main/agent.ts')))}
 export type AgentEvent = real.AgentEvent
 export const resetSession = real.resetSession
@@ -32,6 +32,8 @@ export async function runAgentTask(opts: { root: string }, send: (e: real.AgentE
 }
 `)
 const stubPlugin = { name: 'agent-stub', setup(b) { b.onResolve({ filter: /^\.\/agent$/ }, (a) => (a.importer.endsWith('background.ts') ? { path: agentStub } : undefined)) } }
+// (modules import JavaDap.java as text, the way the real build does)
+const rawPlugin = { name: 'raw', setup(b) { b.onResolve({ filter: /[?]raw$/ }, (a) => ({ path: path.resolve(a.resolveDir, a.path.replace(/[?]raw$/, '')), namespace: 'raw' })); b.onLoad({ filter: /.*/, namespace: 'raw' }, (a) => ({ contents: fs.readFileSync(a.path, 'utf-8'), loader: 'text' })) } }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const results = []
 const check = (name, ok, detail = '') => { results.push(ok); console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  -> ' + String(detail).slice(0, 260) : ''}`) }
@@ -48,9 +50,11 @@ async function waitEvent(pred, what, ms = 40000) {
 ;(async () => {
   const up = await new Promise((res) => { const s = net.connect(2222, '127.0.0.1'); s.once('connect', () => { s.destroy(); res(true) }); s.once('error', () => res(false)) })
   if (!up) { console.log('SKIP  no SSH server on 127.0.0.1:2222 (see the top of this file)'); process.exit(0) }
-  await require('esbuild').build({ entryPoints: [entry], bundle: true, platform: 'node', format: 'cjs', external: ['ssh2', 'ws', 'esbuild', '@anthropic-ai/sdk'], alias: { electron: stub }, plugins: [stubPlugin], outfile: bundle, logLevel: 'error' })
-  const { ssh, dbg, bg } = require(bundle)
+  await require('esbuild').build({ entryPoints: [entry], bundle: true, platform: 'node', format: 'cjs', external: ['ssh2', 'ws', 'esbuild', '@anthropic-ai/sdk'], alias: { electron: stub }, plugins: [stubPlugin, rawPlugin], outfile: bundle, logLevel: 'error' })
+  const { ssh, dbg, bg, lsp } = require(bundle)
   ssh.registerSshHandlers()
+  const lspMessages = []
+  lsp.registerLspHandlers(() => ({ webContents: { send: (ch, m) => lspMessages.push({ ch, m }) } }))
   dbg.registerDebugHandlers(() => ({ webContents: { send: (_ch, e) => events.push(e) } }))
   bg.registerBackgroundHandlers(() => ({ webContents: { send: (ch, t) => { if (ch === 'bg:update') updates.push(t) } } }))
   const call = (n, ...a) => handlers[n]({}, ...a)
@@ -127,6 +131,39 @@ async function waitEvent(pred, what, ms = 40000) {
       check('Go: it finishes with its output', /go linux 5/.test(events.filter((e) => e.type === 'output').map((e) => e.text).join('')), JSON.stringify([end.code]))
     }
     events.length = 0
+  }
+
+  // ---- a language server on the Linux server (pylsp), spoken to through the SSH connection
+  {
+    const have = await sh(home, 'PATH="$PATH:$HOME/.local/bin:/usr/local/bin"; command -v pylsp')
+    if (have.code !== 0) console.log('SKIP  language server (pylsp is not installed in the container)')
+    else {
+      await sh(home, 'mkdir -p proj/lspdir')
+      await ssh.writeFile(P('proj/lspdir/app.py'), ['import os', '', 'def greet(name):', '    """Say hi to someone."""', '    return "hi " + name', '', 'x = greet("a")', 'print(undefined_name)', ''].join('\n'))
+      const lroot = P('proj/lspdir')
+      const r = await call('lsp:start', 'python', lroot)
+      check('LSP: a Python language server is started on the server', r.ok === true && /Python/.test(r.label) && r.realRoot === '/home/tester/proj/lspdir', JSON.stringify(r))
+      if (r.ok) {
+        const uri = 'file://' + r.realRoot + '/app.py'
+        await call('lsp:notify', r.server, 'textDocument/didOpen', { textDocument: { uri, languageId: 'python', version: 1, text: await ssh.readFile(P('proj/lspdir/app.py')) } })
+        const diag = async () => { for (let i = 0; i < 60; i++) { const m = lspMessages.find((x) => x.ch === 'lsp:message' && x.m.method === 'textDocument/publishDiagnostics' && x.m.params.uri === uri && x.m.params.diagnostics.length); if (m) return m.m.params.diagnostics; await sleep(500) } return [] }
+        const d = await diag()
+        check('LSP: it reports the undefined name, at the right line', d.some((x) => /undefined_name/.test(x.message) && x.range.start.line === 7), JSON.stringify(d).slice(0, 200))
+        const hov = await call('lsp:request', r.server, 'textDocument/hover', { textDocument: { uri }, position: { line: 6, character: 5 } })
+        check('LSP: hover shows the function\'s documentation', hov.ok && /Say hi to someone/.test(JSON.stringify(hov.result)), JSON.stringify(hov).slice(0, 200))
+        const def = await call('lsp:request', r.server, 'textDocument/definition', { textDocument: { uri }, position: { line: 6, character: 5 } })
+        check('LSP: go to definition answers with the file on the server, line 3', def.ok && JSON.stringify(def.result).includes('app.py') && JSON.stringify(def.result).includes('"line":2'), JSON.stringify(def).slice(0, 220))
+        const again = await call('lsp:start', 'python', lroot)
+        check('LSP: starting it again shares the running server', again.ok === true && again.server === r.server)
+        const before = (await sh(home, 'pgrep -f "[p]ylsp" | wc -l')).stdout.trim()
+        await call('lsp:stop', r.server)
+        let after = ''
+        for (let i = 0; i < 30; i++) { after = (await sh(home, 'pgrep -f "[p]ylsp" | wc -l')).stdout.trim(); if (after === '0') break; await sleep(300) }
+        check('LSP: stopping it ends the process on the server', Number(before) >= 1 && after === '0', `before ${before}, after ${after}`)
+      }
+      const none = await call('lsp:start', 'rust', lroot)
+      check('LSP: a server that is not installed there says how to install it', none.ok === false && /rust-analyzer/.test(none.error) && /other computer/.test(none.error), JSON.stringify(none))
+    }
   }
 
   // ---- background agents
