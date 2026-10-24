@@ -517,14 +517,14 @@ export function App(): JSX.Element {
     void reloadTasks()
   }, [])
   // Files the debugger can run: JavaScript and TypeScript (Node), Python.
-  const isRunnable = (p: string | null): p is string => !!p && /[.]((c|m)?(j|t)sx?|pyw?|go|cs)$/i.test(p)
+  const isRunnable = (p: string | null): p is string => !!p && /[.]((c|m)?(j|t)sx?|pyw?|go|cs|c|cc|cpp|cxx)$/i.test(p)
   // Saves the file first (the program runs from disk), then starts it under the debugger.
   const startDebug = useCallback(async (): Promise<string | null> => {
     const file = focusedPath()
     const r = rootRef.current
     const cfg = tasksInfoRef.current?.launch.find((l) => l.name === launchSelRef.current)
     // A launch configuration names its own program; only the plain "Current file" choice needs an open file.
-    if (!(cfg && r) && !isRunnable(file)) return 'Open a .js, .ts, .py, .go or .cs file to debug it.'
+    if (!(cfg && r) && !isRunnable(file)) return 'Open a .js, .ts, .py, .go, .cs, .c or .cpp file to debug it.'
     const tab = tabsRef.current.find((t) => t.path === file)
     if (tab?.dirty) await saveTab(tab)
     showDebug()
@@ -1710,6 +1710,13 @@ export function App(): JSX.Element {
       {
         label: 'Debug: Install the Go Debugger (Delve)',
         run: () => newTerminal(undefined, { title: 'Install Delve', command: 'go install github.com/go-delve/delve/cmd/dlv@latest', cwd: rootRef.current })
+      },
+      {
+        label: 'Debug: Install the C/C++ Debugger',
+        run: () =>
+          window.api.platform === 'win32'
+            ? newTerminal(undefined, { title: 'Install the C/C++ debugger', command: 'winget install MartinStorsjo.LLVM-MinGW.UCRT', cwd: rootRef.current })
+            : showToast(window.api.platform === 'darwin' ? 'Install lldb and clang with: xcode-select --install' : 'Install lldb and clang, for example: sudo apt install lldb clang', 'info')
       },
       {
         label: 'Debug: Install the C# Debugger (netcoredbg)',

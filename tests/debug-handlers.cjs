@@ -426,6 +426,95 @@ const same = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLower
     }
   }
 
+  // --- C and C++ (lldb-dap or GDB, and clang or gcc)
+  {
+    events.length = 0
+    const cppDir = path.join(dir, 'cpp app')
+    fs.mkdirSync(cppDir, { recursive: true })
+    const cpp = path.join(cppDir, 'main.cpp')
+    fs.writeFileSync(cpp, [
+      '#include <iostream>',                                                  // 1
+      '#include <vector>',                                                    // 2
+      'int add(int a, int b) {',                                              // 3
+      '    int sum = a + b;',                                                 // 4
+      '    return sum;',                                                      // 5
+      '}',                                                                    // 6
+      'int main(int argc, char** argv) {',                                    // 7
+      '    int total = add(2, 3);',                                           // 8
+      '    std::vector<int> v{1, 2, 3};',                                     // 9
+      '    std::cout << "cpp result " << total << " " << (argc > 1 ? argv[1] : "-") << " " << v.size() << std::endl;', // 10
+      '    return 0;',                                                        // 11
+      '}',                                                                    // 12
+      ''
+    ].join('\n'))
+    let r = await call('dbg:start', { file: cpp, breakpoints: {} })
+    if (r.ok === false && /^C and C\+\+ debugging needs/.test(r.error)) {
+      console.log('SKIP  C/C++ (no lldb-dap or GDB 14+ with clang or gcc found)')
+    } else {
+      await waitEvent((e) => e.type === 'exited', 'cpp run to the end')
+      check('C/C++: a program without breakpoints is compiled and runs to the end', r.ok === true)
+      events.length = 0
+      const bad = path.join(cppDir, 'bad.cpp')
+      fs.writeFileSync(bad, 'int main() { return undefined_thing; }\n')
+      r = await call('dbg:start', { file: bad, breakpoints: {} })
+      check('C/C++: a program that does not compile reports the compiler error', r.ok === false && /did not compile/.test(r.error) && /undefined_thing/.test(r.error), JSON.stringify(r).slice(0, 300))
+      r = await call('dbg:start', { file: path.join(cppDir, 'main.h'), breakpoints: {} })
+      fs.writeFileSync(path.join(cppDir, 'main.h'), '#pragma once\n')
+      r = await call('dbg:start', { file: path.join(cppDir, 'main.h'), breakpoints: {} })
+      check('C/C++: a header cannot be run, and the message says so', r.ok === false && /header/.test(r.error), JSON.stringify(r))
+      r = await call('dbg:start', { file: cpp, args: ['x'], breakpoints: { [cpp]: [{ line: 4 }] } })
+      check('C/C++: the program is compiled and started under the debugger', r.ok === true, JSON.stringify(r).slice(0, 300))
+      let p = r.ok ? await paused('cpp breakpoint') : null
+      check('C/C++: it stops at the breakpoint in add', !!p && p.reason === 'breakpoint' && p.frames[0].line === 4 && /add/.test(p.frames[0].name) && same(p.frames[0].file, cpp), JSON.stringify(p && p.frames[0]))
+      let scopes = await call('dbg:scopes', 0)
+      const names = scopes.flatMap((s) => s.vars).map((v) => v.name + '=' + v.value)
+      check('C/C++: local variables are shown', names.includes('a=2') && names.includes('b=3'), names.join())
+      check('C/C++: the registers are not listed among the scopes', !scopes.some((s) => /regist/i.test(s.name)), scopes.map((s) => s.name).join())
+      let ev = await call('dbg:eval', 'a + b', 0)
+      check('C/C++: an expression is evaluated in the stopped frame', ev.ok && ev.value.value === '5', JSON.stringify(ev))
+      await call('dbg:stepOver')
+      p = await paused('cpp step')
+      check('C/C++: step over goes to the next line', p.frames[0].line === 5, JSON.stringify(p.frames[0]))
+      await call('dbg:stepOut')
+      p = await paused('cpp step out')
+      check('C/C++: step out returns to main', /main/.test(p.frames[0].name) && p.frames[0].line >= 8 && p.frames[0].line <= 9, JSON.stringify(p.frames[0]))
+      await call('dbg:setBreakpoints', cpp, [{ line: 11 }])
+      await call('dbg:continue')
+      p = await paused('cpp breakpoint added while stopped')
+      check('C/C++: a breakpoint added while stopped is used', p.reason === 'breakpoint' && p.frames[0].line === 11, JSON.stringify([p.reason, p.frames[0].line]))
+      scopes = await call('dbg:scopes', 0)
+      const vv = scopes.flatMap((s) => s.vars).find((v) => v.name === 'v')
+      const kids = vv && vv.objectId ? await call('dbg:props', vv.objectId) : []
+      check('C/C++: a vector can be expanded', !!vv && kids.length > 0, JSON.stringify([vv, kids]).slice(0, 300))
+      await call('dbg:continue')
+      const end = await waitEvent((e) => e.type === 'exited', 'cpp exit')
+      const out = events.filter((e) => e.type === 'output').map((e) => e.text).join('')
+      check('C/C++: it finishes with code 0; the argument and the output arrive', end.code === 0 && /cpp result 5 x 3/.test(out), JSON.stringify([end.code, out]))
+      events.length = 0
+      r = await call('dbg:start', { file: cpp, breakpoints: { [cpp]: [{ line: 4, condition: 'a == 100' }] } })
+      const end2 = await waitEvent((e) => e.type === 'exited', 'cpp no stop')
+      check('C/C++: a conditional breakpoint whose condition is false does not stop it', r.ok && end2.code === 0 && !events.some((e) => e.type === 'paused'))
+      events.length = 0
+      r = await call('dbg:start', { file: cpp, breakpoints: { [cpp]: [{ line: 4 }] } })
+      await paused('cpp for stop')
+      await call('dbg:stop')
+      await waitEvent((e) => e.type === 'exited', 'cpp stopped')
+      check('C/C++: Stop ends the session', true)
+      events.length = 0
+      const c = path.join(cppDir, 'plain.c')
+      fs.writeFileSync(c, ['#include <stdio.h>', 'int twice(int x) {', '    int y = x * 2;', '    return y;', '}', 'int main(void) {', '    printf("c result %d\\n", twice(21));', '    return 0;', '}', ''].join('\n'))
+      r = await call('dbg:start', { file: c, breakpoints: { [c]: [{ line: 3 }] } })
+      p = r.ok ? await paused('c breakpoint') : null
+      check('C: a .c file is compiled with the C compiler and stops at its breakpoint', !!p && p.frames[0].line === 3 && /twice/.test(p.frames[0].name), JSON.stringify(r.ok ? p && p.frames[0] : r))
+      ev = await call('dbg:eval', 'x', 0)
+      check('C: a parameter can be read', ev.ok && ev.value.value === '21', JSON.stringify(ev))
+      await call('dbg:continue')
+      const cend = await waitEvent((e) => e.type === 'exited', 'c exit')
+      check('C: it finishes and prints', cend.code === 0 && /c result 42/.test(events.filter((e) => e.type === 'output').map((e) => e.text).join('')))
+      events.length = 0
+    }
+  }
+
   // --- attach to a program that is already running
   {
     events.length = 0

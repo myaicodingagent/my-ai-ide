@@ -8,6 +8,7 @@ import type { DbgBreakpoint, DbgEvent, DbgFrame, DbgScope, DbgVar } from './debu
 import { findPython, hasDebugpy } from './pythonenv'
 import * as ssh from './sshfs'
 import { NETCOREDBG_HELP, findNetcoredbg } from './netcoredbg'
+import { CPP_HELP, compileCpp, findCppDebugger, isCppSource } from './cpptools'
 
 // A client for the Debug Adapter Protocol (the protocol VS Code uses to talk to debuggers), and the Python debugger
 // built on it: `python -m debugpy.adapter` is started and driven over stdin/stdout.
@@ -132,6 +133,7 @@ interface Adapter {
   label: string
   files: RegExp // the files whose breakpoints belong to this adapter
   exceptionFilters?: string[] // what to ask the adapter to stop on (default: uncaught exceptions)
+  evalContext?: string // the `context` of evaluate requests (default repl); lldb answers repl with `(int) $1 = 5`, watch with `5`
   adapterPath?(file: string): string // how the adapter must be told a file's path (the spelling its symbols use)
   start(opts: DebugOptions, emit: (e: DbgEvent) => void): Promise<Started>
   attach?(target: AttachTarget, emit: (e: DbgEvent) => void): Promise<Started>
@@ -469,7 +471,43 @@ export const csharpAdapter: Adapter = {
   }
 }
 
-export const adapterFor = (file: string): Adapter | null => [pythonAdapter, goAdapter, csharpAdapter].find((a) => a.files.test(file)) ?? null
+// C and C++: lldb-dap runs the program that the compiler makes from the open source file.
+export const cppAdapter: Adapter = {
+  id: 'cppdbg',
+  evalContext: 'watch',
+  label: 'C/C++',
+  files: /\.(c|cc|cpp|cxx|c\+\+|h|hh|hpp|hxx)$/i,
+  exceptionFilters: [],
+  adapterPath: (file) => {
+    try {
+      return realpathSync.native(file)
+    } catch {
+      return file
+    }
+  },
+  async start(opts, emit) {
+    if (ssh.isRemotePath(opts.file)) throw new Error('C and C++ programs on another computer cannot be debugged yet.')
+    if (!isCppSource(opts.file)) throw new Error('Open a .c or .cpp file to debug it (a header cannot be run).')
+    const dbg = findCppDebugger()
+    if (!dbg) throw new Error(CPP_HELP)
+    emit({ type: 'output', stream: 'info', text: `Compiling ${basename(opts.file)}...
+` })
+    const program = await compileCpp(opts.file, dirname(dbg))
+    const cwd = opts.cwd || dirname(opts.file)
+    const child = spawn(dbg, [], { cwd, env: cleanEnv(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+    let stderr = ''
+    child.stderr?.on('data', (b: Buffer) => (stderr = (stderr + b.toString('utf-8')).slice(-2000)))
+    const env = opts.env ?? {}
+    return {
+      child,
+      io: { input: child.stdout!, output: child.stdin! },
+      stderr: () => stderr,
+      launch: { name: 'C/C++', request: 'launch', program, args: opts.args ?? [], cwd, env: Object.entries(env).map(([k, v]) => `${k}=${v}`), stopOnEntry: opts.stopOnEntry === true }
+    }
+  }
+}
+
+export const adapterFor = (file: string): Adapter | null => [pythonAdapter, goAdapter, csharpAdapter, cppAdapter].find((a) => a.files.test(file)) ?? null
 
 export function startPythonDebug(opts: DebugOptions, emit: (e: DbgEvent) => void): Promise<DapSession> {
   return startDapDebug(pythonAdapter, opts, emit)
@@ -641,7 +679,7 @@ async function runDap(adapter: Adapter, started: Started, breakpointsByFile: Rec
       const sc = await dap.request<{ scopes: Json[] }>('scopes', { frameId: f.id })
       const out: DbgScope[] = []
       for (const s of sc.scopes) {
-        if (/^globals$/i.test(String(s.name))) continue
+        if (/^(globals|registers?)$/i.test(String(s.name))) continue
         const vars = await dap.request<{ variables: Json[] }>('variables', { variablesReference: s.variablesReference }).catch(() => ({ variables: [] }))
         out.push({ name: /^locals$/i.test(String(s.name)) ? 'Local' : String(s.name), vars: vars.variables.filter((v) => !/ variables$/.test(String(v.name))).slice(0, 300).map(toVar) })
       }
@@ -656,7 +694,7 @@ async function runDap(adapter: Adapter, started: Started, breakpointsByFile: Rec
     async evaluate(expression, frameIndex) {
       try {
         const f = frameIndex === null ? undefined : frames[frameIndex]
-        const r = await dap.request<Json>('evaluate', { expression, context: 'repl', ...(f ? { frameId: f.id } : {}) })
+        const r = await dap.request<Json>('evaluate', { expression, context: adapter.evalContext ?? 'repl', ...(f ? { frameId: f.id } : {}) })
         return { ok: true, value: { name: expression, value: String(r.result ?? ''), type: String(r.type ?? ''), objectId: r.variablesReference > 0 ? 'dap:' + r.variablesReference : undefined } }
       } catch (e) {
         return { ok: false, error: e instanceof Error ? e.message : String(e) }
