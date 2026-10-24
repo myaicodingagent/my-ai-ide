@@ -590,6 +590,19 @@ export function App(): JSX.Element {
   // Tree views and view containers that extensions add.
   const extRecords = useExtensions()
   const extViews = useMemo(() => extRecords.filter((r) => r.enabled).flatMap((r) => r.views.map((v) => ({ ...v, ext: r.id }))), [extRecords])
+  // The title of the window: shown in the title bar (the menu bar) and used by the system for the task bar.
+  const windowTitle = useMemo(() => {
+    const tab = tabs.find((t) => t.path === active)
+    return [tab ? baseName(tab.path) + (tab.dirty ? ' ●' : '') : '', root ? baseName(root) : '', 'My AI IDE'].filter(Boolean).join(' — ')
+  }, [tabs, active, root])
+  useEffect(() => {
+    document.title = windowTitle
+  }, [windowTitle])
+  useEffect(() => {
+    document.documentElement.dataset.platform = window.api.platform
+  }, [])
+  const renderExtView = (v: { id: string; name: string; webview?: boolean }): JSX.Element =>
+    v.webview ? <ExtWebviewView key={v.id} viewId={v.id} name={v.name} /> : <ExtTreeView key={v.id} viewId={v.id} name={v.name} onOpenFile={(p) => void openFile(p)} />
   const extContainers = useMemo(() => extRecords.filter((r) => r.enabled).flatMap((r) => r.containers.map((c) => ({ ...c, ext: r.id }))), [extRecords])
   const customContainerIds = useMemo(() => new Set(extContainers.map((c) => c.id)), [extContainers])
   rootsRef.current = roots
@@ -2148,7 +2161,7 @@ export function App(): JSX.Element {
 
   return (
     <div className="app">
-      <MenuBar menus={menus} />
+      <MenuBar menus={menus} title={windowTitle} />
       <div className="workbench">
       <nav className="activitybar" aria-label="Activity bar">
         <div className="sidebar-views" role="tablist" aria-label="Side bar views" aria-orientation="vertical">
@@ -2260,11 +2273,7 @@ export function App(): JSX.Element {
         {root && (
           <>
             <Outline model={tabs.find((t) => t.path === active)?.model ?? null} onReveal={(line) => active && void openFile(active, line)} />
-            {extViews.filter((v) => !customContainerIds.has(v.container)).map((v) => v.webview ? (
-              <ExtWebviewView key={v.id} viewId={v.id} name={v.name} />
-            ) : (
-              <ExtTreeView key={v.id} viewId={v.id} name={v.name} onOpenFile={(p) => void openFile(p)} />
-            ))}
+            {extViews.filter((v) => !customContainerIds.has(v.container) && v.container !== 'scm' && v.container !== 'debug').map(renderExtView)}
             <Timeline roots={roots} file={active} refreshKey={`${git.status.branch ?? ''}:${git.status.state === 'ok' ? changeCount(git.status) : 0}:${git.status.ahead ?? 0}`} onOpen={showFileHistory} />
           </>
         )}
@@ -2281,11 +2290,7 @@ export function App(): JSX.Element {
         </div>
         {extContainers.map((c) => (
           <div key={c.id} className="tree" style={{ display: sidebarView === 'xc:' + c.id ? 'block' : 'none' }} data-ext-container={c.id}>
-            {extViews.filter((v) => v.container === c.id).map((v) => v.webview ? (
-              <ExtWebviewView key={v.id} viewId={v.id} name={v.name} />
-            ) : (
-              <ExtTreeView key={v.id} viewId={v.id} name={v.name} onOpenFile={(p) => void openFile(p)} />
-            ))}
+            {extViews.filter((v) => v.container === c.id).map(renderExtView)}
           </div>
         ))}
         <div className="tree" style={{ display: sidebarView === 'ext' ? 'block' : 'none' }}>
@@ -2303,6 +2308,7 @@ export function App(): JSX.Element {
             problems={tasksInfo?.errors ?? []}
             onOpenFile={(p, line) => void openFile(p, line)}
           />
+          {extViews.filter((v) => v.container === 'debug').map(renderExtView)}
         </div>
         <div className="tree" style={{ display: sidebarView === 'agents' ? 'block' : 'none' }}>
           <BackgroundPanel
@@ -2324,6 +2330,7 @@ export function App(): JSX.Element {
             onOpenMerge={(abs, repo) => void openMerge(abs, repo)}
             historyFor={historyFor}
           />
+          {extViews.filter((v) => v.container === 'scm').map(renderExtView)}
         </div>
       </aside>
       <main className="main" aria-label="Editor">

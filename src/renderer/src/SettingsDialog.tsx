@@ -295,6 +295,10 @@ export function SettingsDialog({ onClose }: { onClose: () => void }): JSX.Elemen
             <Check setting="nextEdit" keyName="nextEdit" s={s} />
           </Row>
 
+          <Row label="Language servers" hint="Start the language server of the file's language when it is installed (Go, Python, Rust, C and C++): completions, errors, go to definition, rename, hover. Turn off if a server uses too much memory; the editor's own TypeScript, JSON, CSS and HTML support stays on">
+            <Check setting="languageServers" keyName="languageServers" s={s} />
+          </Row>
+
           <Row label="Search by meaning on this PC" hint="Find code by what it does, not only by its words. Downloads a small model (about 23 MB) the first time; your code never leaves this PC">
             <Check setting="meaningSearch" keyName="meaningSearch" s={s} />
           </Row>

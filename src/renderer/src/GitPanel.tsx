@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { CommitEntry, CommitFile, GitFile, StashEntry } from '../../main/git'
 import { refreshGit, useGit } from './gitStore'
+import { Section } from './ExplorerSections'
 
 type Note = { kind: 'ok' | 'error'; text: string } | null
 
@@ -443,14 +444,18 @@ export function GitPanel({
         )}
       </div>
 
-      <div className="git-group">
-        <span>Staged Changes {staged.length > 0 && <span className="git-count">{staged.length}</span>}</span>
-        {staged.length > 0 && (
-          <button title="Unstage all" data-git-action="unstage-all" onClick={() => void run('unstage', () => window.api.gitUnstage(root, null))}>
-            −
-          </button>
-        )}
-      </div>
+      <Section
+        id="git-staged"
+        title="Staged Changes"
+        count={staged.length > 0 ? staged.length : undefined}
+        actions={
+          staged.length > 0 ? (
+            <button title="Unstage all" aria-label="Unstage all" data-git-action="unstage-all" onClick={() => void run('unstage', () => window.api.gitUnstage(root, null))}>
+              −
+            </button>
+          ) : undefined
+        }
+      >
       {staged.map((f) => (
         <Row
           key={'s' + f.rel}
@@ -464,15 +469,20 @@ export function GitPanel({
           onDiscard={() => undefined}
         />
       ))}
+      </Section>
 
-      <div className="git-group">
-        <span>Changes {changes.length > 0 && <span className="git-count">{changes.length}</span>}</span>
-        {changes.length > 0 && (
-          <button title="Stage all" data-git-action="stage-all" onClick={() => void run('stage', () => window.api.gitStage(root, null))}>
-            +
-          </button>
-        )}
-      </div>
+      <Section
+        id="git-changes"
+        title="Changes"
+        count={changes.length > 0 ? changes.length : undefined}
+        actions={
+          changes.length > 0 ? (
+            <button title="Stage all" aria-label="Stage all" data-git-action="stage-all" onClick={() => void run('stage', () => window.api.gitStage(root, null))}>
+              +
+            </button>
+          ) : undefined
+        }
+      >
       {changes.map((f) => (
         <Row
           key={'c' + f.rel}
@@ -489,10 +499,9 @@ export function GitPanel({
         />
       ))}
       {staged.length === 0 && changes.length === 0 && <div className="empty">No changes. The working tree is clean.</div>}
+      </Section>
 
-      <div className="git-group">
-        <span>Stashes {stashes.length > 0 && <span className="git-count">{stashes.length}</span>}</span>
-      </div>
+      <Section id="git-stashes" title="Stashes" count={stashes.length > 0 ? stashes.length : undefined}>
       <div className="git-stash-new">
         <input
           value={stashMsg}
@@ -528,6 +537,7 @@ export function GitPanel({
           </span>
         </div>
       ))}
+      </Section>
         </>
       )}
     </div>

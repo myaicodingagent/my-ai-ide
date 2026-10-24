@@ -17,6 +17,8 @@ const api = {
   openWorkspaceFile: (): Promise<{ file: string; folders: string[] } | { error: string } | null> => ipcRenderer.invoke('workspace:open'),
   saveWorkspaceFile: (folders: string[]): Promise<string | null> => ipcRenderer.invoke('workspace:save', folders),
   initialFolder: (): Promise<string | null> => ipcRenderer.invoke('app:initialFolder'),
+  setTitleBar: (color: string, symbolColor: string): Promise<void> => ipcRenderer.invoke('app:setTitleBar', color, symbolColor),
+  platform: process.platform,
   setNativeTheme: (type: 'light' | 'dark'): Promise<void> => ipcRenderer.invoke('app:setNativeTheme', type),
   themesList: (): Promise<{ file: string; text: string }[]> => ipcRenderer.invoke('themes:list'),
   themesOpenFolder: (): Promise<string | null> => ipcRenderer.invoke('themes:openFolder'),

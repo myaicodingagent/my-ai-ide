@@ -122,6 +122,12 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
   const height0 = await ev('window.innerHeight')
   await ev(`document.querySelector('[data-view="files"]').click()`)
   await sleep(800)
+  // ================= the title bar (the menu bar is drawn in it) =================
+  const wco = JSON.parse(await ev(`JSON.stringify({ visible: navigator.windowControlsOverlay?.visible, rect: navigator.windowControlsOverlay ? (({ x, y, width, height }) => ({ x, y, width, height }))(navigator.windowControlsOverlay.getTitlebarAreaRect()) : null, inner: window.innerWidth })`))
+  check('the window has no system title bar: only its buttons are drawn, over the right end of our own bar', wco.visible === true && wco.rect.width > 200 && wco.rect.width < wco.inner - 60 && wco.rect.height === 30, JSON.stringify(wco))
+  check('the menu bar can be dragged to move the window, its menus cannot', (await ev(`getComputedStyle(document.querySelector('.menubar')).getPropertyValue('-webkit-app-region')`)) === 'drag' && (await ev(`getComputedStyle(document.querySelector('.menu-wrap')).getPropertyValue('-webkit-app-region')`)) === 'no-drag')
+  check('and it stops short of the window buttons', parseFloat(await ev(`getComputedStyle(document.querySelector('.menubar')).paddingRight`)) >= wco.inner - wco.rect.x - wco.rect.width - 1)
+  check('the title names the folder and the program', /dbg|proj/i.test(await ev(`document.querySelector('[data-titlebar-title]')?.textContent ?? ''`)) && /My AI IDE/.test(await ev(`document.title`)), await ev(`document.title`))
   check('the app opened the test folder', (await side()).toLowerCase().includes('dbg.js'))
 
   // ================= native dialogs (answered by environment variables) =================
@@ -193,7 +199,9 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
   await openFile('edit.js')
   await toLine(1)
   await typeText('X')
+  check('the title shows the open file with a dot while it has unsaved changes', /^edit\.js ● — /.test(await ev(`document.querySelector('[data-titlebar-title]').textContent`)), await ev(`document.title`))
   await menu('File', 'Save', 900)
+  check('and without it once saved', /^edit\.js — /.test(await ev(`document.querySelector('[data-titlebar-title]').textContent`)), await ev(`document.title`))
   check('File > Save writes the file to disk', disk('edit.js').startsWith('Xalpha one'), JSON.stringify(disk('edit.js').slice(0, 20)))
   await openFile('two.js')
   await toLine(1); await typeText('Y')

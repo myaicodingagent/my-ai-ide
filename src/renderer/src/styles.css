@@ -232,8 +232,8 @@ kbd { font: 12px var(--font-code); background: var(--hover); border: 1px solid v
 .git-branch { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .git-sync { color: var(--muted); font-weight: 400; margin-left: 4px; }
 .git-head-actions { display: flex; gap: 2px; flex: none; }
-.git-head-actions button, .git-commit-row button:not(.primary), .git-group button, .git-actions button { background: transparent; color: var(--muted); border-radius: 4px; padding: 1px 6px; font-size: 12px; }
-.git-head-actions button:hover:not(:disabled), .git-commit-row button:not(.primary):hover:not(:disabled), .git-group button:hover, .git-actions button:hover { background: var(--active); color: var(--fg); }
+.git-head-actions button, .git-commit-row button:not(.primary), .git-group button, .git-actions button, .ex-actions button { background: transparent; color: var(--muted); border-radius: 4px; padding: 1px 6px; font-size: 12px; }
+.git-head-actions button:hover:not(:disabled), .git-commit-row button:not(.primary):hover:not(:disabled), .git-group button:hover, .git-actions button:hover, .ex-actions button:hover { background: var(--active); color: var(--fg); }
 .git button:disabled { opacity: 0.45; cursor: default; }
 .git-commit { padding: 0 12px 8px; display: flex; flex-direction: column; gap: 6px; }
 .git-commit textarea { resize: none; background: var(--sunken); color: var(--fg); border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; outline: 0; line-height: 1.4; }
@@ -537,7 +537,11 @@ html.reduce-motion *, html.reduce-motion *::before, html.reduce-motion *::after 
 
 /* ---------- Menu bar and activity bar (VS Code layout) ---------- */
 .menubar { display: flex; align-items: stretch; height: 30px; flex: none; background: var(--side); border-bottom: 1px solid var(--border); padding: 0 6px; user-select: none; font-size: 13px; }
-.menu-wrap { position: relative; display: flex; }
+/* The menu bar is the window's title bar: it can be dragged, and leaves room for the window buttons the system draws over its right end. */
+.menubar { -webkit-app-region: drag; padding-right: max(6px, calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, 100vw))); }
+html[data-platform="darwin"] .menubar { padding-left: 80px; }
+.titlebar-title { flex: 1; min-width: 0; align-self: center; text-align: center; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 12px; }
+.menu-wrap { position: relative; display: flex; -webkit-app-region: no-drag; }
 .menu-title { padding: 0 9px; margin: 3px 0; border-radius: 4px; color: var(--fg); background: none; border: 0; font: inherit; cursor: default; }
 .menu-title:hover, .menu-title.open { background: var(--hover); }
 .menu-drop { position: absolute; top: 100%; left: 0; z-index: 70; min-width: 260px; padding: 4px; background: var(--side); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow); }

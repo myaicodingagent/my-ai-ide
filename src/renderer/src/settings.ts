@@ -15,6 +15,7 @@ export interface Settings {
   screenReader: boolean // tell the editor and terminal that a screen reader is in use (otherwise they detect it)
   reduceMotion: boolean // no animations (the system's own setting is respected as well)
   meaningSearch: boolean // search by meaning with a small model that runs on this PC (downloaded once, about 23 MB)
+  languageServers: boolean // start language servers (gopls, pylsp, rust-analyzer, clangd...) for the open files
   nextEdit: boolean // suggest the edit you are likely to make next (Tab jumps to it, Tab applies it)
   autoCheckUpdates: boolean // look for a new version at startup and every few hours
   autoSave: 'off' | 'afterDelay' | 'onBlur' // when to save edited files without being asked
@@ -33,6 +34,7 @@ export const DEFAULT_SETTINGS: Settings = {
   defaultModel: DEFAULT_MODEL,
   autocomplete: true,
   nextEdit: false,
+  languageServers: true,
   meaningSearch: true,
   screenReader: false,
   reduceMotion: false,
@@ -69,6 +71,7 @@ function sanitize(raw: Partial<Record<keyof Settings, unknown>>): Settings {
     defaultModel: MODELS.some((m) => m.id === raw.defaultModel) ? (raw.defaultModel as string) : d.defaultModel,
     autocomplete: typeof raw.autocomplete === 'boolean' ? raw.autocomplete : d.autocomplete,
     nextEdit: typeof raw.nextEdit === 'boolean' ? raw.nextEdit : d.nextEdit,
+    languageServers: typeof raw.languageServers === 'boolean' ? raw.languageServers : d.languageServers,
     meaningSearch: typeof raw.meaningSearch === 'boolean' ? raw.meaningSearch : d.meaningSearch,
     screenReader: typeof raw.screenReader === 'boolean' ? raw.screenReader : d.screenReader,
     reduceMotion: typeof raw.reduceMotion === 'boolean' ? raw.reduceMotion : d.reduceMotion,

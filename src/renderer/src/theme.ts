@@ -165,6 +165,7 @@ export function applyTheme(id: string, persist = false): void {
   monaco.editor.setTheme(monacoThemeName(t))
   // Match the window frame (title bar, dialogs) to the theme.
   void window.api.setNativeTheme(t.type === 'light' ? 'light' : 'dark')
+  void window.api.setTitleBar(u.side, u.fg)
   if (persist) {
     try {
       localStorage.setItem(STORAGE_KEY, t.id)

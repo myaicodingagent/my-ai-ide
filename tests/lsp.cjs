@@ -200,6 +200,24 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
     check('F12 on greet goes to its definition (line 3)', await waitFor(async () => (await cursorLine()) === 3, 8000, 400), await cursorLine())
   }
 
+  // ================= the Settings switch =================
+  const lspSwitch = async (on) => {
+    await menu('File', 'Settings', 900)
+    const now = await ev(`document.querySelector('[data-setting="languageServers"]')?.checked`)
+    if (now !== on) await ev(`document.querySelector('[data-setting="languageServers"]').scrollIntoView({ block: 'center' })`)
+    await sleep(200)
+    if (now !== on) await realClick(`document.querySelector('[data-setting="languageServers"]')`)
+    await sleep(400)
+    await press('Escape', 500)
+  }
+  check('Settings has a Language servers switch, on by default', await (async () => { await menu('File', 'Settings', 900); const v = await ev(`document.querySelector('[data-setting="languageServers"]')?.checked`); await press('Escape', 500); return v === true })())
+  await lspSwitch(false)
+  check('switching it off stops the servers (the status bar entry goes away)', await waitFor(async () => !(await ev(`!!document.querySelector('[data-sb="lsp"]')`)), 15000))
+  await openFile('main.go'); await sleep(2500)
+  check('and a file opened afterwards gets no server', !(await ev(`!!document.querySelector('[data-sb="lsp"]')`)))
+  await lspSwitch(true)
+  check('switching it on starts them again for the open files', await waitFor(() => ev(`/Go/.test(document.querySelector('[data-sb="lsp"]')?.innerText ?? '')`), 60000) || !goplsOk)
+
   // ================= a server that is not installed =================
   await openFile('lib.rs')
   await sleep(2500)

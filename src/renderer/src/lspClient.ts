@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from 'react'
 import { monaco } from './monaco-setup'
+import { getSettings, subscribeSettings } from './settings'
 import { appendOutput } from './outputStore'
 
 // The editor side of the Language Server Protocol. For a file in a language that has a server (Go, Python, Rust, C and
@@ -147,6 +148,7 @@ async function ensureServer(language: string, root: string): Promise<Live | null
 }
 
 function attach(model: monaco.editor.ITextModel): void {
+  if (!getSettings().languageServers) return
   if (model.isDisposed() || model.uri.scheme !== 'file' || ghosts.has(uriOf(model))) return
   const language = languageOfEditor.get(model.getLanguageId())
   if (!language) return
@@ -389,6 +391,15 @@ let initialised = false
 export function initLanguageServers(opts: { getRoots: () => string[]; openFile: (path: string, line: number, column: number) => void; notify: (text: string, kind?: string) => void }): void {
   if (initialised) return
   initialised = true
+  // The Settings switch: off stops every server and clears what they reported; on starts them for the open files.
+  let wasOn = getSettings().languageServers
+  subscribeSettings(() => {
+    const on = getSettings().languageServers
+    if (on === wasOn) return
+    wasOn = on
+    if (on) void restartLanguageServers()
+    else void stopLanguageServers()
+  })
   getRoots = opts.getRoots
   openFileAt = opts.openFile
   say = opts.notify
@@ -443,6 +454,16 @@ export function initLanguageServers(opts: { getRoots: () => string[]; openFile: 
 
 /** Does this file's language have a language server (running or still starting)? */
 export const expectsServer = (model: monaco.editor.ITextModel): boolean => model.uri.scheme === 'file' && languageOfEditor.has(model.getLanguageId())
+
+/** Stops every language server and forgets what they said about the open files. */
+export async function stopLanguageServers(): Promise<void> {
+  for (const model of monaco.editor.getModels()) {
+    if (model.uri.scheme === 'file' && modelServer.has(uriOf(model))) close(model)
+  }
+  for (const l of [...liveByServer.values()]) await window.api.lspStop(l.server)
+  started.clear()
+  emitStatus()
+}
 
 /** Stops every language server and starts them again for the files that are open (after installing one, say). */
 export async function restartLanguageServers(): Promise<void> {

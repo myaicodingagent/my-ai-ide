@@ -54,6 +54,8 @@ function createWindow(): void {
     height: 800,
     backgroundColor: '#1e1e1e',
     title: 'My AI IDE',
+    // The menu bar is drawn in the title bar (see MenuBar); the system draws only the window buttons, over its right end.
+    ...(process.platform === 'darwin' ? { titleBarStyle: 'hiddenInset' as const } : { titleBarStyle: 'hidden' as const, titleBarOverlay: { color: '#252526', symbolColor: '#cccccc', height: 30 } }),
     // The packaged exe carries its own icon; this is for `npm run dev`.
     ...(app.isPackaged ? {} : { icon: join(__dirname, '../../build/icon.png') }),
     webPreferences: {
@@ -193,6 +195,18 @@ ipcMain.handle('themes:save', async (_e, name: string, text: string) => {
   const file = await uniqueThemeFile(String(name))
   await fs.writeFile(join(themesDir(), file), text, 'utf-8')
   return file
+})
+
+// The window buttons that the system draws over the custom title bar take the colors of the theme.
+ipcMain.handle('app:setTitleBar', (_e, color: string, symbolColor: string) => {
+  if (process.platform === 'darwin' || !mainWin || mainWin.isDestroyed()) return
+  const ok = (c: unknown): c is string => typeof c === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(c)
+  if (!ok(color) || !ok(symbolColor)) return
+  try {
+    mainWin.setTitleBarOverlay({ color, symbolColor, height: 30 })
+  } catch {
+    // no overlay on this system
+  }
 })
 
 // Keeps the title bar, dialogs and native scrollbars in step with the chosen theme.

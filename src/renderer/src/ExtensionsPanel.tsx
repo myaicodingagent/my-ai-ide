@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import type { ExtRecord, RegistryResult } from '../../main/extensions'
 import { refreshExtensions, useExtLog, useExtensions } from './extStore'
+import { Section } from './ExplorerSections'
 
 function Row({ e }: { e: ExtRecord }): JSX.Element {
   const [busy, setBusy] = useState(false)
@@ -127,13 +128,17 @@ export function ExtensionsPanel(): JSX.Element {
       )}
 
       {results && (
-        <div data-ext-results>
-          <div className="dbg-section-head">
-            <span>Registry results</span>
-            <button className="dbg-x" onClick={() => setResults(null)}>
+        <Section
+          id="ext-results"
+          title="Registry results"
+          count={results.length}
+          actions={
+            <button className="dbg-x" aria-label="Clear the results" onClick={() => setResults(null)}>
               ×
             </button>
-          </div>
+          }
+        >
+        <div data-ext-results>
           {results.length === 0 && <div className="dbg-empty">Nothing found.</div>}
           {results.map((x) => (
             <div key={x.id} className="ext-row" data-ext-result={x.id}>
@@ -157,13 +162,10 @@ export function ExtensionsPanel(): JSX.Element {
             </div>
           ))}
         </div>
+        </Section>
       )}
 
-      <div className="dbg-section-head">
-        <span>
-          Installed {installed.length > 0 && <span className="git-count">{installed.length}</span>}
-        </span>
-      </div>
+      <Section id="ext-installed" title="Installed" count={installed.length > 0 ? installed.length : undefined}>
       {installed.length === 0 && (
         <div className="dbg-empty">
           No extensions yet. Themes and snippets from VS Code extensions work here; so do extensions written for this editor
@@ -173,16 +175,14 @@ export function ExtensionsPanel(): JSX.Element {
       {installed.map((e) => (
         <Row key={e.id} e={e} />
       ))}
+      </Section>
 
       {log.length > 0 && (
-        <>
-          <div className="dbg-section-head">
-            <span>Extension host log</span>
-          </div>
+        <Section id="ext-log" title="Extension host log">
           <pre className="dbg-output" data-ext-log>
             {log.join('\n')}
           </pre>
-        </>
+        </Section>
       )}
     </div>
   )

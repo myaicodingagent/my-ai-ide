@@ -27,7 +27,7 @@ fs.writeFileSync(path.join(extDir, 'package.json'), JSON.stringify({
       { command: 'demo.hidden', when: 'view == demo.tree && !(viewItem == fruit || viewItem == veg || viewItem == group)', group: '9_x' }
     ] },
     viewsContainers: { activitybar: [{ id: 'demo-bar', title: 'Demo Bar', icon: 'icon.svg' }] },
-    views: { explorer: [{ id: 'demo.tree', name: 'Demo Tree' }], 'demo-bar': [{ id: 'demo.bar', name: 'Bar Items' }] }
+    views: { explorer: [{ id: 'demo.tree', name: 'Demo Tree' }], scm: [{ id: 'demo.scm', name: 'Demo SCM' }], 'demo-bar': [{ id: 'demo.bar', name: 'Bar Items' }] }
   }
 }))
 fs.writeFileSync(path.join(extDir, 'leaf.svg'), '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><circle cx="8" cy="8" r="6" fill="#33aa33"/></svg>')
@@ -58,6 +58,7 @@ exports.activate = (context) => {
     }
   }
   context.subscriptions.push(vscode.window.createTreeView('demo.tree', { treeDataProvider: provider }))
+  vscode.window.registerTreeDataProvider('demo.scm', { getChildren: () => ['changed-a', 'changed-b'], getTreeItem: (n) => new vscode.TreeItem(n) })
   vscode.window.registerTreeDataProvider('demo.bar', { getChildren: () => ['one', 'two', 'three'], getTreeItem: (n) => new vscode.TreeItem(n) })
   for (const [cmd, word] of [['demo.rename', 'renamed'], ['demo.eat', 'ate'], ['demo.openfolder', 'opened'], ['demo.wave', 'waved']]) context.subscriptions.push(vscode.commands.registerCommand(cmd, (el, all) => vscode.window.showInformationMessage(word + ' ' + el.name + ' of ' + all.length)))
   context.subscriptions.push(vscode.commands.registerCommand('demo.picked', (name) => vscode.window.showInformationMessage('picked ' + name)))
@@ -146,6 +147,19 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
   await ev(`${rowSel('demo.tree', 'apple')}.focus()`); await sleep(300)
   await realClick(`${rowSel('demo.tree', 'apple')}.querySelector('[data-xt-inline="demo.wave"]')`)
   check('clicking an inline button runs its command for that node', await waitFor(() => ev(`document.body.innerText.includes('waved apple of 1')`)))
+  // a view the extension put in the Source Control container is shown there, not in the Explorer
+  check('a view contributed to "scm" is not in the Explorer', await ev(`!!document.querySelector('[data-xt-view="demo.tree"]')?.closest('.explorer') && !!document.querySelector('[data-xt-view="demo.scm"]') && !document.querySelector('[data-xt-view="demo.scm"]').closest('.explorer')`))
+  await ev(`document.querySelector('[data-view="git"]').click()`); await sleep(1500)
+  check('it is shown in the Source Control view', await waitFor(async () => (await rows('demo.scm')).some((t) => t.includes('changed-a')) && (await ev(`!!document.querySelector('[data-ext-section]') || true`))), JSON.stringify(await rows('demo.scm')))
+  await ev(`document.querySelector('[data-view="files"]').click()`); await sleep(800)
+  // the Extensions view is made of sections that fold
+  await ev(`document.querySelector('[data-view="ext"]').click()`); await sleep(800)
+  check('the Installed section lists the extension', await waitFor(() => ev(`/Demo/i.test(document.querySelector('[data-ex-section="ext-installed"]')?.innerText ?? '')`)))
+  await ev(`document.querySelector('[data-ex-toggle="ext-installed"]').click()`); await sleep(400)
+  check('Installed folds away, keeping its count', !(await ev(`!!document.querySelector('[data-ex-section="ext-installed"] .ex-body')`)) && (await ev(`document.querySelector('[data-ex-section="ext-installed"] .ex-count')?.textContent`)) === '1')
+  await ev(`document.querySelector('[data-ex-toggle="ext-installed"]').click()`); await sleep(400)
+  check('and opens again', await ev(`!!document.querySelector('[data-ex-section="ext-installed"] .ex-body')`))
+  await ev(`document.querySelector('[data-view="files"]').click()`); await sleep(800)
   // the view container of its own
   check('the extension\'s own container has a button in the activity bar', await waitFor(() => ev(`!!document.querySelector('[data-view="xc:demo-bar"]')`)))
   await realClick(`document.querySelector('[data-view="xc:demo-bar"]')`); await sleep(1200)

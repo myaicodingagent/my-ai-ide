@@ -457,6 +457,12 @@ function removeTestHistory() {
     check('Stage All stages everything', await waitFor(async () => (await gitRows(true)).length === 3 && (await gitRows(false)).length === 0, 'all staged'))
     await gitAction('unstage-all')
     await waitFor(async () => (await gitRows(false)).length === 3, 'all unstaged')
+    // the groups of the Source Control view are sections that fold
+    await c.ev(`document.querySelector('[data-ex-toggle="git-changes"]').click()`)
+    check('the Changes section folds: its files and Stage All are hidden', await waitFor(async () => (await gitRows(false)).length === 0 && !(await c.ev(`!!document.querySelector('[data-git-action="stage-all"]')`)), 'changes folded'))
+    check('and the section header still shows how many files it holds', (await c.ev(`document.querySelector('[data-ex-section="git-changes"] .ex-count')?.textContent`)) === '3')
+    await c.ev(`document.querySelector('[data-ex-toggle="git-changes"]').click()`)
+    check('it opens again with its files', await waitFor(async () => (await gitRows(false)).length === 3, 'changes unfolded'))
     await gitAction('discard', 'hello.txt')
     check('Discard restores a modified file from the index', await waitFor(() => fs.readFileSync(path.join(PROJ, 'hello.txt'), 'utf8').replace(/\r/g, '') === 'hello world\n', 'discarded'))
 

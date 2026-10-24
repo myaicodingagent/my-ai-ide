@@ -18,7 +18,7 @@ export interface MenuDef {
 
 // The menu bar across the top: File, Edit, Selection, View, Go, Run, Terminal, Help. A click opens a menu; while one is
 // open, moving over another title switches to it. Arrow keys move around, Enter chooses, Escape closes.
-export function MenuBar({ menus }: { menus: MenuDef[] }): JSX.Element {
+export function MenuBar({ menus, title }: { menus: MenuDef[]; title?: string }): JSX.Element {
   const [open, setOpen] = useState<number | null>(null)
   const [hi, setHi] = useState(-1)
   const [altHeld, setAltHeld] = useState(false) // the underlined letters show while Alt is down
@@ -153,6 +153,11 @@ export function MenuBar({ menus }: { menus: MenuDef[] }): JSX.Element {
           )}
         </div>
       ))}
+      {title !== undefined && (
+        <div className="titlebar-title" data-titlebar-title aria-hidden="true">
+          {title}
+        </div>
+      )}
     </div>
   )
 }
