@@ -617,7 +617,8 @@ function removeTestHistory() {
     // ---- Editor workflow: tabs, breadcrumbs, saving, session, problems ----
     await c.ev(`window.__confirms = []; window.__confirmAnswer = true; window.confirm = (m) => { window.__confirms.push(String(m)); return window.__confirmAnswer }`)
     const edKey = async (key, init = {}) => { await c.send('Input.dispatchKeyEvent', { type: 'keyDown', key, ...init }); await c.send('Input.dispatchKeyEvent', { type: 'keyUp', key }) }
-    const typeInEditor = async (text) => { await c.ev(`document.querySelector('.monaco-editor textarea')?.focus()`); for (const ch of text) await edKey(ch, { text: ch, unmodifiedText: ch }) }
+    // the editor of the open file: the visible one in the main group (other, hidden editors can come first in the page)
+    const typeInEditor = async (text) => { await c.ev(`(() => { const all = [...document.querySelectorAll('.monaco-editor textarea')]; const vis = (t) => { const r = t.closest('.monaco-editor').getBoundingClientRect(); return r.width > 0 && r.height > 0 }; (all.find((t) => vis(t) && t.closest('.group-main')) || all.find(vis) || all[0])?.focus() })()`); for (const ch of text) await edKey(ch, { text: ch, unmodifiedText: ch }) }
     const ctrl = (key, extra = {}) => c.ev(`window.dispatchEvent(new KeyboardEvent('keydown', ${JSON.stringify({ key, ctrlKey: true, bubbles: true, ...extra })}))`)
     const activeTab = () => c.ev(`document.querySelector('.tab.active .tab-name')?.textContent || null`)
     const dirtyTabs = () => c.ev(`[...document.querySelectorAll('.tab')].filter(t => t.querySelector('.tab-dot')).map(t => t.querySelector('.tab-name').textContent)`)
@@ -1914,7 +1915,9 @@ function removeTestHistory() {
     const nbBefore = await nbCount()
     await edKey('b', { text: 'b', unmodifiedText: 'b', code: 'KeyB' })
     check('B adds a cell below', await waitFor(async () => (await nbCount()) === nbBefore + 1, 'cell added by key'))
-    for (let i = 0; i < 6 && !(await c.ev(`document.activeElement?.hasAttribute('data-nb-cell')`)); i++) { await edKey('Escape', { code: 'Escape', windowsVirtualKeyCode: 27 }); await sleep(400) }
+    // The new cell's editor is made when it comes into view, which can take seconds on a busy machine and then takes the focus: keep pressing Escape until the cell itself has it.
+    for (let i = 0; i < 40 && !(await c.ev(`document.activeElement?.hasAttribute('data-nb-cell')`)); i++) { await edKey('Escape', { code: 'Escape', windowsVirtualKeyCode: 27 }); await sleep(500) }
+    if (!(await c.ev(`document.activeElement?.hasAttribute('data-nb-cell')`))) console.log('DIAG no command mode:', await c.ev(`JSON.stringify({ active: document.activeElement?.tagName + '.' + String(document.activeElement?.className || '').slice(0, 60), inCell: document.activeElement?.closest?.('[data-nb-cell]')?.getAttribute('data-nb-cell'), cells: [...document.querySelectorAll('[data-nb-cell]')].map((x) => x.getAttribute('data-nb-cell') + ':' + x.className).join(' | '), hasFocus: document.hasFocus(), dialogs: document.querySelectorAll('[role=dialog],.ctx-menu,.qp').length, status: document.querySelector('[data-nb-status]')?.dataset.nbStatus, suggest: !!document.querySelector('.suggest-widget.visible'), hints: !!document.querySelector('.parameter-hints-widget.visible'), find: !!document.querySelector('.find-widget.visible'), widgets: [...document.querySelectorAll('.monaco-editor .overflowingContentWidgets > *, .monaco-editor .overlayWidgets > *')].filter((w) => w.getBoundingClientRect().width > 0 && getComputedStyle(w).visibility !== 'hidden').map((w) => w.className.toString().slice(0, 40)).join(',') })`))
     await waitFor(() => c.ev(`document.activeElement?.hasAttribute('data-nb-cell')`), 'command mode before D D')
     await c.ev(`(() => { const el = document.activeElement; for (let i = 0; i < 2; i++) el.dispatchEvent(new KeyboardEvent('keydown', { key: 'd', bubbles: true, cancelable: true })) })()`) // both inside the double-press window, however busy the machine is
     check('D twice deletes the cell', await waitFor(async () => (await nbCount()) === nbBefore, 'cell deleted by key'))
@@ -2012,6 +2015,7 @@ function removeTestHistory() {
     sshServer.close()
     fs.rmSync(sshRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 300 }) // a git command run over SSH may still be closing
 
+    if (c.errors.length) console.log('RENDERER ERRORS (full):', c.errors.slice(0, 3).join(String.fromCharCode(10) + '---' + String.fromCharCode(10)))
     check('no uncaught renderer errors', c.errors.length === 0, c.errors.slice(0, 3).join(' | '))
   } catch (e) {
     check('test run completed without exception', false, e.message)

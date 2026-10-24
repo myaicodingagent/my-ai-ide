@@ -911,12 +911,19 @@ export function App(): JSX.Element {
           const content = await window.api.readFile(path)
           diskText.current.set(path, content)
           releaseGhost(path) // a stand-in model made for a peek view gives way to the real one
-          const model = monaco.editor.createModel(content, undefined, monaco.Uri.file(path))
-          model.onDidChangeContent(() => {
-            if (programmatic.current.has(path)) return
-            setTabs((ts) => ts.map((t) => (t.path === path ? { ...t, dirty: true } : t)))
-          })
-          setTabs((ts) => [...ts, { path, model, dirty: false }])
+          // Another open of this file may have finished a moment ago, before its tab showed up in tabsRef: then its model
+          // is used instead of making a second one for the same address (which Monaco refuses).
+          let model = monaco.editor.getModel(monaco.Uri.file(path))
+          if (!model) {
+            const made = monaco.editor.createModel(content, undefined, monaco.Uri.file(path))
+            made.onDidChangeContent(() => {
+              if (programmatic.current.has(path)) return
+              setTabs((ts) => ts.map((t) => (t.path === path ? { ...t, dirty: true } : t)))
+            })
+            model = made
+          }
+          const shared = model
+          setTabs((ts) => (ts.some((t) => samePath(t.path) === key) ? ts : [...ts, { path, model: shared, dirty: false }]))
           return path
         })().finally(() => opening.current.delete(key))
         opening.current.set(key, pending)
