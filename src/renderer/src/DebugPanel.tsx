@@ -162,7 +162,7 @@ export function DebugPanel({
       {problems.length > 0 && <div className="chat-error" data-dbg-problems>{problems.join(' ')}</div>}
       <div className="dbg-bar">
         {!active ? (
-          <button className="primary" data-dbg-action="start" disabled={!runnable} title={runnable ? 'Run the open file with the debugger (F5)' : 'Open a .js, .ts, .py, .go, .cs, .c or .cpp file to debug it'} onClick={() => void start()}>
+          <button className="primary" data-dbg-action="start" disabled={!runnable} title={runnable ? 'Run the open file with the debugger (F5)' : 'Open a .js, .ts, .py, .go, .cs, .c, .cpp or .java file to debug it'} onClick={() => void start()}>
             ▶ Start Debugging
           </button>
         ) : (

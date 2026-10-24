@@ -9,6 +9,7 @@ import { findPython, hasDebugpy } from './pythonenv'
 import * as ssh from './sshfs'
 import { NETCOREDBG_HELP, findNetcoredbg } from './netcoredbg'
 import { CPP_HELP, compileCpp, findCppDebugger, isCppSource } from './cpptools'
+import { JAVA_HELP, compileJava, ensureJavaAdapter, findJdk } from './javatools'
 
 // A client for the Debug Adapter Protocol (the protocol VS Code uses to talk to debuggers), and the Python debugger
 // built on it: `python -m debugpy.adapter` is started and driven over stdin/stdout.
@@ -507,7 +508,32 @@ export const cppAdapter: Adapter = {
   }
 }
 
-export const adapterFor = (file: string): Adapter | null => [pythonAdapter, goAdapter, csharpAdapter, cppAdapter].find((a) => a.files.test(file)) ?? null
+// Java: the editor's own adapter (JavaDap.java) compiled with the user's JDK; it starts the program with a debug agent.
+export const javaAdapter: Adapter = {
+  id: 'java',
+  label: 'Java',
+  files: /\.java$/i,
+  async start(opts, emit) {
+    if (ssh.isRemotePath(opts.file)) throw new Error('Java programs on another computer cannot be debugged yet.')
+    const jdk = findJdk()
+    if (!jdk) throw new Error(JAVA_HELP)
+    emit({ type: 'output', stream: 'info', text: `Compiling ${basename(opts.file)}...\n` })
+    const prog = await compileJava(opts.file, jdk.javac)
+    const adapterDir = await ensureJavaAdapter(jdk.javac)
+    const cwd = opts.cwd || dirname(opts.file)
+    const child = spawn(jdk.java, ['-cp', adapterDir, 'JavaDap'], { cwd, env: cleanEnv(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+    let stderr = ''
+    child.stderr?.on('data', (b: Buffer) => (stderr = (stderr + b.toString('utf-8')).slice(-2000)))
+    return {
+      child,
+      io: { input: child.stdout!, output: child.stdin! },
+      stderr: () => stderr,
+      launch: { name: 'Java', request: 'launch', javaExe: jdk.java, mainClass: prog.mainClass, classpath: [prog.classes], sourceRoots: [prog.sourceRoot], args: opts.args ?? [], cwd, env: opts.env ?? {}, stopOnEntry: opts.stopOnEntry === true }
+    }
+  }
+}
+
+export const adapterFor = (file: string): Adapter | null => [pythonAdapter, goAdapter, csharpAdapter, cppAdapter, javaAdapter].find((a) => a.files.test(file)) ?? null
 
 export function startPythonDebug(opts: DebugOptions, emit: (e: DbgEvent) => void): Promise<DapSession> {
   return startDapDebug(pythonAdapter, opts, emit)

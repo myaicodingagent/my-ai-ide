@@ -12,10 +12,15 @@ const stubFile = path.join(root, 'node_modules', '.cache', 'debug-electron-stub.
 const bundleFile = path.join(root, 'node_modules', '.cache', 'debug-bundle.cjs')
 fs.mkdirSync(path.dirname(stubFile), { recursive: true })
 fs.writeFileSync(stubFile, 'module.exports = global.__electronStub')
-require('esbuild').buildSync({
-  entryPoints: [path.join(root, 'src', 'main', 'debugger.ts')],
-  bundle: true, platform: 'node', format: 'cjs', external: ['ws', 'esbuild'], alias: { electron: stubFile }, outfile: bundleFile, logLevel: 'error'
-})
+// The program imports a few files as text (JavaDap.java?raw), which needs an esbuild plugin, so it is built in a child process (plugins need the async API).
+require('child_process').execFileSync(process.execPath, ['-e', `
+const path = require('path'), fs = require('fs')
+const o = JSON.parse(process.argv[1])
+require('esbuild').build({
+  entryPoints: [o.entry], bundle: true, platform: 'node', format: 'cjs', external: ['ws', 'esbuild'], alias: { electron: o.stub }, outfile: o.out, logLevel: 'error',
+  plugins: [{ name: 'raw', setup(b) { b.onResolve({ filter: /[?]raw$/ }, (a) => ({ path: path.resolve(a.resolveDir, a.path.replace(/[?]raw$/, '')), namespace: 'raw' })); b.onLoad({ filter: /.*/, namespace: 'raw' }, (a) => ({ contents: fs.readFileSync(a.path, 'utf-8'), loader: 'text' })) } }]
+}).catch((e) => { console.error(e.message); process.exit(1) })
+`, JSON.stringify({ entry: path.join(root, 'src', 'main', 'debugger.ts'), stub: stubFile, out: bundleFile })], { cwd: root, stdio: 'inherit' })
 const mod = require(bundleFile)
 mod.registerDebugHandlers(() => ({ webContents: { send: (_ch, e) => events.push(e) } }))
 const call = (n, ...a) => handlers[n]({}, ...a)
@@ -512,6 +517,118 @@ const same = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLower
       const cend = await waitEvent((e) => e.type === 'exited', 'c exit')
       check('C: it finishes and prints', cend.code === 0 && /c result 42/.test(events.filter((e) => e.type === 'output').map((e) => e.text).join('')))
       events.length = 0
+    }
+  }
+
+  // --- Java (a JDK; the editor's own debug adapter is built on the JDK's JDI)
+  {
+    events.length = 0
+    const jdir = path.join(dir, 'java app')
+    const pdir = path.join(jdir, 'com', 'demo')
+    fs.mkdirSync(pdir, { recursive: true })
+    const hello = path.join(jdir, 'Hello.java')
+    fs.writeFileSync(hello, [
+      'import java.util.*;',                                                  // 1
+      '',                                                                     // 2
+      'public class Hello {',                                                 // 3
+      '    static int add(int a, int b) {',                                   // 4
+      '        int sum = a + b;',                                             // 5
+      '        return sum;',                                                  // 6
+      '    }',                                                                // 7
+      '    public static void main(String[] args) {',                         // 8
+      '        int total = add(2, 3);',                                       // 9
+      '        List<Integer> list = new ArrayList<>(List.of(1, 2, 3));',      // 10
+      '        String who = args.length > 0 ? args[0] : "-";',                // 11
+      '        System.out.println("java result " + total + " " + who + " " + list.size() + " " + System.getenv("MYV"));', // 12
+      '        System.err.println("to stderr");',                             // 13
+      '    }',                                                                // 14
+      '}',                                                                    // 15
+      ''
+    ].join('\n'))
+    let r = await call('dbg:start', { file: hello, breakpoints: {} })
+    if (r.ok === false && /^Java debugging needs a JDK/.test(r.error)) {
+      console.log('SKIP  Java (no JDK found)')
+    } else {
+      await waitEvent((e) => e.type === 'exited', 'java run to the end')
+      check('Java: a program without breakpoints is compiled and runs to the end', r.ok === true, JSON.stringify(r).slice(0, 300))
+      events.length = 0
+      const bad = path.join(jdir, 'Bad.java')
+      fs.writeFileSync(bad, 'public class Bad { public static void main(String[] a) { int x = "no"; } }\n')
+      r = await call('dbg:start', { file: bad, breakpoints: {} })
+      check('Java: a program that does not compile reports the compiler error', r.ok === false && /did not compile/.test(r.error) && /incompatible types/.test(r.error), JSON.stringify(r).slice(0, 300))
+      const nomain = path.join(jdir, 'Lib.java')
+      fs.writeFileSync(nomain, 'public class Lib { static int one() { return 1; } }\n')
+      r = await call('dbg:start', { file: nomain, breakpoints: {} })
+      check('Java: a file without a main method says so', r.ok === false && /no main method/.test(r.error), JSON.stringify(r))
+      r = await call('dbg:start', { file: hello, args: ['x'], env: { MYV: 'hi' }, breakpoints: { [hello]: [{ line: 5 }] } })
+      check('Java: the program is compiled and started under the debugger', r.ok === true, JSON.stringify(r).slice(0, 300))
+      let p = r.ok ? await paused('java breakpoint') : null
+      check('Java: it stops at the breakpoint in add', !!p && p.reason === 'breakpoint' && p.frames[0].line === 5 && /add/.test(p.frames[0].name) && same(p.frames[0].file, hello), JSON.stringify(p && p.frames[0]))
+      check('Java: the caller is main, at line 9', !!p && /main/.test(p.frames[1].name) && p.frames[1].line === 9, JSON.stringify(p && p.frames[1]))
+      let scopes = await call('dbg:scopes', 0)
+      const names = scopes.flatMap((s) => s.vars).map((v) => v.name + '=' + v.value)
+      check('Java: local variables are shown', names.includes('a=2') && names.includes('b=3'), names.join())
+      let ev = await call('dbg:eval', 'a + b * 2', 0)
+      check('Java: an expression is evaluated in the stopped frame', ev.ok && ev.value.value === '8', JSON.stringify(ev))
+      ev = await call('dbg:eval', 'Math.max(a, b)', 0)
+      check('Java: a static method can be called in an expression', ev.ok && ev.value.value === '3', JSON.stringify(ev))
+      ev = await call('dbg:eval', 'nope + 1', 0)
+      check('Java: a bad expression reports its error', ev.ok === false && /nope/.test(ev.error), JSON.stringify(ev))
+      await call('dbg:stepOver')
+      p = await paused('java step')
+      check('Java: step over goes to the next line', p.frames[0].line === 6, JSON.stringify(p.frames[0]))
+      await call('dbg:stepOut')
+      p = await paused('java step out')
+      check('Java: step out returns to main', /main/.test(p.frames[0].name) && p.frames[0].line >= 9 && p.frames[0].line <= 10, JSON.stringify(p.frames[0]))
+      await call('dbg:setBreakpoints', hello, [{ line: 13 }])
+      await call('dbg:continue')
+      p = await paused('java breakpoint added while stopped')
+      check('Java: a breakpoint added while stopped is used', p.reason === 'breakpoint' && p.frames[0].line === 13, JSON.stringify([p.reason, p.frames[0].line]))
+      scopes = await call('dbg:scopes', 0)
+      const vars = scopes.flatMap((s) => s.vars)
+      check('Java: a list shows its contents, a string its text, a number its value', vars.some((v) => v.name === 'list' && v.value === '[1, 2, 3]') && vars.some((v) => v.name === 'who' && v.value === '"x"') && vars.some((v) => v.name === 'total' && v.value === '5'), JSON.stringify(vars.map((v) => v.name + '=' + v.value)))
+      const argsVar = vars.find((v) => v.name === 'args')
+      const kids = argsVar && argsVar.objectId ? await call('dbg:props', argsVar.objectId) : []
+      check('Java: an array can be expanded', !!argsVar && kids.length === 1 && kids[0].value === '"x"', JSON.stringify([argsVar, kids]))
+      ev = await call('dbg:eval', 'list.size() + total', 0)
+      check('Java: an instance method can be called in an expression', ev.ok && ev.value.value === '8', JSON.stringify(ev))
+      await call('dbg:continue')
+      const end = await waitEvent((e) => e.type === 'exited', 'java exit')
+      const out = events.filter((e) => e.type === 'output').map((e) => e.text).join('')
+      check('Java: it finishes with code 0; the argument, the environment variable and the output arrive', end.code === 0 && /java result 5 x 3 hi/.test(out) && /to stderr/.test(out), JSON.stringify([end.code, out]))
+      check('Java: the debug agent\'s banner is not part of the output', !/Listening for transport/.test(out), out)
+      events.length = 0
+      r = await call('dbg:start', { file: hello, breakpoints: { [hello]: [{ line: 5, condition: 'a == 100' }] } })
+      const end2 = await waitEvent((e) => e.type === 'exited', 'java no stop')
+      check('Java: a conditional breakpoint whose condition is false does not stop it', r.ok && end2.code === 0 && !events.some((e) => e.type === 'paused'))
+      events.length = 0
+      r = await call('dbg:start', { file: hello, breakpoints: { [hello]: [{ line: 5, condition: 'a == 2' }] } })
+      p = await paused('java conditional')
+      check('Java: and one whose condition is true does', p.reason === 'breakpoint' && p.frames[0].line === 5)
+      await call('dbg:stop')
+      await waitEvent((e) => e.type === 'exited', 'java stopped')
+      check('Java: Stop ends the session', true)
+      events.length = 0
+      r = await call('dbg:start', { file: hello, stopOnEntry: true, breakpoints: {} })
+      p = r.ok ? await paused('java entry') : null
+      check('Java: stop on entry stops at the start of main', !!p && /main/.test(p.frames[0].name) && p.frames[0].line >= 8 && p.frames[0].line <= 9, JSON.stringify(p && p.frames[0]))
+      await call('dbg:continue'); await waitEvent((e) => e.type === 'exited', 'java entry exit'); events.length = 0
+      // a program in a package, using another class of its package; breakpoint in the other file
+      const helper = path.join(pdir, 'Greeter.java')
+      const mainP = path.join(pdir, 'App.java')
+      fs.writeFileSync(helper, ['package com.demo;', '', 'public class Greeter {', '    private final String name;', '    public Greeter(String name) { this.name = name; }', '    public String greet() {', '        String msg = "hello " + name;', '        return msg;', '    }', '}', ''].join('\n'))
+      fs.writeFileSync(mainP, ['package com.demo;', '', 'public class App {', '    public static void main(String[] args) {', '        Greeter g = new Greeter("pkg");', '        System.out.println(g.greet());', '        int zero = 0;', '        System.out.println(1 / zero);', '    }', '}', ''].join('\n'))
+      r = await call('dbg:start', { file: mainP, breakpoints: { [helper]: [{ line: 7 }] } })
+      p = r.ok ? await paused('java package breakpoint') : null
+      check('Java: a package program stops at a breakpoint in another file of the package', !!p && /Greeter\.greet/.test(p.frames[0].name) && p.frames[0].line === 7 && same(p.frames[0].file, helper), JSON.stringify(r.ok ? p && p.frames[0] : r))
+      scopes = await call('dbg:scopes', 0)
+      const tv = scopes.flatMap((s) => s.vars).find((v) => v.name === 'this')
+      const tk = tv && tv.objectId ? await call('dbg:props', tv.objectId) : []
+      check('Java: this can be expanded to its fields', !!tv && tk.some((k) => k.name === 'name' && k.value === '"pkg"'), JSON.stringify([tv, tk]))
+      await call('dbg:continue')
+      p = await paused('java exception')
+      check('Java: an uncaught exception stops the program where it happened', p.reason === 'exception' && /ArithmeticException/.test(p.exception || '') && p.frames[0].line === 8 && same(p.frames[0].file, mainP), JSON.stringify([p.reason, p.exception, p.frames[0].line]))
+      await call('dbg:stop'); await waitEvent((e) => e.type === 'exited', 'java exc stop'); events.length = 0
     }
   }
 
