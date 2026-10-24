@@ -70,10 +70,12 @@ const subscribe = (cb: () => void): (() => void) => {
     listeners.delete(cb)
   }
 }
+/** Calls back whenever the list of extensions changes. */
+export const onExtensionsChanged = (cb: () => void): (() => void) => subscribe(cb)
 export const useExtensions = (): ExtRecord[] => useSyncExternalStore(subscribe, () => list)
 export const useExtLog = (): string[] => useSyncExternalStore(subscribe, () => log)
 export const getExtensions = (): ExtRecord[] => list
 
 /** Commands of enabled native extensions, for the palette. */
 export const extensionCommands = (): { extId: string; id: string; title: string; ext: string }[] =>
-  list.filter((e) => e.enabled && (e.native || e.vscode)).flatMap((e) => e.commands.map((c) => ({ extId: e.id, id: c.id, title: c.title, ext: e.displayName })))
+  list.filter((e) => e.enabled && (e.native || e.vscode)).flatMap((e) => e.commands.filter((c) => !(e.hiddenCommands ?? []).includes(c.id)).map((c) => ({ extId: e.id, id: c.id, title: c.title, ext: e.displayName })))

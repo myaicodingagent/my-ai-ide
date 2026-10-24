@@ -39,6 +39,9 @@ export interface ExtRecord {
   containers: { id: string; title: string }[] // extra activity bar entries
   // Menu entries for tree items (contributes.menus["view/item/context"]): what to offer in a node's right-click menu.
   treeMenus: { command: string; title: string; when: string; group: string }[]
+  viewTitleMenus: { command: string; title: string; when: string; group: string }[] // buttons in the header of a view ("view/title")
+  editorMenus: { command: string; title: string; when: string; group: string }[] // entries of the editor's right-click menu ("editor/context")
+  hiddenCommands: string[] // commands the palette must not list ("commandPalette" entries whose when is false)
   unsupported: string[] // contributions that are ignored (grammars, languages, debuggers...)
   codeIgnored: boolean // a VS Code extension with code (main) that cannot run here
   source: 'vsix' | 'registry' | 'folder'
@@ -104,14 +107,17 @@ async function readExtension(dir: string, source: ExtRecord['source']): Promise<
       : []
   const unsupported = Object.keys(c).filter((k) => !SUPPORTED.has(k) && k !== 'menus')
   const menus = (c.menus && typeof c.menus === 'object' ? c.menus : {}) as Record<string, unknown>
-  const otherMenus = Object.keys(menus).filter((k) => k !== 'view/item/context')
+  const otherMenus = Object.keys(menus).filter((k) => !['view/item/context', 'view/title', 'editor/context', 'commandPalette'].includes(k))
   if (otherMenus.length) unsupported.push('menus (' + otherMenus.join(', ') + ')')
   const titleOf = new Map(commands.map((x) => [x.id, x.title]))
-  const treeMenus: ExtRecord['treeMenus'] = vscode && Array.isArray(menus['view/item/context'])
-    ? (menus['view/item/context'] as { command?: unknown; when?: unknown; group?: unknown }[])
-        .filter((x) => x && typeof x.command === 'string')
-        .map((x) => ({ command: x.command as string, title: titleOf.get(x.command as string) ?? (x.command as string), when: typeof x.when === 'string' ? x.when : '', group: typeof x.group === 'string' ? x.group : '' }))
-    : []
+  const menuList = (key: string): ExtRecord['treeMenus'] =>
+    vscode && Array.isArray(menus[key])
+      ? (menus[key] as { command?: unknown; when?: unknown; group?: unknown }[])
+          .filter((x) => x && typeof x.command === 'string')
+          .map((x) => ({ command: x.command as string, title: titleOf.get(x.command as string) ?? (x.command as string), when: typeof x.when === 'string' ? x.when : '', group: typeof x.group === 'string' ? x.group : '' }))
+      : []
+  const treeMenus = menuList('view/item/context')
+  const hiddenCommands = menuList('commandPalette').filter((m) => m.when.trim() === 'false').map((m) => m.command)
   const views: ExtRecord['views'] = []
   if (vscode && c.views && typeof c.views === 'object') {
     for (const [container, arr] of Object.entries(c.views as Record<string, unknown>)) {
@@ -142,6 +148,9 @@ async function readExtension(dir: string, source: ExtRecord['source']): Promise<
     views,
     containers,
     treeMenus,
+    viewTitleMenus: menuList('view/title'),
+    editorMenus: menuList('editor/context'),
+    hiddenCommands,
     unsupported,
     codeIgnored: false,
     source
@@ -714,7 +723,7 @@ async function doStartHost(gen: number): Promise<Host | null> {
   return h
 }
 
-async function runCommand(extId: string, command: string): Promise<{ ok: true } | { ok: false; error: string }> {
+async function runCommand(extId: string, command: string, args: unknown[] = []): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
     const h = (await startHost()) ?? (await startHost()) // once more if a restart overtook the first
     if (!h) return { ok: false, error: 'No extension is running.' }
@@ -722,7 +731,7 @@ async function runCommand(extId: string, command: string): Promise<{ ok: true } 
     const runId = nextRun++
     await new Promise<void>((resolveRun, rejectRun) => {
       h.runs.set(runId, { resolve: resolveRun, reject: rejectRun })
-      h.child.send({ type: 'run', runId, ext: extId, command })
+      h.child.send({ type: 'run', runId, ext: extId, command, args })
     })
     return { ok: true }
   } catch (e) {
@@ -835,7 +844,7 @@ export function registerExtensionHandlers(getWin: () => BrowserWindow | null): v
       h.child.send({ type: 'provide', reqId, providerId, kind, params })
     })
   })
-  ipcMain.handle('ext:run', (_e, extId: string, command: string) => runCommand(extId, command))
+  ipcMain.handle('ext:run', (_e, extId: string, command: string, args?: unknown[]) => runCommand(extId, command, Array.isArray(args) ? args.slice(0, 5) : []))
   ipcMain.handle('ext:log', () => hostLog)
   ipcMain.handle('ext:openFolder', async () => {
     await fs.mkdir(extDir(), { recursive: true })

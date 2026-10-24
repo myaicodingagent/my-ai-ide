@@ -17,8 +17,8 @@ fs.writeFileSync(path.join(proj, 'readme.txt'), 'hello\n')
 fs.writeFileSync(path.join(extDir, 'package.json'), JSON.stringify({
   name: 'demo-tree', publisher: 'local', version: '1.0.0', main: './extension.js', activationEvents: ['*'], engines: { vscode: '^1.85.0' },
   contributes: {
-    commands: [{ command: 'demo.refresh', title: 'Demo: Refresh' }, { command: 'demo.rename', title: 'Rename' }, { command: 'demo.eat', title: 'Eat' }, { command: 'demo.openfolder', title: 'Open Folder' }, { command: 'demo.wave', title: 'Wave' }, { command: 'demo.hidden', title: 'Never Shown' }],
-    menus: { 'view/item/context': [
+    commands: [{ command: 'demo.refresh', title: 'Demo: Refresh' }, { command: 'demo.count', title: 'Demo Count Lines' }, { command: 'demo.pyonly', title: 'Demo Python Only' }, { command: 'demo.rename', title: 'Rename' }, { command: 'demo.eat', title: 'Eat' }, { command: 'demo.openfolder', title: 'Open Folder' }, { command: 'demo.wave', title: 'Wave' }, { command: 'demo.hidden', title: 'Never Shown' }],
+    menus: { 'view/title': [{ command: 'demo.refresh', when: 'view == demo.tree', group: 'navigation' }, { command: 'demo.refresh', when: 'view == other.tree', group: 'navigation' }], 'editor/context': [{ command: 'demo.count', when: 'resourceExtname == .txt', group: 'navigation' }, { command: 'demo.pyonly', when: 'editorLangId == python', group: 'navigation' }], commandPalette: [{ command: 'demo.hidden', when: 'false' }], 'view/item/context': [
       { command: 'demo.eat', when: 'view == demo.tree && viewItem =~ /^(fruit|veg)$/', group: '2_eat@2' },
       { command: 'demo.rename', when: 'view == demo.tree && viewItem == fruit', group: '1_modify@1' },
       { command: 'demo.openfolder', when: "view == demo.tree && viewItem == 'group'", group: 'navigation' },
@@ -61,6 +61,7 @@ exports.activate = (context) => {
   vscode.window.registerTreeDataProvider('demo.scm', { getChildren: () => ['changed-a', 'changed-b'], getTreeItem: (n) => new vscode.TreeItem(n) })
   vscode.window.registerTreeDataProvider('demo.bar', { getChildren: () => ['one', 'two', 'three'], getTreeItem: (n) => new vscode.TreeItem(n) })
   for (const [cmd, word] of [['demo.rename', 'renamed'], ['demo.eat', 'ate'], ['demo.openfolder', 'opened'], ['demo.wave', 'waved']]) context.subscriptions.push(vscode.commands.registerCommand(cmd, (el, all) => vscode.window.showInformationMessage(word + ' ' + el.name + ' of ' + all.length)))
+  context.subscriptions.push(vscode.commands.registerCommand('demo.count', (uri) => vscode.window.showInformationMessage('counted in ' + path.basename(uri.fsPath) + ' / ' + (vscode.window.activeTextEditor ? vscode.window.activeTextEditor.document.lineCount : 'no editor'))))
   context.subscriptions.push(vscode.commands.registerCommand('demo.picked', (name) => vscode.window.showInformationMessage('picked ' + name)))
   context.subscriptions.push(vscode.commands.registerCommand('demo.refresh', () => { tick++; groups.Fruits.push('cherry'); emitter.fire(undefined) }))
 }
@@ -160,6 +161,29 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
   await ev(`document.querySelector('[data-ex-toggle="ext-installed"]').click()`); await sleep(400)
   check('and opens again', await ev(`!!document.querySelector('[data-ex-section="ext-installed"] .ex-body')`))
   await ev(`document.querySelector('[data-view="files"]').click()`); await sleep(800)
+  // ---- view/title: a button in the view's header; commandPalette: a command that is hidden there
+  check('a view/title entry is a button in the header of the view it names (and only that view)', (await ev(`document.querySelectorAll('[data-xt-title-action="demo.refresh"]').length`)) === 1)
+  const ticks = async () => ev(`(document.body.innerText.match(/refreshed ([0-9]+) times/) || [])[1] ?? ''`)
+  const t0 = await ticks()
+  await realClick(`document.querySelector('[data-xt-title-action="demo.refresh"]')`); await sleep(1500)
+  check('clicking it runs the command (the tree reloads)', await waitFor(async () => (await ticks()) !== t0 && (await ticks()) !== ''), `${t0} -> ${await ticks()}`)
+  await ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'p', ctrlKey: true, shiftKey: true, bubbles: true }))`); await sleep(500)
+  await ev(`(() => { const el = document.querySelector('.qp input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, 'Demo'); el.dispatchEvent(new Event('input', { bubbles: true })) })()`); await sleep(500)
+  const palette = await ev(`JSON.stringify([...document.querySelectorAll('.qp-item')].map((i) => i.textContent))`)
+  check('the palette lists the commands of the extension, except the one its commandPalette entry hides', /Demo Count Lines/.test(palette) && /Demo: Refresh/.test(palette) && !/Never Shown/.test(palette), palette)
+  await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }); await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }); await sleep(400)
+  // ---- editor/context: entries in the editor's right-click menu whose when clause fits the open file
+  await ev(`[...document.querySelectorAll('.tree-row')].find((e) => (e.getAttribute('data-tree-path') || '').endsWith('readme.txt'))?.click()`); await sleep(2000)
+  const er = JSON.parse(await ev(`JSON.stringify(document.querySelector('.monaco-editor .view-lines').getBoundingClientRect())`))
+  await mouse(er.left + 60, er.top + 8); await sleep(300)
+  await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'ContextMenu', code: 'ContextMenu', windowsVirtualKeyCode: 93 }); await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'ContextMenu', code: 'ContextMenu', windowsVirtualKeyCode: 93 })
+  await sleep(800)
+  const menuItems = `[...document.querySelectorAll('.shadow-root-host')].flatMap((h) => [...(h.shadowRoot?.querySelectorAll('.monaco-menu .action-label') ?? [])])`
+  const mlabels = await ev(`JSON.stringify(${menuItems}.map((e) => e.textContent.trim()))`)
+  check('the context menu of a .txt file has the entry whose clause matches, and not the Python-only one', /Demo Count Lines/.test(mlabels) && !/Python Only/.test(mlabels), mlabels)
+  const at = JSON.parse(await ev(`(() => { const e = ${menuItems}.find((x) => /Demo Count Lines/.test(x.textContent)); const r = e.getBoundingClientRect(); return JSON.stringify({ x: r.left + r.width / 2, y: r.top + r.height / 2 }) })()`))
+  await mouse(at.x, at.y)
+  check('choosing it runs the command of the extension with the file (a Uri) and the editor it was chosen in', await waitFor(() => ev(`document.body.innerText.includes('counted in readme.txt')`), 15000), await ev(`document.body.innerText.slice(-200)`))
   // the view container of its own
   check('the extension\'s own container has a button in the activity bar', await waitFor(() => ev(`!!document.querySelector('[data-view="xc:demo-bar"]')`)))
   await realClick(`document.querySelector('[data-view="xc:demo-bar"]')`); await sleep(1200)

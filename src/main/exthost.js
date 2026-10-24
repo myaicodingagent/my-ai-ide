@@ -726,7 +726,9 @@ process.on('message', async (msg) => {
     } else if (msg.type === 'run') {
       const fn = handlers.get(msg.ext + ':' + msg.command) || commandRegistry.get(msg.command)
       if (!fn) return process.send({ type: 'done', runId: msg.runId, error: 'The extension did not register the command ' + msg.command + '.' })
-      try { await fn(); process.send({ type: 'done', runId: msg.runId }) } catch (e) { process.send({ type: 'done', runId: msg.runId, error: String(e && e.message || e) }) }
+      // a file given as { $uri: path } reaches the command as a vscode.Uri (what the editor's menus pass)
+      const callArgs = (Array.isArray(msg.args) ? msg.args : []).map((a) => (a && typeof a === 'object' && typeof a.$uri === 'string' ? Uri.file(a.$uri) : a))
+      try { await fn(...callArgs); process.send({ type: 'done', runId: msg.runId }) } catch (e) { process.send({ type: 'done', runId: msg.runId, error: String(e && e.message || e) }) }
     } else if (msg.type === 'response') {
       const w = waiting.get(msg.reqId)
       if (w) { waiting.delete(msg.reqId); msg.error ? w.reject(new Error(msg.error)) : w.resolve(msg.result) }

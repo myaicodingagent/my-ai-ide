@@ -51,7 +51,8 @@ import type { LaunchConfig, TaskDef, TasksInfo } from '../../main/tasks'
 import { expandVars, taskChain } from './tasksRun'
 import { validSshTarget, wslUnc } from '../../main/shellspec'
 import type { ConnectResult } from '../../main/sshfs'
-import { extensionCommands, initExtensions } from './extStore'
+import { extensionCommands, initExtensions, onExtensionsChanged } from './extStore'
+import { attachExtEditorMenus } from './extEditorMenus'
 import { attachDebugEditor, toggleBreakpointAtCaret } from './debugEditor'
 import { attachDebugging, getDebug, initDebug, isActive as debugActive, startDebugging, stepDebug, stopDebugging, clearBreakpoints as clearAllBreakpoints } from './debugStore'
 import { initBackground, needsAttention, useBgTasks } from './bgStore'
@@ -760,8 +761,10 @@ export function App(): JSX.Element {
     const nextEdit = attachNextEdit(ed, () => getSettings().nextEdit)
     const debugDecos = attachDebugEditor(ed)
     const extState = attachExtEditorState(ed, () => focusRef.current === 'main')
+    const extMenus = attachExtEditorMenus(ed, onExtensionsChanged)
     editorRef.current = ed
     return () => {
+      extMenus.dispose()
       extState.dispose()
       debugDecos.dispose()
       nextEdit.dispose()

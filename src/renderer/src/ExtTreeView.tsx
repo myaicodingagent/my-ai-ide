@@ -209,7 +209,10 @@ export function ExtTreeView({ viewId, name, onOpenFile }: { viewId: string; name
   const expandedRef = useRef(expanded)
   expandedRef.current = expanded
   // What the extensions put in a node's menu.
-  const menus = useExtensions().filter((e) => e.enabled && e.views.some((v) => v.id === viewId)).flatMap((e) => e.treeMenus ?? [])
+  const owners = useExtensions().filter((e) => e.enabled && e.views.some((v) => v.id === viewId))
+  const menus = owners.flatMap((e) => e.treeMenus ?? [])
+  // buttons in the view's header ("view/title")
+  const titleButtons = owners.flatMap((e) => (e.viewTitleMenus ?? []).filter((m) => evalWhen(m.when, { view: viewId })).map((m) => ({ ...m, extId: e.id })))
   const [menu, setMenu] = useState<{ x: number; y: number; item: Item } | null>(null)
 
   const load = useCallback(
@@ -270,7 +273,21 @@ export function ExtTreeView({ viewId, name, onOpenFile }: { viewId: string; name
 
   const root = nodes.get(ROOT) ?? []
   return (
-    <Section id={'xt-' + viewId} title={name}>
+    <Section
+      id={'xt-' + viewId}
+      title={name}
+      actions={
+        titleButtons.length ? (
+          <>
+            {titleButtons.map((m) => (
+              <button key={m.extId + m.command} data-xt-title-action={m.command} title={m.title} aria-label={m.title} onClick={() => void window.api.extRun(m.extId, m.command)}>
+                {m.title}
+              </button>
+            ))}
+          </>
+        ) : undefined
+      }
+    >
       <div role="tree" aria-label={name} data-ext-tree={viewId}>
         <TreeRows viewId={viewId} items={root} depth={0} expanded={expanded} onToggle={toggle} onActivate={activate} menus={menus} onMenu={(item, x, y) => entriesFor(menus, viewId, item).some((m) => !isInline(m)) && setMenu({ x, y, item })} onRun={run}>
           {(it) => nodes.get(it.handle)}
