@@ -184,8 +184,8 @@ const toEdits = (edits: Json[] | undefined): monaco.languages.TextEdit[] => (edi
 
 // Results in files that are not open need a model before Monaco can show them (peek views); this makes one that the
 // app drops again when it opens that file for real.
-async function ensureModels(paths: string[]): Promise<void> {
-  for (const p of [...new Set(paths)].slice(0, 20)) {
+async function ensureModels(paths: string[], limit = 20): Promise<void> {
+  for (const p of [...new Set(paths)].slice(0, limit)) {
     const uri = monaco.Uri.file(p)
     if (monaco.editor.getModel(uri)) continue
     try {
@@ -348,14 +348,63 @@ function registerProviders(editorLanguage: string): void {
       if (!res) return { edits: [], rejectReason: 'Nothing can be renamed here.' }
       const byUri: Record<string, Json[]> = res.changes ?? {}
       for (const dc of res.documentChanges ?? []) if (dc.textDocument && dc.edits) byUri[dc.textDocument.uri] = [...(byUri[dc.textDocument.uri] ?? []), ...dc.edits]
+      // Files that are not open are changed through a stand-in model (as peek views use) and written to disk when it changes.
+      const closed = Object.keys(byUri).map((u) => fromServerUri(l, u)).filter((u) => u.scheme === 'file' && !monaco.editor.getModel(u)).map((u) => u.fsPath)
+      if (closed.length > 50) return { edits: [], rejectReason: `The name is used in ${closed.length} files that are not open; renaming that many at once is not supported.` }
+      await ensureModels(closed, 50)
       const edits: monaco.languages.IWorkspaceTextEdit[] = []
+      const others: monaco.editor.ITextModel[] = []
       for (const [uri, list] of Object.entries(byUri)) {
         const target = monaco.editor.getModel(fromServerUri(l, uri))
-        if (!target || ghosts.has(target.uri.toString())) return { edits: [], rejectReason: 'The name is also used in files that are not open. Open them first (renaming across closed files is not supported yet).' }
+        if (!target) return { edits: [], rejectReason: 'The name is also used in a file that could not be read: ' + fromServerUri(l, uri).fsPath }
+        if (ghosts.has(target.uri.toString())) saveWhenChanged(target, l)
         for (const e of list) edits.push({ resource: target.uri, versionId: undefined, textEdit: { range: rangeOf(e.range), text: e.newText } })
+        if (target !== model) others.push(target)
       }
+      linkUndo(model, others)
       return { edits }
     }
+  })
+}
+
+// Monaco keeps one undo history per file, so undoing a rename in the editor that started it would leave the other files renamed.
+// While that editor's history is at the state before the rename (or after it) the other files follow it.
+function linkUndo(main: monaco.editor.ITextModel, others: monaco.editor.ITextModel[]): void {
+  if (!others.length) return
+  const before = main.getAlternativeVersionId()
+  let after = -1
+  const sub = main.onDidChangeContent((e) => {
+    if (main.isDisposed()) return sub.dispose()
+    if (after < 0 && !e.isUndoing && !e.isRedoing) {
+      after = main.getAlternativeVersionId() // the rename itself
+    } else if (e.isUndoing && main.getAlternativeVersionId() === before) {
+      for (const o of others) if (!o.isDisposed()) (o as unknown as { undo(): void }).undo() // the model's own history (not in the public type)
+    } else if (e.isRedoing && main.getAlternativeVersionId() === after) {
+      for (const o of others) if (!o.isDisposed()) (o as unknown as { redo(): void }).redo()
+    } else if (!e.isUndoing && !e.isRedoing) {
+      sub.dispose() // the file was edited after the rename: it no longer leads
+    }
+  })
+}
+
+// A file that is not open, changed by a rename (or by undoing one): written back to disk a moment after its stand-in model changes,
+// and the server is told that the file changed. When the file is opened for real, its tab takes over and this stops.
+const savingGhosts = new Set<string>()
+function saveWhenChanged(model: monaco.editor.ITextModel, l: Live): void {
+  const key = model.uri.toString()
+  if (savingGhosts.has(key)) return
+  savingGhosts.add(key)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const sub = model.onDidChangeContent(() => {
+    if (timer) clearTimeout(timer)
+    timer = setTimeout(() => {
+      if (model.isDisposed() || !ghosts.has(key)) {
+        sub.dispose()
+        savingGhosts.delete(key)
+        return
+      }
+      void window.api.writeFile(model.uri.fsPath, model.getValue()).then(() => window.api.lspNotify(l.server, 'workspace/didChangeWatchedFiles', { changes: [{ uri: sUri(l, model), type: 2 }] })).catch((e) => say(`Could not save ${model.uri.fsPath}: ${e instanceof Error ? e.message : String(e)}`, 'error'))
+    }, 400)
   })
 }
 

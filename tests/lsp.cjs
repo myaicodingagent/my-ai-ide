@@ -36,6 +36,7 @@ write('main.go', [
   '}',                                              // 15
   ''
 ].join('\n'))
+write('other.go', 'package main' + String.fromCharCode(10) + String.fromCharCode(10) + 'func useAdd() int { return add(3, 4) }' + String.fromCharCode(10))
 write('messy.go', 'package main\n\nfunc   twice( n int )int{return n*2}\n')
 write('app.py', 'import os\n\ndef greet(name):\n    """Say hi to someone."""\n    return "hi " + name\n\nclass Box:\n    def size(self):\n        return 1\n\nx = greet("a")\nprint(undefined_name)\n')
 write('lib.rs', 'fn main() {}\n')
@@ -162,10 +163,14 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
     await mouse(sym.x, sym.y); await sleep(300)
     await press('F2', 900)
     check('F2 opens the rename box', await visible('.rename-box, .monaco-editor .rename-input, .rename-input'))
-    await send('Input.insertText', { text: 'plus' }); await sleep(200); await press('Enter', 2500)
-    const after = await text()
+    await send('Input.insertText', { text: 'plus' }); await sleep(200); await press('Enter', 500)
+    const after = (await waitFor(async () => { const t = await text(); return /func plus/.test(t) && /plus\(1, 2\)/.test(t) && t }, 12000, 400)) || (await text())
     check('renaming add to plus changes the definition and the call', /func plus/.test(after) && /plus\(1, 2\)/.test(after) && !/\badd\b/.test(after.replace(/\/\/.*$/gm, '')), after.split('\n').slice(8, 14).join(' | '))
+    // the rename reached a file that was not open, and was written to disk
+    check('the rename also changed a file that is not open (other.go), on disk', await waitFor(() => fs.readFileSync(path.join(proj, 'other.go'), 'utf-8').includes('plus(3, 4)'), 8000, 400), fs.readFileSync(path.join(proj, 'other.go'), 'utf-8'))
+    check('and no tab was opened for it', !(await ev(`[...document.querySelectorAll('.tabs [role="tab"]')].some((t) => t.innerText.trim().startsWith('other.go'))`)))
     await press('Ctrl+Z', 400)
+    check('undoing the rename puts that file back as well', await waitFor(() => fs.readFileSync(path.join(proj, 'other.go'), 'utf-8').includes('add(3, 4)'), 8000, 400), fs.readFileSync(path.join(proj, 'other.go'), 'utf-8'))
     // formatting
     await openFile('messy.go')
     await sleep(3000)
