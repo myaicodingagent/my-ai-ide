@@ -138,6 +138,7 @@ const api = {
     ipcRenderer.on('dbg:event', h)
     return () => ipcRenderer.removeListener('dbg:event', h)
   },
+  nbHtmlPage: (html: string): Promise<string | null> => ipcRenderer.invoke('nb:htmlPage', html),
   nbKernels: (): Promise<KernelInfo[]> => ipcRenderer.invoke('nb:kernels'),
   sshConnect: (address: string, secrets?: { password?: string; passphrase?: string; trust?: string }): Promise<ConnectResult> => ipcRenderer.invoke('ssh:connect', address, secrets),
   sshEnsure: (unc: string, secrets?: { password?: string; passphrase?: string; trust?: string }): Promise<ConnectResult> => ipcRenderer.invoke('ssh:ensure', unc, secrets),

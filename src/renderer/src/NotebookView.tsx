@@ -42,6 +42,34 @@ const dirName = (p: string): string => p.replace(/[\\/][^\\/]*$/, '')
 
 // ---- One output ----
 
+// Outputs that a cell run in this session produced: their HTML may run scripts (plotly, bokeh, maps). What was loaded from a file may not.
+const liveOutputs = new WeakSet<object>()
+
+// HTML from a cell that was just run: a frame that runs scripts but is cut off from the editor (its own address, no access to this page).
+function ScriptedHtmlOutput({ html }: { html: string }): JSX.Element {
+  const ref = useRef<HTMLIFrameElement>(null)
+  const [page, setPage] = useState<string | null>(null)
+  const [height, setHeight] = useState(60)
+  useEffect(() => {
+    let gone = false
+    void window.api.nbHtmlPage(html).then((id) => !gone && setPage(id))
+    return () => {
+      gone = true
+    }
+  }, [html])
+  useEffect(() => {
+    if (!page) return
+    const onMessage = (e: MessageEvent): void => {
+      if (e.source !== ref.current?.contentWindow || !e.data || e.data.__nbHtml !== page || typeof e.data.height !== 'number') return
+      setHeight(Math.max(30, Math.min(2000, Math.ceil(e.data.height) + 4)))
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [page])
+  if (!page) return <div className="nb-html" />
+  return <iframe ref={ref} className="nb-html" data-nb-html-live title="Output" sandbox="allow-scripts" src={`vscode-webview-resource://w/nbhtml/${encodeURIComponent(page)}`} style={{ height }} />
+}
+
 function HtmlOutput({ html }: { html: string }): JSX.Element {
   const ref = useRef<HTMLIFrameElement>(null)
   // The page is shown in a frame that may not run scripts; the frame is sized to its content once loaded.
@@ -83,7 +111,7 @@ function OutputView({ o, session }: { o: NbOutput; session: number | null }): JS
   if (!best) return null
   if (best.mime === 'image/png' || best.mime === 'image/jpeg') return <img className="nb-img" alt="Output" src={`data:${best.mime};base64,${best.value.replace(/\s/g, '')}`} />
   if (best.mime === 'image/svg+xml') return <img className="nb-img" alt="Output" src={`data:image/svg+xml;base64,${btoa(unescape(encodeURIComponent(best.value)))}`} />
-  if (best.mime === 'text/html') return <HtmlOutput html={best.value} />
+  if (best.mime === 'text/html') return liveOutputs.has(o) ? <ScriptedHtmlOutput html={best.value} /> : <HtmlOutput html={best.value} />
   if (best.mime === 'text/markdown') return <div className="nb-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(best.value) }} />
   return <pre className="nb-stream">{best.value}</pre>
 }
@@ -363,7 +391,12 @@ export function NotebookView({
         const at = displayIds.current.get(cellId)?.get(ev.id)
         const old = at === undefined ? undefined : outputs[at]
         if (at === undefined || !old) return
-        outputs = outputs.map((o, i) => (i === at ? { ...o, data: ev.data } : o))
+        outputs = outputs.map((o, i) => {
+          if (i !== at) return o
+          const n = { ...o, data: ev.data }
+          liveOutputs.add(n)
+          return n
+        })
         commit(updateCell(cur, cellId, { outputs }), false)
         return
       }
@@ -373,9 +406,15 @@ export function NotebookView({
         outputs = []
       }
       if (ev.type === 'stream') outputs = appendStream(outputs, ev.name, ev.text)
-      else if (ev.type === 'result') outputs = [...outputs, { output_type: 'execute_result', data: ev.data, metadata: {}, execution_count: cell.execution_count }]
+      else if (ev.type === 'result') {
+        const o = { output_type: 'execute_result' as const, data: ev.data, metadata: {}, execution_count: cell.execution_count }
+        liveOutputs.add(o)
+        outputs = [...outputs, o]
+      }
       else if (ev.type === 'display') {
-        outputs = [...outputs, { output_type: 'display_data', data: ev.data, metadata: {} }]
+        const o = { output_type: 'display_data' as const, data: ev.data, metadata: {} }
+        liveOutputs.add(o)
+        outputs = [...outputs, o]
         if (ev.id) displayIds.current.set(cellId, (displayIds.current.get(cellId) ?? new Map()).set(ev.id, outputs.length - 1))
       }
       else if (ev.type === 'error') outputs = [...outputs, { output_type: 'error', ename: ev.ename, evalue: ev.evalue, traceback: ev.traceback }]

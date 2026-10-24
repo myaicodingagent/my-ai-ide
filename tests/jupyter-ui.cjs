@@ -28,7 +28,8 @@ fs.writeFileSync(path.join(proj, 'w.ipynb'), JSON.stringify({
     cell('c3', ['slider.value = 8']),
     cell('c4', ['from ipywidgets import interact', '@interact(n=(0, 10))', 'def show(n=3):', '    print("n is", n)']),
     cell('c5', ['from IPython.display import display', 'h = display("first", display_id="box")', 'h.update("second")']),
-    cell('c6', ['from IPython.display import clear_output', 'print("p1")', 'clear_output(wait=True)', 'print("p2")'])
+    cell('c6', ['from IPython.display import clear_output', 'print("p1")', 'clear_output(wait=True)', 'print("p2")']),
+    cell('c7', ['from IPython.display import HTML, display', 'display(HTML(\'<div id="x">start</div><script>var d=document.getElementById("x");for(var i=0;i<14;i++){var p=document.createElement("p");p.textContent="line "+i;d.appendChild(p)}</script>\'))'])
   ],
   metadata: { kernelspec: { display_name: 'IDE Test Kernel', language: 'python', name: 'ide-test' }, language_info: { name: 'python' } }, nbformat: 4, nbformat_minor: 5
 }, null, 1))
@@ -102,6 +103,10 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
   check('a display updated by its display_id shows the new text, not the old', await waitFor(async () => { const t = await out(4); return /second/.test(t) && !/first/.test(t) }, 30000), await out(4))
   await realClick(`${cellSel(5)}.querySelector('[data-nb-run]')`)
   check('clear_output(wait=True) leaves only what is printed after it', await waitFor(async () => { const t = await out(5); return /p2/.test(t) && !/p1/.test(t) }, 30000), await out(5))
+  // HTML with scripts (plotly, bokeh...) runs in a frame of its own for a cell that was just run: the script made the page taller
+  await realClick(`${cellSel(6)}.querySelector('[data-nb-run]')`)
+  check('the script in the HTML output of a cell that was just run ran (the frame grew to hold what it added)', await waitFor(async () => (await ev(`${cellSel(6)}.querySelector('[data-nb-html-live]')?.getBoundingClientRect().height ?? 0`)) > 150, 30000), await ev(`${cellSel(6)}.querySelector('[data-nb-outputs]')?.innerHTML.slice(0, 300)`))
+  check('and that frame is cut off from the editor (a sandbox without same-origin access)', (await ev(`${cellSel(6)}.querySelector('[data-nb-html-live]')?.getAttribute('sandbox')`)) === 'allow-scripts')
   const shot = await send('Page.captureScreenshot', { format: 'png' })
   if (process.env.JUPYTER_UI_SHOT) fs.writeFileSync(process.env.JUPYTER_UI_SHOT, Buffer.from(shot.result.data, 'base64'))
   // the notebook file keeps the widget's fallback text, not widget state
@@ -112,6 +117,11 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
   // stopping the kernel
   await ev(`document.querySelector('[data-nb-action="stop"]').click()`)
   check('Stop with nothing running stops the kernel', await waitFor(() => ev(`document.querySelector('[data-nb-status]')?.getAttribute('data-nb-status') === 'stopped'`), 15000))
+  // the same notebook opened again: its saved HTML does not run scripts
+  await ev(`document.querySelector('.tab .close, .tab [data-tab-close]')?.click()`); await sleep(800)
+  await ev(`[...document.querySelectorAll('.tree-row')].find((e) => (e.getAttribute('data-tree-path') || '').endsWith('w.ipynb'))?.click()`)
+  await waitFor(() => ev(`document.querySelectorAll('[data-nb-cell]').length === 7`), 20000)
+  check('after the notebook is opened again, saved HTML is shown without scripts (not in the script-running frame)', await waitFor(() => ev(`!!${cellSel(6)}.querySelector('iframe.nb-html') && !${cellSel(6)}.querySelector('[data-nb-html-live]') && ${cellSel(6)}.querySelector('iframe.nb-html').getAttribute('sandbox') === 'allow-same-origin'`), 20000))
   check('no uncaught errors in the page', errors.length === 0, errors.join(' | '))
   console.log('ipywidgets', widgetsVersion)
   stopApp()

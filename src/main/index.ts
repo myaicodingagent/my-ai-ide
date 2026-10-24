@@ -15,7 +15,7 @@ import { registerBackgroundHandlers, stopAllBackground } from './background'
 import { registerDebugHandlers, stopDebugging } from './debugger'
 import { extensionThemes, registerExtensionHandlers, stopExtensions } from './extensions'
 import { registerTaskHandlers } from './tasks'
-import { registerNotebookHandlers, stopAllKernels } from './notebook'
+import { notebookPage, registerNotebookHandlers, stopAllKernels } from './notebook'
 import { webviewMayRead, webviewPage } from './extensions'
 import { registerLspHandlers, stopAllLanguageServers } from './lsp'
 import * as ssh from './sshfs'
@@ -481,6 +481,10 @@ app.whenReady().then(() => {
     try {
       const parts = new URL(req.url).pathname.split('/')
       const seg = parts[1] ?? ''
+      if (seg === 'nbhtml') {
+        const page = notebookPage(decodeURIComponent(parts[2] ?? ''))
+        return page === null ? new Response('Not found', { status: 404 }) : new Response(page, { headers: { 'content-type': 'text/html; charset=utf-8' } })
+      }
       if (seg === 'page') {
         const html = webviewPage(decodeURIComponent(parts[2] ?? ''))
         return html === null ? new Response('Not found', { status: 404 }) : new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' } })

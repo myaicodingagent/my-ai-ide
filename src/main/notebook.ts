@@ -200,6 +200,19 @@ let nextSession = 1
 let getWinRef: () => BrowserWindow | null = () => null
 const dataDir = (): string => join(app.getPath('userData'), 'notebook')
 
+// HTML that a running cell produced (plotly, bokeh, maps...) is shown in a frame of its own that may run scripts: it is served by the
+// vscode-webview-resource protocol (see index.ts) from this list, and has no access to the editor.
+const htmlPages = new Map<string, string>()
+let nextHtmlPage = 1
+
+export function notebookPage(id: string): string | null {
+  const html = htmlPages.get(id)
+  if (html === undefined) return null
+  // The page tells the editor how tall it is, so the frame can be sized to it.
+  const report = `<script>(function(){var id=${JSON.stringify(id)};function h(){parent.postMessage({__nbHtml:id,height:document.documentElement.scrollHeight},'*')}new ResizeObserver(h).observe(document.documentElement);addEventListener('load',h)})()</script>`
+  return `<!doctype html><meta charset="utf-8"><style>body{margin:0;font:13px system-ui,sans-serif;color:#222;background:#fff;padding:4px 8px}table{border-collapse:collapse}td,th{border:1px solid #ccc;padding:2px 8px}img{max-width:100%}</style>${html}${report}`
+}
+
 export async function availableKernels(): Promise<KernelInfo[]> {
   const out: KernelInfo[] = []
   const py = await findPython()
@@ -303,6 +316,13 @@ function kill(s: Session): void {
 export function registerNotebookHandlers(getWin: () => BrowserWindow | null): void {
   getWinRef = getWin
   ipcMain.handle('nb:kernels', () => availableKernels())
+  ipcMain.handle('nb:htmlPage', (_e, html: string) => {
+    if (typeof html !== 'string' || html.length > 20_000_000) return null
+    const id = String(nextHtmlPage++)
+    htmlPages.set(id, html)
+    if (htmlPages.size > 300) htmlPages.delete(htmlPages.keys().next().value as string) // the oldest goes
+    return id
+  })
   ipcMain.handle('nb:start', (_e, kernel: string, cwd: string) => {
     if (kernel !== 'python' && kernel !== 'javascript' && !/^jupyter:[A-Za-z0-9._-]{1,80}$/.test(String(kernel))) return { ok: false as const, error: 'Unknown kernel.' }
     return startKernel(kernel, cwd || process.cwd())
