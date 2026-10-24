@@ -215,6 +215,8 @@ export function NotebookView({
   const counter = useRef(0)
   const selfEdit = useRef(false)
   const pending = useRef<Set<string>>(new Set()) // cells sent to the kernel and not finished
+  const displayIds = useRef(new Map<string, Map<string, number>>()) // cell -> display_id -> index of that output
+  const clearWait = useRef(new Set<string>()) // cells whose output goes when the next output arrives (clear_output(wait=True))
   const lastD = useRef(0)
   const saveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const rootRef = useRef<HTMLDivElement>(null)
@@ -347,9 +349,35 @@ export function NotebookView({
         })
         return
       }
+      // clear_output(): now, or (wait) with the next output, so a loop that redraws does not flicker
+      if (ev.type === 'clear') {
+        if (ev.wait) clearWait.current.add(cellId)
+        else {
+          outputs = []
+          displayIds.current.delete(cellId)
+        }
+        commit(updateCell(cur, cellId, { outputs }), false)
+        return
+      }
+      if (ev.type === 'update') {
+        const at = displayIds.current.get(cellId)?.get(ev.id)
+        const old = at === undefined ? undefined : outputs[at]
+        if (at === undefined || !old) return
+        outputs = outputs.map((o, i) => (i === at ? { ...o, data: ev.data } : o))
+        commit(updateCell(cur, cellId, { outputs }), false)
+        return
+      }
+      if (clearWait.current.has(cellId) && ev.type !== 'done') {
+        clearWait.current.delete(cellId)
+        displayIds.current.delete(cellId)
+        outputs = []
+      }
       if (ev.type === 'stream') outputs = appendStream(outputs, ev.name, ev.text)
       else if (ev.type === 'result') outputs = [...outputs, { output_type: 'execute_result', data: ev.data, metadata: {}, execution_count: cell.execution_count }]
-      else if (ev.type === 'display') outputs = [...outputs, { output_type: 'display_data', data: ev.data, metadata: {} }]
+      else if (ev.type === 'display') {
+        outputs = [...outputs, { output_type: 'display_data', data: ev.data, metadata: {} }]
+        if (ev.id) displayIds.current.set(cellId, (displayIds.current.get(cellId) ?? new Map()).set(ev.id, outputs.length - 1))
+      }
       else if (ev.type === 'error') outputs = [...outputs, { output_type: 'error', ename: ev.ename, evalue: ev.evalue, traceback: ev.traceback }]
       else if (ev.type === 'done') {
         pending.current.delete(cellId)
@@ -392,6 +420,8 @@ export function NotebookView({
         const cell = next.cells.find((c) => c.id === id)
         if (!cell) continue
         counter.current += 1
+        displayIds.current.delete(id)
+        clearWait.current.delete(id)
         next = updateCell(next, id, { outputs: [], execution_count: counter.current })
         jobs.push({ id, code: cell.source })
       }
@@ -559,7 +589,11 @@ export function NotebookView({
         <button data-nb-action="add-markdown" onClick={() => add('markdown', selected ? 'below' : 'end', selected ?? undefined)}>
           + Text
         </button>
-        <button data-nb-action="clear" onClick={() => commit(clearOutputs(nb))}>
+        <button data-nb-action="clear" onClick={() => {
+            displayIds.current.clear()
+            clearWait.current.clear()
+            commit(clearOutputs(nb))
+          }}>
           Clear Outputs
         </button>
         <span className="nb-spacer" />

@@ -334,8 +334,13 @@ export class JupyterKernel {
         this.hooks.event(run.cell, { type: 'stream', name: c.name === 'stderr' ? 'stderr' : 'stdout', text: String(c.text ?? '') })
         break
       case 'display_data':
+        this.hooks.event(run.cell, { type: 'display', data: mimeBundle(c.data), ...(typeof c.transient?.display_id === 'string' ? { id: c.transient.display_id } : {}) })
+        break
       case 'update_display_data':
-        this.hooks.event(run.cell, { type: 'display', data: mimeBundle(c.data) })
+        if (typeof c.transient?.display_id === 'string') this.hooks.event(run.cell, { type: 'update', id: c.transient.display_id, data: mimeBundle(c.data) })
+        break
+      case 'clear_output':
+        this.hooks.event(run.cell, { type: 'clear', wait: c.wait === true })
         break
       case 'execute_result':
         this.hooks.event(run.cell, { type: 'result', data: mimeBundle(c.data) })

@@ -21,7 +21,9 @@ export interface KernelInfo {
 export type NbEvent =
   | { type: 'stream'; name: 'stdout' | 'stderr'; text: string }
   | { type: 'result'; data: Record<string, string> }
-  | { type: 'display'; data: Record<string, string> }
+  | { type: 'display'; data: Record<string, string>; id?: string } // id: display(..., display_id=...), which update_display_data refers to
+  | { type: 'update'; id: string; data: Record<string, string> }
+  | { type: 'clear'; wait: boolean } // clear_output(); with wait, the output goes when the next output arrives
   | { type: 'error'; ename: string; evalue: string; traceback: string[] }
   | { type: 'input_request'; prompt: string }
   | { type: 'done'; ok: boolean }

@@ -58,6 +58,13 @@ const events = (session, cell) => sent.filter((s) => s.ch === 'nb:event' && s.a[
   check('display() arrives with its HTML', ev.some((e) => e.type === 'display' && /<b>bold<\/b>/.test(e.data['text/html'] || '')), JSON.stringify(ev))
   ev = await run('c5', 'import matplotlib\nmatplotlib.use("module://matplotlib_inline.backend_inline")\nimport matplotlib.pyplot as plt\nplt.plot([1, 2, 3])\nplt.show()', 40000)
   check('a plot arrives as a PNG image', ev.some((e) => e.type === 'display' && /^iVBOR/.test(e.data['image/png'] || '')), JSON.stringify(ev).slice(0, 200))
+  // display(..., display_id=...) with an update, and clear_output
+  ev = await run('c5b', ['from IPython.display import display, HTML, clear_output', 'h = display(HTML("<b>one</b>"), display_id="box1")', 'h.update(HTML("<b>two</b>"))', 'print("before")', 'clear_output(wait=True)', 'print("after")'].join(String.fromCharCode(10)))
+  const dd = ev.find((e) => e.type === 'display')
+  const up = ev.find((e) => e.type === 'update')
+  check('a display with a display_id carries it, and update_display_data names the same one', !!dd && dd.id === 'box1' && /one/.test(dd.data['text/html']) && !!up && up.id === 'box1' && /two/.test(up.data['text/html']), JSON.stringify(ev).slice(0, 300))
+  const ci = ev.findIndex((e) => e.type === 'clear')
+  check('clear_output(wait=True) arrives as a clear that waits, between the two prints', ci > 0 && ev[ci].wait === true && ev[ci - 1].type === 'stream' && /before/.test(ev[ci - 1].text) && ev[ci + 1].type === 'stream' && /after/.test(ev[ci + 1].text), JSON.stringify(ev.map((e) => e.type)))
   // input()
   await call('nb:execute', s, 'c6', 'name = input("name? ")\nprint("hi " + name)')
   const t1 = Date.now()

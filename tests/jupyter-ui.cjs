@@ -26,7 +26,9 @@ fs.writeFileSync(path.join(proj, 'w.ipynb'), JSON.stringify({
     cell('c1', ['import ipywidgets as w', 'from IPython.display import display', 'slider = w.IntSlider(value=5, min=0, max=10, description="Level")', 'clicks = []', 'button = w.Button(description="Press me")', 'button.on_click(lambda b: clicks.append(1))', 'display(slider, button)']),
     cell('c2', ['print("level", slider.value, "clicks", len(clicks))']),
     cell('c3', ['slider.value = 8']),
-    cell('c4', ['from ipywidgets import interact', '@interact(n=(0, 10))', 'def show(n=3):', '    print("n is", n)'])
+    cell('c4', ['from ipywidgets import interact', '@interact(n=(0, 10))', 'def show(n=3):', '    print("n is", n)']),
+    cell('c5', ['from IPython.display import display', 'h = display("first", display_id="box")', 'h.update("second")']),
+    cell('c6', ['from IPython.display import clear_output', 'print("p1")', 'clear_output(wait=True)', 'print("p2")'])
   ],
   metadata: { kernelspec: { display_name: 'IDE Test Kernel', language: 'python', name: 'ide-test' }, language_info: { name: 'python' } }, nbformat: 4, nbformat_minor: 5
 }, null, 1))
@@ -95,6 +97,11 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
   await realClick(`${cellSel(3)}.querySelector('.noUi-handle, [role="slider"]')`)
   await key('ArrowRight', 'ArrowRight', 39)
   check('moving that slider re-runs the function in the kernel and the new output replaces the old', await waitFor(async () => { const t = await ev(`${cellSel(3)}?.querySelector('.nb-widget-output')?.innerText ?? ''`); return /n is 4/.test(t) && !/n is 3/.test(t) }, 20000), await ev(`${cellSel(3)}?.querySelector('.nb-widget-output')?.innerText`))
+  // update_display_data replaces an output, clear_output(wait=True) replaces what was printed
+  await realClick(`${cellSel(4)}.querySelector('[data-nb-run]')`)
+  check('a display updated by its display_id shows the new text, not the old', await waitFor(async () => { const t = await out(4); return /second/.test(t) && !/first/.test(t) }, 30000), await out(4))
+  await realClick(`${cellSel(5)}.querySelector('[data-nb-run]')`)
+  check('clear_output(wait=True) leaves only what is printed after it', await waitFor(async () => { const t = await out(5); return /p2/.test(t) && !/p1/.test(t) }, 30000), await out(5))
   const shot = await send('Page.captureScreenshot', { format: 'png' })
   if (process.env.JUPYTER_UI_SHOT) fs.writeFileSync(process.env.JUPYTER_UI_SHOT, Buffer.from(shot.result.data, 'base64'))
   // the notebook file keeps the widget's fallback text, not widget state
