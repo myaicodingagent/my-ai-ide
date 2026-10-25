@@ -10,6 +10,7 @@ import * as host from './hostenv'
 import { NETCOREDBG_HELP, findNetcoredbg } from './netcoredbg'
 import { CPP_HELP, compileCpp, findCppDebugger, isCppSource } from './cpptools'
 import { JAVA_HELP, compileJava, ensureJavaAdapter, findJdk } from './javatools'
+import { prepareRemoteCpp, prepareRemoteCsharp, prepareRemoteJava, remoteNetcoredbg, remoteTool } from './remotetools'
 
 // A client for the Debug Adapter Protocol (the protocol VS Code uses to talk to debuggers), and the Python debugger
 // built on it: `python -m debugpy.adapter` is started and driven over stdin/stdout.
@@ -486,7 +487,18 @@ export const csharpAdapter: Adapter = {
     }
   },
   async start(opts, emit) {
-    if (host.isRemotePath(opts.file)) throw new Error('C# programs on another computer cannot be debugged yet.')
+    if (host.isRemotePath(opts.file)) {
+      const cwdUnc = opts.cwd || dirname(opts.file)
+      const { debuggerPath, dll, projDir } = await prepareRemoteCsharp(opts.file, cwdUnc, (text) => emit({ type: 'output', stream: 'info', text }))
+      const { child, stderr } = remoteAdapter(cwdUnc, [debuggerPath, '--interpreter=vscode'])
+      return {
+        child,
+        io: { input: child.stdout!, output: child.stdin! },
+        stderr,
+        remote: host.parseRemote(opts.file)?.name,
+        launch: { name: 'C#', type: 'coreclr', request: 'launch', program: dll, args: opts.args ?? [], cwd: opts.cwd ? (host.nativePath(opts.cwd) as string) : projDir, env: opts.env ?? {}, stopAtEntry: opts.stopOnEntry === true }
+      }
+    }
     const dbg = findNetcoredbg()
     if (!dbg) throw new Error(NETCOREDBG_HELP)
     const proj = findProject(dirname(opts.file))
@@ -513,6 +525,14 @@ export const csharpAdapter: Adapter = {
   }
 }
 
+/** A debug adapter started on another computer or in a WSL distribution; its standard input and output carry the protocol. */
+function remoteAdapter(cwdUnc: string, argv: string[]): { child: ChildProcess; stderr: () => string } {
+  const child = host.spawnRemote(cwdUnc, argv, { stdin: true }) as unknown as ChildProcess
+  let stderr = ''
+  child.stderr?.on('data', (b: Buffer) => (stderr = (stderr + b.toString('utf-8')).slice(-2000)))
+  return { child, stderr: () => stderr }
+}
+
 // C and C++: lldb-dap runs the program that the compiler makes from the open source file.
 export const cppAdapter: Adapter = {
   id: 'cppdbg',
@@ -528,7 +548,21 @@ export const cppAdapter: Adapter = {
     }
   },
   async start(opts, emit) {
-    if (host.isRemotePath(opts.file)) throw new Error('C and C++ programs on another computer cannot be debugged yet.')
+    if (host.isRemotePath(opts.file)) {
+      const cwdUnc = opts.cwd || dirname(opts.file)
+      emit({ type: 'output', stream: 'info', text: `Compiling ${basename(opts.file)}...
+` })
+      const { debuggerPath, program } = await prepareRemoteCpp(opts.file, cwdUnc)
+      const { child, stderr } = remoteAdapter(cwdUnc, [debuggerPath])
+      const env = opts.env ?? {}
+      return {
+        child,
+        io: { input: child.stdout!, output: child.stdin! },
+        stderr,
+        remote: host.parseRemote(opts.file)?.name,
+        launch: { name: 'C/C++', request: 'launch', program, args: opts.args ?? [], cwd: host.nativePath(cwdUnc), env: Object.entries(env).map(([k, v]) => `${k}=${v}`), stopOnEntry: opts.stopOnEntry === true }
+      }
+    }
     if (!isCppSource(opts.file)) throw new Error('Open a .c or .cpp file to debug it (a header cannot be run).')
     const dbg = findCppDebugger()
     if (!dbg) throw new Error(CPP_HELP)
@@ -555,7 +589,20 @@ export const javaAdapter: Adapter = {
   label: 'Java',
   files: /\.java$/i,
   async start(opts, emit) {
-    if (host.isRemotePath(opts.file)) throw new Error('Java programs on another computer cannot be debugged yet.')
+    if (host.isRemotePath(opts.file)) {
+      const cwdUnc = opts.cwd || dirname(opts.file)
+      emit({ type: 'output', stream: 'info', text: `Compiling ${basename(opts.file)}...
+` })
+      const prog = await prepareRemoteJava(opts.file, cwdUnc)
+      const { child, stderr } = remoteAdapter(cwdUnc, [prog.java, '-cp', prog.adapterDir, 'JavaDap'])
+      return {
+        child,
+        io: { input: child.stdout!, output: child.stdin! },
+        stderr,
+        remote: host.parseRemote(opts.file)?.name,
+        launch: { name: 'Java', request: 'launch', javaExe: prog.java, mainClass: prog.mainClass, classpath: [prog.classes], sourceRoots: [prog.sourceRoot], args: opts.args ?? [], cwd: host.nativePath(cwdUnc), env: opts.env ?? {}, stopOnEntry: opts.stopOnEntry === true }
+      }
+    }
     const jdk = findJdk()
     if (!jdk) throw new Error(JAVA_HELP)
     emit({ type: 'output', stream: 'info', text: `Compiling ${basename(opts.file)}...\n` })
@@ -576,6 +623,14 @@ export const javaAdapter: Adapter = {
 
 javaAdapter.attach = async (target) => {
   if (!target.port) throw new Error('Give the port the program listens on for a debugger (start it with: java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=5005 ...).')
+  const remoteRoot = (target.roots ?? []).find((r) => host.isRemotePath(r))
+  if (remoteRoot) {
+    // The adapter runs there too, so the program's port is simply 127.0.0.1 for it.
+    const prog = await prepareRemoteJava(null, remoteRoot)
+    const { child, stderr } = remoteAdapter(remoteRoot, [prog.java, '-cp', prog.adapterDir, 'JavaDap'])
+    const sourceRoots = (target.roots ?? []).filter((r) => host.isRemotePath(r)).map((r) => host.nativePath(r) as string)
+    return { child, io: { input: child.stdout!, output: child.stdin! }, stderr, remote: host.parseRemote(remoteRoot)?.name, launch: { name: 'Java attach', request: 'attach', host: '127.0.0.1', port: target.port, sourceRoots } }
+  }
   const jdk = findJdk()
   if (!jdk) throw new Error(JAVA_HELP)
   const adapterDir = await ensureJavaAdapter(jdk.javac)
@@ -593,6 +648,13 @@ javaAdapter.attach = async (target) => {
 // C and C++: lldb-dap attaches to a process by its id. netcoredbg (below) does the same for .NET programs.
 cppAdapter.attach = async (target) => {
   if (!target.pid) throw new Error('Give the id of the process: "pid 1234".')
+  const remoteRoot = (target.roots ?? []).find((r) => host.isRemotePath(r))
+  if (remoteRoot) {
+    const debuggerPath = await remoteTool(remoteRoot, ['lldb-dap', 'lldb-dap-18', 'lldb-dap-17', 'lldb-dap-16', 'lldb-vscode'])
+    if (!debuggerPath) throw new Error('lldb-dap was not found there. ' + CPP_HELP)
+    const { child, stderr } = remoteAdapter(remoteRoot, [debuggerPath])
+    return { child, io: { input: child.stdout!, output: child.stdin! }, stderr, remote: host.parseRemote(remoteRoot)?.name, launch: { name: 'C/C++ attach', request: 'attach', pid: target.pid } }
+  }
   const dbg = findCppDebugger()
   if (!dbg) throw new Error(CPP_HELP)
   const child = spawn(dbg, [], { env: cleanEnv(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
@@ -603,6 +665,11 @@ cppAdapter.attach = async (target) => {
 
 csharpAdapter.attach = async (target) => {
   if (!target.pid) throw new Error('Give the id of the .NET process: "pid 1234".')
+  const remoteRoot = (target.roots ?? []).find((r) => host.isRemotePath(r))
+  if (remoteRoot) {
+    const { child, stderr } = remoteAdapter(remoteRoot, [await remoteNetcoredbg(remoteRoot), '--interpreter=vscode'])
+    return { child, io: { input: child.stdout!, output: child.stdin! }, stderr, remote: host.parseRemote(remoteRoot)?.name, launch: { name: 'C# attach', type: 'coreclr', request: 'attach', processId: target.pid } }
+  }
   const dbg = findNetcoredbg()
   if (!dbg) throw new Error(NETCOREDBG_HELP)
   const child = spawn(dbg, ['--interpreter=vscode'], { env: cleanEnv(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })

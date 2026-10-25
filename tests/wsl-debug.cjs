@@ -127,6 +127,93 @@ async function waitDead(pid, ms = 10000) { const t0 = Date.now(); while (aliveIn
     events.length = 0
   }
 
+  // --- TypeScript (bundled by the editor into the distribution's /tmp, run by the node there, shown at its place in the .ts files)
+  if (has('node')) {
+    wsl(`mkdir -p "${projN}/tsapp/node_modules/tinydep"`)
+    put('tsapp/node_modules/tinydep/index.js', 'module.exports = (s) => "**" + s + "**"\n')
+    put('tsapp/helper.ts', ['export function triple(n: number): number {', '  const t = n * 3', '  return t', '}', ''].join('\n'))
+    put('tsapp/main.ts', ['import { triple } from "./helper"', 'const wrap = require("tinydep")', 'const x: number = triple(2)', 'console.log("ts wsl", wrap(String(x)), process.env.MYVAR)', ''].join('\n'))
+    const mainU = unc(projN + '/tsapp/main.ts'), helperU = unc(projN + '/tsapp/helper.ts')
+    const r = await call('dbg:start', { file: mainU, env: { MYVAR: 'tsenv' }, breakpoints: { [helperU]: [{ line: 2 }] } })
+    check('TypeScript: a program in the distribution is bundled and started under the debugger', r.ok === true, JSON.stringify(r))
+    let p = r.ok ? await paused('ts wsl breakpoint') : null
+    check('TypeScript: it stops at the breakpoint in the .ts file, in the editor\'s address of it', !!p && p.reason === 'breakpoint' && p.frames[0].name === 'triple' && p.frames[0].line === 2 && p.frames[0].file === helperU, JSON.stringify(p && p.frames[0]))
+    await call('dbg:stepOver')
+    p = await paused('ts wsl step')
+    check('TypeScript: stepping follows the source', p.frames[0].line === 3 && p.frames[0].file === helperU, JSON.stringify(p.frames[0]))
+    await call('dbg:setBreakpoints', helperU, [])
+    await call('dbg:continue')
+    const end = await waitEvent((e) => e.type === 'exited', 'ts wsl exit')
+    const out = events.filter((e) => e.type === 'output').map((e) => e.text).join('')
+    check('TypeScript: it ran with the package it imports and finished', end.code === 0 && /ts wsl \*\*6\*\* tsenv/.test(out), JSON.stringify([end.code, out]))
+    events.length = 0
+    await sleep(800)
+    check('TypeScript: the bundle in the distribution is removed afterwards', wsl('ls -d /tmp/ai-ide-debug-* 2>/dev/null | wc -l').stdout.trim() === '0', wsl('ls -d /tmp/ai-ide-debug-*').stdout)
+  }
+
+  // --- C and C++ (compiled in the distribution, debugged by its lldb-dap)
+  if (!has('lldb-dap-18 || command -v lldb-dap') || !has('gcc')) console.log('SKIP  C/C++ in WSL (gcc or lldb are not installed in ' + distro + ')')
+  else {
+    put('prog.c', ['#include <stdio.h>', '#include <stdlib.h>', 'int add(int a, int b) {', '  int s = a + b;', '  return s;', '}', 'int main(void) {', '  int r = add(2, 3);', '  printf("c wsl %d %s\\n", r, getenv("MYVAR"));', '  return 0;', '}', ''].join('\n'))
+    const cU = unc(projN + '/prog.c')
+    const r = await call('dbg:start', { file: cU, env: { MYVAR: 'cenv' }, breakpoints: { [cU]: [{ line: 4 }] } })
+    check('C: a program is compiled in the distribution and starts under lldb-dap', r.ok === true, JSON.stringify(r))
+    const p = r.ok ? await paused('c wsl breakpoint') : null
+    check('C: it stops at the breakpoint in the editor\'s address of the file', !!p && p.reason === 'breakpoint' && p.frames[0].name === 'add' && p.frames[0].line === 4 && p.frames[0].file === cU, JSON.stringify(p && p.frames[0]))
+    const ev = await call('dbg:eval', 'a + b', 0)
+    check('C: expressions are evaluated there', ev.ok && String(ev.value.value).includes('5'), JSON.stringify(ev))
+    await call('dbg:setBreakpoints', cU, [])
+    await call('dbg:continue')
+    const end = await waitEvent((e) => e.type === 'exited', 'c wsl exit')
+    const out = events.filter((e) => e.type === 'output').map((e) => e.text).join('')
+    check('C: it finishes and its output arrives, with the environment variable', end.code === 0 && /c wsl 5 cenv/.test(out), JSON.stringify([end.code, out]))
+    events.length = 0
+    put('bad.c', 'int main(void) { return undefined_thing; }\n')
+    const bad = await call('dbg:start', { file: unc(projN + '/bad.c'), breakpoints: {} })
+    check('C: a compile error is reported readably', bad.ok === false && /did not compile/.test(bad.error) && /undefined_thing/.test(bad.error), JSON.stringify(bad))
+  }
+
+  // --- Java (compiled in the distribution, debugged by the editor's own adapter running there)
+  if (!has('javac')) console.log('SKIP  Java in WSL (no JDK in ' + distro + ')')
+  else {
+    wsl(`mkdir -p "${projN}/jv/demo"`)
+    put('jv/demo/Main.java', ['package demo;', '', 'public class Main {', '  static int add(int a, int b) {', '    int s = a + b;', '    return s;', '  }', '  public static void main(String[] args) {', '    int r = add(2, 3);', '    System.out.println("java wsl " + r + " " + System.getenv("MYVAR"));', '  }', '}', ''].join('\n'))
+    const jU = unc(projN + '/jv/demo/Main.java')
+    const r = await call('dbg:start', { file: jU, env: { MYVAR: 'jenv' }, breakpoints: { [jU]: [{ line: 5 }] } })
+    check('Java: a program is compiled in the distribution and starts under the editor\'s adapter', r.ok === true, JSON.stringify(r))
+    const p = r.ok ? await paused('java wsl breakpoint') : null
+    check('Java: it stops at the breakpoint in the editor\'s address of the file', !!p && p.reason === 'breakpoint' && /add/.test(p.frames[0].name) && p.frames[0].line === 5 && p.frames[0].file === jU, JSON.stringify(p && p.frames[0]))
+    const ev = await call('dbg:eval', 'a + b', 0)
+    check('Java: expressions are evaluated there', ev.ok && String(ev.value.value).includes('5'), JSON.stringify(ev))
+    await call('dbg:setBreakpoints', jU, [])
+    await call('dbg:continue')
+    const end = await waitEvent((e) => e.type === 'exited', 'java wsl exit')
+    const out = events.filter((e) => e.type === 'output').map((e) => e.text).join('')
+    check('Java: it finishes and its output arrives, with the environment variable', end.code === 0 && /java wsl 5 jenv/.test(out), JSON.stringify([end.code, out]))
+    events.length = 0
+  }
+
+  // --- C# (built with the distribution's dotnet, debugged by netcoredbg installed there)
+  if (!has('dotnet') || wsl('test -x "$HOME/.local/share/my-ai-ide/netcoredbg/netcoredbg" || command -v netcoredbg').status !== 0) console.log('SKIP  C# in WSL (dotnet or netcoredbg is not installed in ' + distro + ')')
+  else {
+    wsl(`mkdir -p "${projN}/cs"`)
+    put('cs/app.csproj', '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>\n')
+    put('cs/Program.cs', ['int Add(int a, int b)', '{', '    int s = a + b;', '    return s;', '}', 'var r = Add(2, 3);', 'Console.WriteLine("cs wsl " + r + " " + Environment.GetEnvironmentVariable("MYVAR"));', ''].join('\n'))
+    const csU = unc(projN + '/cs/Program.cs')
+    const r = await call('dbg:start', { file: csU, env: { MYVAR: 'csenv' }, breakpoints: { [csU]: [{ line: 3 }] } })
+    check('C#: a project is built in the distribution and starts under netcoredbg', r.ok === true, JSON.stringify(r))
+    const p = r.ok ? await paused('cs wsl breakpoint') : null
+    check('C#: it stops at the breakpoint in the editor\'s address of the file', !!p && p.reason === 'breakpoint' && p.frames[0].line === 3 && p.frames[0].file === csU, JSON.stringify(p && p.frames[0]))
+    const ev = await call('dbg:eval', 'a + b', 0)
+    check('C#: expressions are evaluated there', ev.ok && String(ev.value.value).includes('5'), JSON.stringify(ev))
+    await call('dbg:setBreakpoints', csU, [])
+    await call('dbg:continue')
+    const end = await waitEvent((e) => e.type === 'exited', 'cs wsl exit', 60000)
+    const out = events.filter((e) => e.type === 'output').map((e) => e.text).join('')
+    check('C#: it finishes and its output arrives, with the environment variable', end.code === 0 && /cs wsl 5 csenv/.test(out), JSON.stringify([end.code, out]))
+    events.length = 0
+  }
+
   // --- attach to programs that are already running in the distribution (the open folder says which machine the port / pid is on)
   const bg = []
   const startBg = (script) => { const c = cp.spawn('wsl.exe', ['-d', distro, '--user', 'root', '--exec', 'sh', '-c', script], { stdio: 'ignore', windowsHide: true }); bg.push(c); return c }
@@ -183,6 +270,44 @@ async function waitDead(pid, ms = 10000) { const t0 = Date.now(); while (aliveIn
     await waitEvent((e) => e.type === 'exited', 'py attach exit')
     check('Python attach: the program keeps running after Stop', aliveIn(pid3))
     killIn(pid3)
+    events.length = 0
+  }
+  if (has('javac')) {
+    wsl(`mkdir -p "${projN}/jloop"`)
+    put('jloop/Loop.java', ['public class Loop {', '  static int tick(int n) {', '    return n + 1;', '  }', '  public static void main(String[] a) throws Exception {', '    int n = 0;', '    while (n < 600) { n = tick(n); Thread.sleep(200); }', '  }', '}', ''].join('\n'))
+    const lU = unc(projN + '/jloop/Loop.java')
+    const built = wsl(`cd "${projN}/jloop" && javac -g Loop.java 2>&1`)
+    startBg(`cd "${projN}/jloop" && echo $$ > ${dir}/jl.pid && exec java -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=127.0.0.1:5694 Loop`)
+    const pidJ = await pidOf(dir + '/jl.pid')
+    await sleep(2000)
+    const r = await call('dbg:attach', { language: 'java', port: 5694, roots: [unc(projN + '/jloop')], breakpoints: { [lU]: [{ line: 3 }] } })
+    check('Java attach: a program started with a JDWP agent in the distribution is attached to by port', r.ok === true, JSON.stringify(r) + built.stdout)
+    const p = r.ok ? await paused('java attach breakpoint') : null
+    check('Java attach: it stops at the breakpoint in the editor\'s address of the file', !!p && /tick/.test(p.frames[0].name) && p.frames[0].line === 3 && p.frames[0].file === lU, JSON.stringify(p && p.frames[0]))
+    await call('dbg:setBreakpoints', lU, [])
+    await call('dbg:continue')
+    await call('dbg:stop')
+    await waitEvent((e) => e.type === 'exited', 'java attach exit')
+    check('Java attach: the program keeps running after Stop', aliveIn(pidJ))
+    killIn(pidJ)
+    events.length = 0
+  }
+  if (has('gcc') && has('lldb-dap-18 || command -v lldb-dap')) {
+    put('cloop.c', ['#include <unistd.h>', 'int tick(int n) {', '  return n + 1;', '}', 'int main(void) {', '  int n = 0;', '  while (n < 600) { n = tick(n); usleep(200000); }', '  return 0;', '}', ''].join('\n'))
+    const cU = unc(projN + '/cloop.c')
+    wsl(`cd "${projN}" && gcc -g -O0 cloop.c -o cloop`)
+    startBg(`cd "${projN}" && echo $$ > ${dir}/cl.pid && exec ./cloop`)
+    const pidC = await pidOf(dir + '/cl.pid')
+    const r = await call('dbg:attach', { language: 'cpp', pid: pidC, roots: [unc(projN)], breakpoints: { [cU]: [{ line: 3 }] } })
+    check('C attach: a running program in the distribution is attached to by process id', r.ok === true, JSON.stringify(r))
+    const p = r.ok ? await paused('c attach breakpoint') : null
+    check('C attach: it stops at the breakpoint in the editor\'s address of the file', !!p && p.frames[0].name === 'tick' && p.frames[0].line === 3 && p.frames[0].file === cU, JSON.stringify(p && p.frames[0]))
+    await call('dbg:setBreakpoints', cU, [])
+    await call('dbg:continue')
+    await call('dbg:stop')
+    await waitEvent((e) => e.type === 'exited', 'c attach exit')
+    check('C attach: the program keeps running after Stop', aliveIn(pidC))
+    killIn(pidC)
     events.length = 0
   }
   if (has('dlv') && has('go')) {

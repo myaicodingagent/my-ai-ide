@@ -10,6 +10,7 @@ import { installNetcoredbg } from './netcoredbg'
 import { DapSession, adapterFor, cppAdapter, csharpAdapter, goAdapter, javaAdapter, killTree, pythonAdapter, startDapAttach, startDapDebug } from './dap'
 import * as host from './hostenv'
 import { isRemotePath } from './hostenv'
+import { wslLocation } from './shellspec'
 
 // A JavaScript debugger: the program runs under `node --inspect-brk` and this talks to Node's built-in inspector
 // (the Chrome DevTools protocol) over a WebSocket. One session at a time.
@@ -165,7 +166,7 @@ async function applyBreakpoints(s: Session, file: string, bps: DbgBreakpoint[]):
         if (!g) continue // nothing on or after that line becomes code
         lineNumber = g.line
         columnNumber = g.column
-        urlRegex = urlRegexFor(s.ts.jsFile)
+        urlRegex = s.remote ? urlRegexForNative(host.nativePath(s.ts.jsFile) as string) : urlRegexFor(s.ts.jsFile)
       }
       const r = await send<{ breakpointId: string }>(s, 'Debugger.setBreakpointByUrl', {
         lineNumber,
@@ -275,12 +276,13 @@ function esbuildBinary(): string | undefined {
 }
 
 /** Turns a TypeScript program into one JavaScript file with a source map (packages stay as imports, found at run time). */
-async function bundleTs(entry: string, cwd: string): Promise<{ jsFile: string; index: SourceMapIndex; dir: string }> {
+async function bundleTs(entry: string, cwd: string, outRoot?: string): Promise<{ jsFile: string; index: SourceMapIndex; dir: string }> {
   const bin = esbuildBinary()
   if (bin && !process.env.ESBUILD_BINARY_PATH) process.env.ESBUILD_BINARY_PATH = bin
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const esbuild = require('esbuild') as typeof import('esbuild')
-  const dir = await fsp.mkdtemp(join(tmpdir(), 'ai-ide-debug-'))
+  // For a program in a WSL distribution the bundle is written into that distribution (its /tmp), where its node can run it.
+  const dir = await fsp.mkdtemp(join(outRoot ?? tmpdir(), 'ai-ide-debug-'))
   const jsFile = join(dir, 'program.js')
   await esbuild.build({
     entryPoints: [entry],
@@ -310,7 +312,7 @@ async function start(opts: {
   if (session && !session.exited) return { ok: false, error: 'A debug session is already running. Stop it first.' }
   const remote = isRemotePath(opts.file) ? host.parseRemote(opts.file)?.name : undefined
   if (remote) {
-    if (TS_FILE.test(opts.file)) return { ok: false, error: 'TypeScript programs on another computer cannot be debugged yet. Compile it there and debug the JavaScript file.' }
+    if (TS_FILE.test(opts.file) && !wslLocation(opts.file)) return { ok: false, error: 'TypeScript programs on another computer cannot be debugged yet. Compile it there and debug the JavaScript file.' }
     try {
       await host.requireFile(opts.file)
     } catch (e) {
@@ -323,7 +325,7 @@ async function start(opts: {
   let program = opts.file
   if (TS_FILE.test(opts.file)) {
     try {
-      ts = await bundleTs(opts.file, cwd)
+      ts = await bundleTs(opts.file, cwd, remote ? host.remoteUnc(remote, '/tmp') : undefined)
       program = ts.jsFile
     } catch (e) {
       const errs = (e as { errors?: { text: string; location?: { file: string; line: number } }[] }).errors
@@ -340,7 +342,13 @@ async function start(opts: {
   try {
     if (remote) {
       // On the other computer: its own node, started over SSH; the debugger port is reached through the same connection.
-      child = host.spawnRemote(cwd, ['node', '--inspect-brk=127.0.0.1:0', host.nativePath(opts.file) as string, ...(opts.args ?? [])], { env: opts.env }) as unknown as ChildProcess
+      // (a TypeScript program runs from its bundle; the packages it imports are looked for next to the program, as for a local one)
+      const remotePath: string[] = []
+      for (let d = host.nativePath(cwd) as string; ; d = d.slice(0, d.lastIndexOf('/')) || '/') {
+        remotePath.push((d === '/' ? '' : d) + '/node_modules')
+        if (d === '/') break
+      }
+      child = host.spawnRemote(cwd, ['node', '--inspect-brk=127.0.0.1:0', host.nativePath(program) as string, ...(opts.args ?? [])], { env: { ...(ts ? { NODE_PATH: remotePath.join(':') } : {}), ...(opts.env ?? {}) } }) as unknown as ChildProcess
     } else
     child = spawn(file, ['--inspect-brk=127.0.0.1:0', program, ...(opts.args ?? [])], {
       cwd,
