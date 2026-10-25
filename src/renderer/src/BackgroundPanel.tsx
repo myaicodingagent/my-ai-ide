@@ -60,6 +60,7 @@ function Card({
         <span className="bg-pill" data-bg-pill>
           {STATUS_LABEL[t.status]}
         </span>
+        {t.cloud && <span className="bg-pill" data-bg-cloud-pill title="Runs on the server of the project">☁ there</span>}
         <span className="bg-time">{elapsed(t)}</span>
       </div>
       <div className="bg-task" title={t.task}>
@@ -152,6 +153,10 @@ export function BackgroundPanel({
   const [model, setModel] = useState(getSettings().defaultModel)
   const [error, setError] = useState<string | null>(null)
   const [starting, setStarting] = useState(false)
+  // On a folder over SSH or in WSL the agent can run on that machine and go on without the editor.
+  const [cloud, setCloud] = useState(false)
+  const [policy, setPolicy] = useState<'ask' | 'auto' | 'deny'>('ask')
+  const remote = !!root && /^\\\\ssh[.]/i.test(root)
   const box = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => initBackground(), [])
@@ -163,7 +168,11 @@ export function BackgroundPanel({
     setStarting(true)
     setError(null)
     try {
-      const r = await window.api.bgStart(root, task, model)
+      const opts = remote && cloud ? { cloud: true, policy } : undefined
+      let r = await window.api.bgStart(root, task, model, opts)
+      if (!r.ok && r.needsKey !== undefined && window.confirm(`The agent runs on the other machine, which has no Anthropic API key of its own. Send your key to ${r.needsKey ? 'it' : 'that machine'} for this task? It is kept in a private file there until the task ends, then deleted.`)) {
+        r = await window.api.bgStart(root, task, model, { ...opts, sendKey: true })
+      }
       if (!r.ok) return setError(r.error)
       setText('')
     } catch (e) {
@@ -214,6 +223,20 @@ export function BackgroundPanel({
             {starting ? 'Starting…' : 'Start'}
           </button>
         </div>
+        {remote && (
+          <div className="bg-new-row" data-bg-cloud-row>
+            <label title="The agent runs on that machine and goes on when the editor is closed or this PC sleeps">
+              <input type="checkbox" data-bg-cloud checked={cloud} onChange={(e) => setCloud(e.target.checked)} /> Keep running on the server
+            </label>
+            {cloud && (
+              <select value={policy} data-bg-policy onChange={(e) => setPolicy(e.target.value as 'ask' | 'auto' | 'deny')} title="What the agent does when it wants to run a command">
+                <option value="ask">Ask before commands</option>
+                <option value="auto">Run commands</option>
+                <option value="deny">No commands</option>
+              </select>
+            )}
+          </div>
+        )}
         {error && <div className="chat-error" data-bg-error>{error}</div>}
       </div>
       {mine.length === 0 && (

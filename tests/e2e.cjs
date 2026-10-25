@@ -1132,6 +1132,7 @@ function removeTestHistory() {
     const bgCards = () => c.ev(`[...document.querySelectorAll('[data-bg-card]')].map(e => e.dataset.bgStatus)`)
     await c.ev(`document.querySelector('[data-view="agents"]').click()`)
     check('the Agents view explains how background tasks work', await waitFor(() => c.ev(`/Apply to my files/.test(document.querySelector('[data-bg-panel]')?.textContent || '')`), 'agents panel'))
+    check("a local folder has no option to run the agent on a server", await c.ev(`!document.querySelector("[data-bg-cloud]")`))
     await typeInto('[data-bg-input]', 'Create bg-created.txt and rename the greeting in hello.txt')
     await c.ev(`document.querySelector('[data-bg-start]').click()`)
     check('Start adds a task card', await waitFor(async () => (await bgCards()).length === 1, 'card appears').catch(async () => { console.log('DEBUG bg start error:', await c.ev(`document.querySelector('[data-bg-error]')?.textContent`), '| root:', await c.ev(`document.querySelector('.tree-root')?.title`)); return false }))
@@ -1998,6 +1999,12 @@ function removeTestHistory() {
     await c.ev(`document.querySelectorAll('.sidebar-views button')[1].click()`)
     await typeInput('.search-box input', 'needle-in-the-remote')
     check('Find in files searches the other computer', await waitFor(() => c.ev(`[...document.querySelectorAll('.search-hit')].some(h => /needle-in-the-remote/.test(h.textContent))`), 'remote search', 15000))
+    // Agents in a folder on a server: the option to keep the agent running there
+    await c.ev(`document.querySelector('[data-view="agents"]').click()`)
+    check('in a folder over SSH the Agents view offers to keep the agent running on the server', await waitFor(() => c.ev(`!!document.querySelector('[data-bg-cloud]')`), 'cloud option'))
+    await c.ev(`document.querySelector('[data-bg-cloud]').click()`)
+    check('and then asks what to do with commands', await waitFor(() => c.ev(`!!document.querySelector('[data-bg-policy]') && document.querySelector('[data-bg-policy]').value === 'ask'`), 'policy select'))
+    await c.ev(`document.querySelectorAll('.sidebar-views button')[1].click()`)
     // Search by meaning (the ✦ toggle) in the folder on the other computer
     fs.writeFileSync(path.join(sshRoot, 'home', 'tester', 'proj', 'sub', 'ledger.ts'), 'export function reconcileLedgerEntries(rows: Row[]) {\n  return rows.filter(r => r.open)\n}\n')
     await c.ev(`document.querySelector('[data-search-semantic]').click()`)

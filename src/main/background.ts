@@ -6,6 +6,15 @@ import { runGit } from './git'
 import * as host from './hostenv'
 import { isRemotePath } from './hostenv'
 import { AgentEvent, resetSession, runAgentTask } from './agent'
+import { loadKey } from './ai'
+import * as cloud from './cloud'
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+const BG_EXTRA =
+  '\n\nThis is a background task. You are working in an isolated copy of the project (a git worktree on its own branch), so your edits are applied immediately and the user reviews the whole result afterwards. ' +
+  'Nobody is watching: do not ask questions, make reasonable assumptions and say which you made. Untracked files were copied in, and node_modules (if the project has one) is linked to the original, so do not reinstall or modify packages. ' +
+  'Finish with a short summary of what you changed and anything the user should check.'
 
 // Background agents: a task is handed to the agent, which works on its own copy of the project (a git worktree on
 // its own branch) while you keep editing. Nothing touches your files until you review the result and apply it.
@@ -39,6 +48,7 @@ export interface BgTask {
   waitCommand?: string
   files: { status: string; rel: string; orig?: string }[]
   committed: boolean
+  cloud?: cloud.CloudRun // set when the agent runs on the machine of the project (a "cloud" agent): where its task folder is
 }
 
 const MAX_RUNNING = 3
@@ -62,7 +72,11 @@ async function load(): Promise<void> {
     const list = JSON.parse(await fs.readFile(stateFile(), 'utf-8')) as BgTask[]
     for (const t of Array.isArray(list) ? list : []) {
       if (!t || typeof t.id !== 'string') continue
-      if (t.status === 'running' || t.status === 'waiting') {
+      if (t.cloud && (t.status === 'running' || t.status === 'waiting')) {
+        // It was running on its own machine and still is: the editor reconnects to it (see bg:list).
+        t.activity = 'Reconnecting…'
+        tasks.set(t.id, t)
+      } else if (t.status === 'running' || t.status === 'waiting') {
         t.status = 'failed'
         t.error = 'The app was closed while this was running. What it had done so far is kept on its branch.'
         t.waitId = undefined
@@ -206,12 +220,31 @@ async function seedWorktree(top: string, worktree: string, base: string): Promis
 /** A path below a folder on the other computer, in the editor's form. */
 const remoteChild = (dirUnc: string, rel: string): string => dirUnc.replace(/\\+$/, '') + '\\' + rel.replace(/\//g, '\\')
 
-async function start(root: string, taskText: string, model: string): Promise<{ ok: true; task: BgTask } | { ok: false; error: string }> {
+async function start(root: string, taskText: string, model: string, opts: StartOptions = {}): Promise<{ ok: true; task: BgTask } | { ok: false; error: string; needsKey?: string }> {
   await load()
   const remote = isRemotePath(root) ? (host.parseRemote(root)?.name as string) : null
+  // (a WSL distribution is no place for it: it is on this PC, and it ends the processes it started when the session that started them ends)
+  if (opts.cloud && (!remote || remote.startsWith('wsl:'))) return { ok: false, error: 'A cloud agent runs on a server: open a folder over SSH first.' }
   const running = [...tasks.values()].filter((t) => t.status === 'running' || t.status === 'waiting').length
   if (running >= MAX_RUNNING) return { ok: false, error: `${MAX_RUNNING} background agents are already working. Wait for one to finish or stop it.` }
   if (!taskText.trim()) return { ok: false, error: 'Describe the task first.' }
+
+  // A cloud agent: check the machine first (Node.js, the runner copied over) and whether the model key has to be brought along.
+  let begin: CloudBegin | undefined
+  if (opts.cloud) {
+    try {
+      const d = await cloud.deploy(root)
+      let key: string | null = null
+      if (!d.hasKey) {
+        key = await loadKey()
+        if (!key) return { ok: false, error: 'A cloud agent needs your own Anthropic API key: add it in the Chat tab, or set ANTHROPIC_API_KEY on that machine.' }
+        if (!opts.sendKey) return { ok: false, error: 'The key has to be sent to that machine.', needsKey: remote ?? '' }
+      }
+      begin = { d, key, policy: opts.policy ?? 'ask' }
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) }
+    }
+  }
 
   const top = await runGit(root, ['rev-parse', '--show-toplevel'])
   if (top.code === -1 && remote) return { ok: false, error: top.stderr.trim() || 'Could not reach the other computer.' }
@@ -270,11 +303,64 @@ async function start(root: string, taskText: string, model: string): Promise<{ o
   }
   tasks.set(id, t)
   push(t, true)
-  void run(t)
+  void run(t, begin)
   return { ok: true, task: t }
 }
 
-async function run(t: BgTask): Promise<void> {
+export interface StartOptions {
+  cloud?: boolean // run the agent on the machine of the project, detached, so it goes on without the editor
+  policy?: cloud.CloudPolicy // what a cloud agent does with a command it wants to run: ask (default), run it, or refuse
+  sendKey?: boolean // the user agreed to send the model key to that machine
+}
+
+interface CloudBegin {
+  d: Awaited<ReturnType<typeof cloud.deploy>>
+  key: string | null
+  policy: cloud.CloudPolicy
+}
+
+/** Runs the task on the machine of the project and passes what the runner reports on as agent events, until it ends. */
+async function runCloudAgent(t: BgTask, send: (e: AgentEvent) => void, signal: AbortSignal, begin?: CloudBegin): Promise<void> {
+  const where = t.agentRoot
+  if (!t.cloud) {
+    if (!begin) throw new Error('The cloud task has no task folder.')
+    t.cloud = await cloud.startRunner(where, begin.d, { id: t.id, task: t.task, model: t.model, root: host.nativePath(t.agentRoot) as string, policy: begin.policy, maxSteps: BG_STEPS, extraSystem: BG_EXTRA }, begin.key)
+    push(t, true)
+  }
+  let stopSentAt = 0
+  let lostSince = 0
+  for (;;) {
+    if (signal.aborted && !stopSentAt) {
+      stopSentAt = Date.now()
+      await cloud.requestStop(where, t.cloud).catch(() => undefined)
+    }
+    const r = await cloud.poll(where, t.cloud)
+    if (!r) {
+      lostSince ||= Date.now()
+      t.activity = 'Waiting for the connection…'
+      push(t)
+      if (stopSentAt && Date.now() - stopSentAt > 120_000) return
+      await sleep(3000)
+      continue
+    }
+    if (lostSince) {
+      lostSince = 0
+      t.activity = ''
+    }
+    for (const ev of r.events) send(ev.e)
+    t.cloud.offset = r.offset
+    save()
+    const st = r.status
+    if (st && st.state !== 'running' && st.state !== 'waiting' && r.events.length === 0) {
+      if (st.state === 'failed') throw new Error(st.error || 'The agent failed.')
+      return
+    }
+    if (stopSentAt && Date.now() - stopSentAt > 90_000) return
+    await sleep(r.events.length ? 250 : 1500)
+  }
+}
+
+async function run(t: BgTask, begin?: CloudBegin): Promise<void> {
   const controller = new AbortController()
   controllers.set(t.id, controller)
   let current = ''
@@ -314,7 +400,8 @@ async function run(t: BgTask): Promise<void> {
     push(t, e.type === 'command_request' || e.type === 'tool_end')
   }
   try {
-    await runAgentTask(
+    if (t.cloud || begin) await runCloudAgent(t, send, controller.signal, begin)
+    else await runAgentTask(
       {
         runId: t.runId,
         sessionId: 'bg-' + t.id,
@@ -323,10 +410,7 @@ async function run(t: BgTask): Promise<void> {
         task: t.task,
         autoApproveEdits: true,
         maxSteps: BG_STEPS,
-        extraSystem:
-          '\n\nThis is a background task. You are working in an isolated copy of the project (a git worktree on its own branch), so your edits are applied immediately and the user reviews the whole result afterwards. ' +
-          'Nobody is watching: do not ask questions, make reasonable assumptions and say which you made. Untracked files were copied in, and node_modules (if the project has one) is linked to the original, so do not reinstall or modify packages. ' +
-          'Finish with a short summary of what you changed and anything the user should check.'
+        extraSystem: BG_EXTRA
       },
       send,
       controller.signal
@@ -417,6 +501,7 @@ async function discard(t: BgTask): Promise<void> {
   }
   await runGit(cwd, ['worktree', 'prune'])
   await runGit(cwd, ['branch', '-D', t.branch])
+  if (t.cloud) await cloud.forget(t.top, t.cloud).catch(() => undefined) // its task folder on the machine
   resetSession('bg-' + t.id)
   tasks.delete(t.id)
   save()
@@ -431,10 +516,23 @@ export function registerBackgroundHandlers(getWin: () => BrowserWindow | null): 
     for (const t of tasks.values()) {
       const name = isRemotePath(t.root) ? host.parseRemote(t.root)?.name : undefined
       if (name && live.has(name) && !t.committed && t.status === 'failed') void commitAndList(t)
+      // A cloud agent that went on while the editor was closed: pick up where its events were left.
+      if (t.cloud && (t.status === 'running' || t.status === 'waiting') && !controllers.has(t.id) && name && live.has(name)) void run(t)
     }
     return [...tasks.values()].sort((a, b) => b.started - a.started)
   })
-  ipcMain.handle('bg:start', (_e, root: string, task: string, model: string) => start(root, String(task ?? ''), String(model ?? '')))
+  ipcMain.handle('bg:start', (_e, root: string, task: string, model: string, opts?: StartOptions) =>
+    start(root, String(task ?? ''), String(model ?? ''), {
+      cloud: opts?.cloud === true,
+      sendKey: opts?.sendKey === true,
+      policy: opts?.policy === 'auto' || opts?.policy === 'deny' ? opts.policy : 'ask'
+    })
+  )
+  // A cloud agent that waits for permission to run a command: the answer goes to its machine.
+  ipcMain.on('agent:approve', (_e, runId: number, id: string, ok: boolean) => {
+    const t = [...tasks.values()].find((x) => x.runId === runId && x.cloud && x.waitId === id)
+    if (t?.cloud) void cloud.answer(t.agentRoot, t.cloud, id, ok === true)
+  })
   ipcMain.handle('bg:stop', (_e, id: string) => {
     controllers.get(id)?.abort()
   })
@@ -452,5 +550,6 @@ export function registerBackgroundHandlers(getWin: () => BrowserWindow | null): 
 
 /** Called when the app is closing: running tasks are stopped (their work so far is saved by the next start). */
 export function stopAllBackground(): void {
-  for (const c of controllers.values()) c.abort()
+  // (a cloud agent is not stopped: it goes on without the editor, and is picked up again at the next start)
+  for (const [id, c] of controllers) if (!tasks.get(id)?.cloud) c.abort()
 }

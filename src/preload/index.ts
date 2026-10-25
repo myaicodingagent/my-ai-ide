@@ -217,8 +217,8 @@ const api = {
     return () => ipcRenderer.removeListener('ext:log', h)
   },
   bgList: (): Promise<BgTask[]> => ipcRenderer.invoke('bg:list'),
-  bgStart: (root: string, task: string, model: string): Promise<{ ok: true; task: BgTask } | { ok: false; error: string }> =>
-    ipcRenderer.invoke('bg:start', root, task, model),
+  bgStart: (root: string, task: string, model: string, opts?: { cloud?: boolean; policy?: 'ask' | 'auto' | 'deny'; sendKey?: boolean }): Promise<{ ok: true; task: BgTask } | { ok: false; error: string; needsKey?: string }> =>
+    ipcRenderer.invoke('bg:start', root, task, model, opts),
   bgStop: (id: string): Promise<void> => ipcRenderer.invoke('bg:stop', id),
   bgFileDiff: (id: string, rel: string, orig?: string): Promise<{ original: string; modified: string; abs: string }> =>
     ipcRenderer.invoke('bg:fileDiff', id, rel, orig),
