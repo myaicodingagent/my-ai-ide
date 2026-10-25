@@ -114,6 +114,14 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
   await waitFor(() => /widget-view/.test(fs.readFileSync(path.join(proj, 'w.ipynb'), 'utf-8')), 8000)
   const saved = fs.readFileSync(path.join(proj, 'w.ipynb'), 'utf-8')
   check('the saved notebook has the widget as an output with a text fallback', /application\/vnd\.jupyter\.widget-view\+json/.test(saved) && /IntSlider/.test(saved))
+  // the widgets' state is in the file too (metadata.widgets), as Jupyter writes it
+  const nbJson = JSON.parse(saved)
+  const wstate = nbJson.metadata?.widgets?.['application/vnd.jupyter.widget-state+json']
+  const models = Object.values(wstate?.state ?? {})
+  const byName = (n) => models.filter((m) => m.model_name === n)
+  check('the saved notebook has the widget state in its metadata (version 2, one entry per widget the outputs show)', wstate?.version_major === 2 && byName('IntSliderModel').length >= 2 && byName('ButtonModel').length === 1 && byName('OutputModel').length === 1, JSON.stringify(models.map((m) => m.model_name)))
+  check('with the current value of the slider (8, set by the kernel) and the output of interact()', byName('IntSliderModel').some((m) => m.state.value === 8) && JSON.stringify(byName('OutputModel')[0]?.state).includes('n is 4'), JSON.stringify(byName('IntSliderModel').map((m) => m.state.value)))
+  check('and nothing for widgets that no output shows (no leftovers of other models)', models.every((m) => ['IntSliderModel', 'ButtonModel', 'OutputModel', 'LayoutModel', 'SliderStyleModel', 'ButtonStyleModel', 'DescriptionStyleModel', 'HBoxModel', 'VBoxModel', 'IntTextModel', 'LabelModel', 'HTMLModel', 'ProgressStyleModel'].includes(m.model_name)), JSON.stringify([...new Set(models.map((m) => m.model_name))]))
   // stopping the kernel
   await ev(`document.querySelector('[data-nb-action="stop"]').click()`)
   check('Stop with nothing running stops the kernel', await waitFor(() => ev(`document.querySelector('[data-nb-status]')?.getAttribute('data-nb-status') === 'stopped'`), 15000))
@@ -122,6 +130,17 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
   await ev(`[...document.querySelectorAll('.tree-row')].find((e) => (e.getAttribute('data-tree-path') || '').endsWith('w.ipynb'))?.click()`)
   await waitFor(() => ev(`document.querySelectorAll('[data-nb-cell]').length === 7`), 20000)
   check('after the notebook is opened again, saved HTML is shown without scripts (not in the script-running frame)', await waitFor(() => ev(`!!${cellSel(6)}.querySelector('iframe.nb-html') && !${cellSel(6)}.querySelector('[data-nb-html-live]') && ${cellSel(6)}.querySelector('iframe.nb-html').getAttribute('sandbox') === 'allow-same-origin'`), 20000))
+  // and its widgets come back from the saved state, with no kernel running
+  check('the widgets saved in the notebook are drawn again without a kernel: the slider at 8 and the button', await waitFor(() => ev(`/8/.test(${cellSel(0)}.querySelector('[data-nb-widget] .widget-readout')?.textContent ?? '') && /Press me/.test(${cellSel(0)}.querySelector('[data-nb-outputs]')?.innerText ?? '')`), 20000), await ev(`${cellSel(0)}.querySelector('[data-nb-outputs]')?.innerText`))
+  check('the Output widget of interact() shows its saved output', await waitFor(() => ev(`/n is 4/.test(${cellSel(3)}.querySelector('.nb-widget-output')?.innerText ?? '')`), 20000), await ev(`${cellSel(3)}.querySelector('[data-nb-outputs]')?.innerText`))
+  check('and the kernel is still stopped', (await ev(`document.querySelector('[data-nb-status]')?.getAttribute('data-nb-status')`)) !== 'ready')
+  check('opening it changed nothing in the file', (await ev(`document.querySelectorAll('.tab .tab-dot').length`)) === 0)
+  await realClick(`${cellSel(0)}.querySelector('[data-nb-widget] .noUi-handle, [data-nb-widget] [role="slider"]')`)
+  await key('ArrowRight', 'ArrowRight', 39)
+  check('a restored slider can be moved (it changes on screen, nothing runs)', await waitFor(() => ev(`/9/.test(${cellSel(0)}.querySelector('[data-nb-widget] .widget-readout')?.textContent ?? '')`), 10000), await ev(`${cellSel(0)}.querySelector('[data-nb-widget] .widget-readout')?.textContent`))
+  check('and the new value is kept for the next save (the tab is marked as modified)', await waitFor(() => ev(`document.querySelectorAll('.tab .tab-dot').length === 1`), 10000))
+  await send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 's', code: 'KeyS', windowsVirtualKeyCode: 83, modifiers: 2 }); await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 's', code: 'KeyS', windowsVirtualKeyCode: 83, modifiers: 2 })
+  check('saving writes it', await waitFor(() => { const m = Object.values(JSON.parse(fs.readFileSync(path.join(proj, 'w.ipynb'), 'utf-8')).metadata?.widgets?.['application/vnd.jupyter.widget-state+json']?.state ?? {}); return m.some((x) => x.model_name === 'IntSliderModel' && x.state.value === 9) }, 10000))
   check('no uncaught errors in the page', errors.length === 0, errors.join(' | '))
   console.log('ipywidgets', widgetsVersion)
   stopApp()

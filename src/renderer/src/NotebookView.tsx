@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { monaco } from './monaco-setup'
 import { announce } from './a11y'
 import { InputDialog, InputRequest } from './InputDialog'
@@ -26,7 +26,7 @@ import {
   updateCell
 } from './notebookModel'
 
-import { WIDGET_MIME, WidgetOutput, forgetWidgets, initWidgets, widgetManager } from './widgets'
+import { WIDGET_MIME, WIDGET_STATE_MIME, IdeWidgetManager, StaticWidgets, WidgetOutput, collectWidgetState, forgetWidgets, initWidgets, restoreWidgets, savedWidgetState, widgetManager } from './widgets'
 
 type KernelInfo = { id: string; label: string; kernelspec?: { name: string; display_name: string; language: string } }
 
@@ -90,6 +90,7 @@ function HtmlOutput({ html }: { html: string }): JSX.Element {
 }
 
 function OutputView({ o, session }: { o: NbOutput; session: number | null }): JSX.Element | null {
+  const restored = useContext(StaticWidgets)
   if (o.output_type === 'stream') {
     return <pre className={'nb-stream' + (o.name === 'stderr' ? ' err' : '')}>{renderStreamText(outputText(o.text))}</pre>
   }
@@ -97,9 +98,9 @@ function OutputView({ o, session }: { o: NbOutput; session: number | null }): JS
     const tb = (o.traceback ?? []).map(stripAnsi).join('\n')
     return <pre className="nb-error">{tb || `${o.ename}: ${o.evalue}`}</pre>
   }
-  // A widget of a running Jupyter kernel is drawn live; saved without its kernel it falls back to its text.
+  // A widget of a running Jupyter kernel is drawn live, one saved in the notebook from the saved state; otherwise it falls back to its text.
   const widget = (o.data ?? {})[WIDGET_MIME]
-  if (widget && widgetManager(session)) {
+  if (widget && (widgetManager(session) || restored)) {
     try {
       const id = (typeof widget === 'string' ? JSON.parse(widget) : widget).model_id
       if (typeof id === 'string') return <WidgetOutput session={session} modelId={id} />
@@ -250,6 +251,9 @@ export function NotebookView({
   const rootRef = useRef<HTMLDivElement>(null)
 
   nbRef.current = nb
+  const [restored, setRestored] = useState<IdeWidgetManager | null>(null) // the widgets saved in the file
+  const restoredRef = useRef<IdeWidgetManager | null>(null)
+  const captureSoon = useRef<() => void>(() => undefined)
 
   // ---- reading and writing the file's text ----
   const load = useCallback(
@@ -262,6 +266,15 @@ export function NotebookView({
       }
       setError(null)
       setNb(r.nb)
+      // Widgets saved in the file are shown again without a kernel.
+      const saved = savedWidgetState(r.nb.metadata)
+      const widgets = saved ? restoreWidgets(saved) : null
+      if (widgets) widgets.onModelChange = () => captureSoon.current()
+      setRestored((old) => {
+        void old?.clear_state()
+        return widgets
+      })
+      restoredRef.current = widgets
       counter.current = Math.max(counter.current, ...r.nb.cells.map((c) => c.execution_count ?? 0))
       setSelected((cur) => (cur && r.nb.cells.some((c) => c.id === cur) ? cur : (r.nb.cells[0]?.id ?? null)))
       setKernelId(kernelFor(r.nb, kernelsRef.current))
@@ -301,6 +314,43 @@ export function NotebookView({
     },
     [writeNow]
   )
+  // The state of the widgets the outputs show goes into the notebook's metadata (as Jupyter does), so they come back when it is reopened.
+  const captureTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const captureWidgets = useCallback(async (): Promise<void> => {
+    const cur = nbRef.current
+    if (!cur) return
+    const shown = new Set<string>()
+    for (const c of cur.cells) {
+      for (const o of c.outputs ?? []) {
+        const w = (o.data ?? {})[WIDGET_MIME]
+        try {
+          const id = (typeof w === 'string' ? JSON.parse(w) : w)?.model_id
+          if (typeof id === 'string') shown.add(id)
+        } catch {
+          // not a widget description
+        }
+      }
+    }
+    const before = savedWidgetState(cur.metadata)
+    if (!shown.size && !before) return
+    const next = await collectWidgetState(before, [restoredRef.current, widgetManager(session.current)], shown)
+    const now = nbRef.current
+    if (!now) return
+    if (JSON.stringify(savedWidgetState(now.metadata)) === JSON.stringify(next)) return
+    const widgets = { ...((now.metadata.widgets as Record<string, unknown> | undefined) ?? {}) }
+    if (next) widgets[WIDGET_STATE_MIME] = next
+    else delete widgets[WIDGET_STATE_MIME]
+    const metadata = { ...now.metadata }
+    if (Object.keys(widgets).length) metadata.widgets = widgets
+    else delete metadata.widgets
+    commit({ ...now, metadata }, false)
+  }, [commit])
+  captureSoon.current = (): void => {
+    clearTimeout(captureTimer.current)
+    captureTimer.current = setTimeout(() => void captureWidgets().catch((e) => console.error('saving widget state', e)), 150)
+  }
+  useEffect(() => () => clearTimeout(captureTimer.current), [])
+
   // Ctrl+S must save what is on screen, including output that arrived a moment ago and is still waiting to be written.
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
@@ -425,7 +475,12 @@ export function NotebookView({
         else if (pending.current.size === 0) announce('Finished running')
       }
       if (ev.type !== 'done') commit(updateCell(cur, cellId, { outputs }), false)
-      else commit(cur, false)
+      else {
+        commit(cur, false)
+        const live = widgetManager(session.current)
+        if (live) live.onModelChange = () => captureSoon.current()
+        captureSoon.current()
+      }
     })
     const offExit = window.api.onNbExited((sid, code, err) => {
       forgetWidgets(sid)
@@ -599,6 +654,7 @@ export function NotebookView({
   if (!nb) return <div className="notebook" data-notebook />
 
   return (
+    <StaticWidgets.Provider value={restored}>
     <div className="notebook" data-notebook ref={rootRef} role="region" aria-label={`Notebook ${baseName(path)}`}>
       {askInput && (
         <InputDialog
@@ -770,5 +826,6 @@ export function NotebookView({
         )}
       </div>
     </div>
+    </StaticWidgets.Provider>
   )
 }

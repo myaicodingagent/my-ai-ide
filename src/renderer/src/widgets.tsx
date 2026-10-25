@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { createContext, useContext, useEffect, useRef, useState } from 'react'
 import { ManagerBase } from '@jupyter-widgets/base-manager'
 import { DOMWidgetModel, DOMWidgetView, ErrorWidgetView, createErrorWidgetModel } from '@jupyter-widgets/base'
 import type { IClassicComm, WidgetModel, WidgetView } from '@jupyter-widgets/base'
@@ -26,6 +26,10 @@ class IdeComm implements IClassicComm {
   ) {}
 
   private post(type: 'comm_open' | 'comm_msg' | 'comm_close', data: unknown, callbacks: Callbacks, metadata?: unknown, buffers?: Buf[]): string {
+    if (this.manager.session < 0) {
+      callbacks?.iopub?.status?.({ content: { execution_state: 'idle' } }) // widgets without a kernel: nobody to tell
+      return this.comm_id
+    }
     const content: Record<string, unknown> = { comm_id: this.comm_id, data: data ?? {} }
     if (type === 'comm_open') content.target_name = this.target_name
     void window.api.nbComm(this.manager.session, type, content, (buffers ?? []).map(toBytes)).then((id) => {
@@ -137,8 +141,19 @@ export class IdeWidgetManager extends ManagerBase {
   queue: Promise<unknown> = Promise.resolve()
   private views = new Set<WidgetView>()
 
+  /** Called when the state of any widget changes, so the notebook can save it. */
+  onModelChange: (() => void) | null = null
+  /** Resolves when the state read from a notebook has been turned into models. */
+  restored: Promise<unknown> = Promise.resolve()
+
+  // A manager with a negative session shows the widgets saved in a notebook: there is no kernel behind them.
   constructor(readonly session: number) {
     super()
+  }
+
+  register_model(modelId: string, modelPromise: Promise<WidgetModel>): void {
+    super.register_model(modelId, modelPromise)
+    void modelPromise.then((m) => m.on('change', () => this.onModelChange?.()), () => undefined)
   }
 
   // A widget made in the notebook (rare: most come from the kernel) gets a comm of its own.
@@ -235,6 +250,56 @@ export function initWidgets(): void {
   })
 }
 
+export const WIDGET_STATE_MIME = 'application/vnd.jupyter.widget-state+json'
+type SavedModel = { model_name: string; model_module: string; model_module_version: string; state: Record<string, unknown>; buffers?: unknown }
+export interface WidgetState {
+  version_major: number
+  version_minor: number
+  state: Record<string, SavedModel>
+}
+
+/** The widgets that the editor can draw itself (the same list as `loadClass`); others are kept in the file as they were. */
+const KNOWN_MODULES = new Set(['@jupyter-widgets/base', '@jupyter-widgets/controls', '@jupyter-widgets/output'])
+
+/** The notebook's saved widget state (`metadata.widgets`), if it is one we understand. */
+export function savedWidgetState(metadata: Record<string, unknown>): WidgetState | null {
+  const w = (metadata.widgets as Record<string, unknown> | undefined)?.[WIDGET_STATE_MIME] as Partial<WidgetState> | undefined
+  return w && typeof w === 'object' && typeof w.version_major === 'number' && w.version_major <= 2 && w.state && typeof w.state === 'object' ? (w as WidgetState) : null
+}
+
+/** Makes models of the widgets saved in a notebook; they are drawn without a kernel (they respond locally, nothing runs). */
+export function restoreWidgets(state: WidgetState): IdeWidgetManager {
+  const m = new IdeWidgetManager(-1)
+  const known: WidgetState = { ...state, state: Object.fromEntries(Object.entries(state.state).filter(([, v]) => v && KNOWN_MODULES.has(v.model_module))) }
+  m.restored = m.set_state(known as never).catch((e) => console.error('could not restore the widgets', e))
+  return m
+}
+
+/**
+ * The state to save with a notebook: what was saved before, updated with the models of the managers (the restored ones and the
+ * kernel's), and cut down to the widgets that the outputs show, together with the widgets those refer to.
+ */
+export async function collectWidgetState(before: WidgetState | null, managers: (IdeWidgetManager | null)[], shown: Set<string>): Promise<WidgetState | null> {
+  const all: Record<string, SavedModel> = { ...(before?.state ?? {}) }
+  for (const m of managers) {
+    if (!m) continue
+    await m.restored
+    const s = (await m.get_state({ drop_defaults: true })) as unknown as WidgetState
+    for (const [id, v] of Object.entries(s.state)) if (KNOWN_MODULES.has(v.model_module)) all[id] = v
+  }
+  const keep: Record<string, SavedModel> = {}
+  const visit = (id: string): void => {
+    const v = all[id]
+    if (!v || keep[id]) return
+    keep[id] = v
+    for (const ref of JSON.stringify(v.state).matchAll(/IPY_MODEL_([0-9A-Za-z-]+)/g)) visit(ref[1])
+  }
+  for (const id of shown) visit(id)
+  return Object.keys(keep).length ? { version_major: 2, version_minor: 0, state: keep } : null
+}
+
+export const StaticWidgets = createContext<IdeWidgetManager | null>(null)
+
 /** A kernel that is gone takes its widgets with it. */
 export function forgetWidgets(session: number): void {
   managers.delete(session)
@@ -244,25 +309,37 @@ export function forgetWidgets(session: number): void {
 export function WidgetOutput({ session, modelId }: { session: number | null; modelId: string }): JSX.Element {
   const host = useRef<HTMLDivElement>(null)
   const [err, setErr] = useState<string | null>(null)
+  const restored = useContext(StaticWidgets)
   useEffect(() => {
-    const m = widgetManager(session)
-    // The kernel's messages about this widget came first; wait until they have all been handled.
-    const model = m ? m.queue.then(() => m.get_model(modelId)) : null
-    if (!m || !model || !host.current) {
-      setErr('This widget is only available while its kernel is running. Run the cell again to show it.')
-      return
+    const live = widgetManager(session)
+    // The kernel's messages about this widget came first; wait until they have all been handled. A widget that the kernel
+    // does not have (the cell was not run since the notebook was opened) comes from the state saved in the notebook.
+    const pick = async (): Promise<{ m: IdeWidgetManager; mod: WidgetModel } | null> => {
+      if (live) {
+        await live.queue
+        if (live.has_model(modelId)) return { m: live, mod: await live.get_model(modelId) }
+      }
+      if (restored) {
+        await restored.restored
+        if (restored.has_model(modelId)) return { m: restored, mod: await restored.get_model(modelId) }
+      }
+      return null
     }
+    if (!host.current) return
     setErr(null)
     let view: { remove?: () => void } | null = null
     let gone = false
-    model
-      .then((mod) => m.create_view(mod))
-      .then(async (v) => {
+    pick()
+      .then((found) => {
+        if (!found) throw new Error('This widget is not saved in the notebook. Run the cell again to show it.')
+        return found.m.create_view(found.mod).then((v) => ({ m: found.m, v }))
+      })
+      .then(async ({ m, v }) => {
         if (gone) return void v.remove()
         view = v
         if (host.current) await m.display_view(v, host.current)
       })
-      .catch((e: unknown) => setErr('The widget could not be shown: ' + (e instanceof Error ? e.message : String(e))))
+      .catch((e: unknown) => setErr(e instanceof Error && /not saved/.test(e.message) ? e.message : 'The widget could not be shown: ' + (e instanceof Error ? e.message : String(e))))
     return () => {
       gone = true
       try {
@@ -271,7 +348,7 @@ export function WidgetOutput({ session, modelId }: { session: number | null; mod
         // already gone
       }
     }
-  }, [session, modelId])
+  }, [session, modelId, restored])
   return (
     <div className="nb-widget" data-nb-widget={modelId}>
       <div ref={host} />
