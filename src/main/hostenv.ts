@@ -36,12 +36,12 @@ export function fromNativePath(name: string, p: string): string {
  * wsl.exe that runs a small bridge inside the distribution (bash's /dev/tcp). WSL's own localhost forwarding is not used: it
  * notices new ports only after a delay, and a debugger that accepts one client (debugpy, Delve) cannot be probed for readiness.
  */
-export function forwardPort(unc: string, port: number): Promise<{ port: number; close(): void }> {
+export function forwardPort(unc: string, port: number, waitMs = 30_000): Promise<{ port: number; close(): void }> {
   const w = wslLocation(unc)
   if (!w) return ssh.forwardPort(unc, port)
   const sockets = new Set<Socket>()
   const children = new Set<ChildProcess>()
-  const listening = waitListening(w.distro, port)
+  const listening = waitListening(w.distro, port, waitMs)
   const server = createServer((sock) => {
     sockets.add(sock)
     const bridge = spawn('wsl.exe', ['-d', w.distro, '--exec', 'bash', '-c', 'exec 3<>/dev/tcp/127.0.0.1/$1 || exit 1; cat >&3 <&0 & cat <&3; kill $! 2>/dev/null', 'bash', String(port)], { stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true })
@@ -85,7 +85,7 @@ export function forwardPort(unc: string, port: number): Promise<{ port: number; 
  * taken for the debugger's client). Programs that were just started need a moment, and a bridge that finds no listener gives up
  * only after wsl.exe has started, which is too slow to tell "not yet" from "connected".
  */
-async function waitListening(distro: string, port: number): Promise<void> {
+async function waitListening(distro: string, port: number, waitMs: number): Promise<void> {
   const hex = port.toString(16).toUpperCase().padStart(4, '0')
   const script = `grep -Eiq ':${hex} [0-9A-F:]+ 0A ' /proc/net/tcp /proc/net/tcp6`
   const t0 = Date.now()
@@ -96,7 +96,7 @@ async function waitListening(distro: string, port: number): Promise<void> {
       p.once('error', () => res(false))
     })
     if (ok) return
-    if (Date.now() - t0 > 30_000) throw new Error(`Nothing listens on port ${port} in the distribution.`)
+    if (Date.now() - t0 > waitMs) throw new Error(`Nothing listens on port ${port} in the distribution.`)
     await new Promise((r) => setTimeout(r, 200))
   }
 }

@@ -127,6 +127,85 @@ async function waitDead(pid, ms = 10000) { const t0 = Date.now(); while (aliveIn
     events.length = 0
   }
 
+  // --- attach to programs that are already running in the distribution (the open folder says which machine the port / pid is on)
+  const bg = []
+  const startBg = (script) => { const c = cp.spawn('wsl.exe', ['-d', distro, '--user', 'root', '--exec', 'sh', '-c', script], { stdio: 'ignore', windowsHide: true }); bg.push(c); return c }
+  const pidOf = async (file) => { for (let i = 0; i < 60; i++) { const v = Number(wsl(`cat ${file} 2>/dev/null`).stdout.trim()); if (v > 0) return v; await sleep(200) } return 0 }
+  const killIn = (pid) => wsl(`kill ${pid} 2>/dev/null; true`)
+  if (has('node')) {
+    wsl(`mkdir -p "${projN}"`)
+    put('loop.js', ['let count = 0', 'function tick() {', '  count += 1', '  return count', '}', 'setInterval(tick, 200)', ''].join('\n'))
+    const loopU = unc(projN + '/loop.js')
+    // by port
+    startBg(`cd "${projN}" && echo $$ > ${dir}/loop1.pid && exec node --inspect=127.0.0.1:9339 loop.js`)
+    const pid1 = await pidOf(dir + '/loop1.pid')
+    let r = await call('dbg:attach', { port: 9339, roots: [unc(projN)], breakpoints: { [loopU]: [{ line: 3 }] } })
+    check('Node attach: a program already running in the distribution is attached to by port', r.ok === true, JSON.stringify(r))
+    let p = r.ok ? await paused('attach port breakpoint') : null
+    check('Node attach: it stops at the breakpoint, in the editor\'s address of the file', !!p && p.reason === 'breakpoint' && p.frames[0].name === 'tick' && p.frames[0].file === loopU && p.frames[0].line === 3, JSON.stringify(p && p.frames[0]))
+    await call('dbg:setBreakpoints', loopU, [])
+    await call('dbg:continue')
+    await call('dbg:stop')
+    await waitEvent((e) => e.type === 'exited', 'attach port exit')
+    check('Node attach: Stop lets go, the program keeps running', aliveIn(pid1))
+    killIn(pid1)
+    events.length = 0
+    // by process id (the program was not started with --inspect)
+    startBg(`cd "${projN}" && echo $$ > ${dir}/loop2.pid && exec node loop.js`)
+    const pid2 = await pidOf(dir + '/loop2.pid')
+    r = await call('dbg:attach', { pid: pid2, roots: [unc(projN)], breakpoints: { [loopU]: [{ line: 3 }] } })
+    check('Node attach: a program is attached to by process id (it is asked to open its debugger)', r.ok === true, JSON.stringify(r))
+    p = r.ok ? await paused('attach pid breakpoint') : null
+    check('Node attach: and stops at the breakpoint there', !!p && p.frames[0].name === 'tick' && p.frames[0].file === loopU, JSON.stringify(p && p.frames[0]))
+    await call('dbg:setBreakpoints', loopU, [])
+    await call('dbg:continue')
+    await call('dbg:stop')
+    await waitEvent((e) => e.type === 'exited', 'attach pid exit')
+    check('Node attach: the program keeps running after Stop', aliveIn(pid2))
+    killIn(pid2)
+    events.length = 0
+    r = await call('dbg:attach', { port: 9391, roots: [unc(projN)], breakpoints: {} })
+    check('Node attach: a port with nothing behind it gives a readable error', r.ok === false && /Nothing|did not become|not reachable|listen/i.test(r.error), JSON.stringify(r))
+  }
+  if (wsl('python3 -c "import debugpy"').status === 0) {
+    put('pyloop.py', ['import time', 'def tick(n):', '    return n + 1', 'n = 0', 'while n < 600:', '    n = tick(n)', '    time.sleep(0.2)', ''].join('\n'))
+    const pyU = unc(projN + '/pyloop.py')
+    startBg(`cd "${projN}" && echo $$ > ${dir}/py.pid && exec python3 -m debugpy --listen 127.0.0.1:5691 pyloop.py`)
+    const pid3 = await pidOf(dir + '/py.pid')
+    await sleep(1500)
+    const r = await call('dbg:attach', { language: 'python', port: 5691, roots: [unc(projN)], breakpoints: { [pyU]: [{ line: 3 }] } })
+    check('Python attach: a program running under debugpy in the distribution is attached to by port', r.ok === true, JSON.stringify(r))
+    const p = r.ok ? await paused('py attach breakpoint') : null
+    check('Python attach: it stops at the breakpoint in the editor\'s address of the file', !!p && p.reason === 'breakpoint' && p.frames[0].name === 'tick' && p.frames[0].file === pyU, JSON.stringify(p && p.frames[0]))
+    await call('dbg:setBreakpoints', pyU, [])
+    await call('dbg:continue')
+    await call('dbg:stop')
+    await waitEvent((e) => e.type === 'exited', 'py attach exit')
+    check('Python attach: the program keeps running after Stop', aliveIn(pid3))
+    killIn(pid3)
+    events.length = 0
+  }
+  if (has('dlv') && has('go')) {
+    wsl(`mkdir -p "${projN}/goloop"`)
+    put('goloop/go.mod', 'module goloop\n\ngo 1.20\n')
+    put('goloop/main.go', ['package main', '', 'import "time"', '', 'func tick(n int) int {', '\treturn n + 1', '}', '', 'func main() {', '\tn := 0', '\tfor n < 600 {', '\t\tn = tick(n)', '\t\ttime.Sleep(200 * time.Millisecond)', '\t}', '}', ''].join('\n'))
+    const gU = unc(projN + '/goloop/main.go')
+    const built = wsl(`cd "${projN}/goloop" && go build -gcflags='all=-N -l' -o loop . 2>&1`)
+    startBg(`cd "${projN}/goloop" && exec dlv exec ./loop --headless --listen=127.0.0.1:2392 --api-version=2 --accept-multiclient`)
+    await sleep(2500)
+    const r = await call('dbg:attach', { language: 'go', port: 2392, roots: [unc(projN)], breakpoints: { [gU]: [{ line: 6 }] } })
+    check('Go attach: a program under a Delve server in the distribution is attached to by port', r.ok === true, JSON.stringify(r) + built.stdout)
+    const p = r.ok ? await paused('go attach breakpoint') : null
+    check('Go attach: it stops at the breakpoint in the editor\'s address of the file', !!p && p.reason === 'breakpoint' && /tick/.test(p.frames[0].name) && p.frames[0].file === gU && p.frames[0].line === 6, JSON.stringify(p && p.frames[0]))
+    await call('dbg:setBreakpoints', gU, [])
+    await call('dbg:continue')
+    await call('dbg:stop')
+    await waitEvent((e) => e.type === 'exited', 'go attach exit')
+    wsl('pkill -f "dlv exec" ; pkill -f goloop/loop; true')
+    events.length = 0
+  }
+  for (const c of bg) try { c.kill() } catch { /* gone */ }
+
   wsl(`rm -rf ${dir}`)
   try { fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 }) } catch { /* only a temp folder */ }
   const failed = results.filter((x) => !x).length

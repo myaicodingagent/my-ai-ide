@@ -95,6 +95,26 @@ const server = require('./sshserver.cjs')(path.join(tmp, 'server-root'))
   check('Stop ends the program on the other computer', await waitDead(remotePid), 'pid ' + remotePid)
   events.length = 0
 
+  // --- attach to a Node program that is already running "on the server" (the open folder says which machine the port is on)
+  {
+    const loop = path.join(proj, 'loop.js')
+    fs.writeFileSync(loop, ['let count = 0', 'function tick() {', '  count += 1', '  return count', '}', 'setInterval(tick, 200)', ''].join('\n'))
+    const loopU = unc(loop)
+    const running = cp.spawn(process.execPath, ['--inspect=127.0.0.1:9355', loop], { stdio: 'ignore', windowsHide: true, env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined } })
+    await sleep(1500)
+    r = await call('dbg:attach', { port: 9355, roots: [unc(proj)], breakpoints: { [loopU]: [{ line: 3 }] } })
+    check('attach: a Node program that is already running is attached to by port through the SSH tunnel', r.ok === true, JSON.stringify(r))
+    p = r.ok ? await paused('ssh attach breakpoint') : null
+    check('attach: it stops at the breakpoint, in the editor\'s address of the file', !!p && p.frames[0].name === 'tick' && p.frames[0].file === loopU && p.frames[0].line === 3, JSON.stringify(p && p.frames[0]))
+    await call('dbg:setBreakpoints', loopU, [])
+    await call('dbg:continue')
+    await call('dbg:stop')
+    await waitEvent((e) => e.type === 'exited', 'ssh attach exit')
+    check('attach: Stop lets go, the program keeps running', alive(running.pid))
+    running.kill()
+    events.length = 0
+  }
+
   // --- Python
   const havePy = cp.spawnSync('py', ['-3', '-c', 'import debugpy'], { windowsHide: true }).status === 0
   const pyDir = (cp.spawnSync('py', ['-3', '-c', 'import sys,os;print(os.path.dirname(sys.executable))'], { encoding: 'utf-8', windowsHide: true }).stdout || '').trim()

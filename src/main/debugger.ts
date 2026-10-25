@@ -478,25 +478,47 @@ async function enableInspector(pid: number): Promise<number> {
   throw new Error(`Process ${pid} did not open a debugger. Is it a Node.js process that is still running?`)
 }
 
-async function attach(opts: { host?: string; port?: number; pid?: number; breakpoints: Record<string, DbgBreakpoint[]> }): Promise<{ ok: true } | { ok: false; error: string }> {
+// The same, for a program on another computer or in a WSL distribution (the open folder says which): its process id and its
+// ports are the ones there.
+async function enableInspectorRemote(root: string, pid: number): Promise<number> {
+  const sig = await host.exec(root, ['sh', '-c', 'kill -USR1 "$1"', 'sh', String(Math.floor(pid))])
+  if (sig.code !== 0) throw new Error(sig.stderr.trim() || `Could not signal process ${pid}.`)
+  const probe = 'for p in 9229 9230 9231; do if (exec 3<>/dev/tcp/127.0.0.1/$p) 2>/dev/null; then echo $p; exit 0; fi; done; exit 1'
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 250))
+    const r = await host.exec(root, ['bash', '-c', probe])
+    if (r.code === 0 && /^\d+$/.test(r.stdout.trim())) return Number(r.stdout.trim())
+  }
+  throw new Error(`Process ${pid} did not open a debugger. Is it a Node.js process that is still running there?`)
+}
+
+async function attach(opts: { host?: string; port?: number; pid?: number; roots?: string[]; breakpoints: Record<string, DbgBreakpoint[]> }): Promise<{ ok: true } | { ok: false; error: string }> {
   if (session && !session.exited) return { ok: false, error: 'A debug session is already running. Stop it first.' }
-  const host = opts.host || '127.0.0.1'
+  let address = opts.host || '127.0.0.1'
+  const remoteRoot = (opts.roots ?? []).find((r) => isRemotePath(r))
+  let tunnel: { port: number; close(): void } | undefined
   let url: string
   let pid = 0
   try {
     let port = opts.port
     if (!port && opts.pid) {
-      pid = opts.pid
-      port = await enableInspector(opts.pid)
+      pid = remoteRoot ? 0 : opts.pid
+      port = remoteRoot ? await enableInspectorRemote(remoteRoot, opts.pid) : await enableInspector(opts.pid)
     }
     if (!port || port < 1 || port > 65535) return { ok: false, error: 'Give a port (for example 9229) or a process id.' }
-    url = await inspectorUrl(host, port)
+    if (remoteRoot) {
+      tunnel = await host.forwardPort(remoteRoot, port, 4000)
+      address = '127.0.0.1'
+      port = tunnel.port
+    }
+    url = await inspectorUrl(address, port)
   } catch (e) {
+    tunnel?.close()
     return { ok: false, error: e instanceof Error ? e.message : String(e) }
   }
   const s: Session = {
     child: null, ws: null, nextId: 1, pending: new Map(), frames: [], breakpointIds: new Map(), scripts: new Map(),
-    stopOnEntry: false, firstPause: false, exited: false
+    stopOnEntry: false, firstPause: false, exited: false, remote: remoteRoot ? host.parseRemote(remoteRoot)?.name : undefined
   }
   session = s
   return new Promise((resolve) => {
@@ -507,6 +529,7 @@ async function attach(opts: { host?: string; port?: number; pid?: number; breakp
       if (connected) return
       connected = true
       s.exited = true
+      tunnel?.close()
       if (session === s) session = null
       try {
         ws.close()
@@ -524,7 +547,7 @@ async function attach(opts: { host?: string; port?: number; pid?: number; breakp
         connected = true
         resolve({ ok: true })
         emit({ type: 'started', pid })
-        emit({ type: 'output', stream: 'info', text: `Attached to ${host} (the program keeps running; Stop only disconnects).
+        emit({ type: 'output', stream: 'info', text: `Attached to ${remoteRoot ? 'the program there' : address} (the program keeps running; Stop only disconnects).
 ` })
       } catch (e) {
         fail(e instanceof Error ? e.message : String(e))
@@ -538,6 +561,7 @@ async function attach(opts: { host?: string; port?: number; pid?: number; breakp
       s.exited = true
       for (const p of s.pending.values()) p.reject(new Error('The debugger disconnected.'))
       s.pending.clear()
+      tunnel?.close()
       if (session === s) session = null
       emit({ type: 'exited', code: null })
     })

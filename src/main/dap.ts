@@ -230,11 +230,11 @@ export const pythonAdapter: Adapter = {
 const randomPort = (): number => 30000 + Math.floor(Math.random() * 20000)
 
 /** Opens a tunnel to a port on the remote computer and connects once something is listening there. */
-async function connectRemote(unc: string, port: number, proc: host.RemoteProcess, what: string): Promise<{ socket: Socket; tunnel: { close(): void } }> {
-  const tunnel = await host.forwardPort(unc, port)
+async function connectRemote(unc: string, port: number, proc: host.RemoteProcess | null, what: string, tries = 80): Promise<{ socket: Socket; tunnel: { close(): void } }> {
+  const tunnel = await host.forwardPort(unc, port, proc ? 30_000 : 4000)
   try {
-    for (let i = 0; i < 80; i++) {
-      if (proc.exitCode !== null) break
+    for (let i = 0; i < tries; i++) {
+      if (proc && proc.exitCode !== null) break
       // The tunnel accepts at once; whether something listens on the other end shows when the connection is closed again.
       const socket = tcpConnect(tunnel.port, '127.0.0.1')
       const state = await new Promise<'up' | 'down'>((resolve) => {
@@ -284,9 +284,15 @@ async function startRemotePython(opts: DebugOptions): Promise<Started> {
 
 pythonAdapter.attach = async (target) => {
   if (!target.port) throw new Error('Give the port the program listens on (started with: python -m debugpy --listen 5678 script.py).')
-  const host = target.host || '127.0.0.1'
+  const remoteRoot = (target.roots ?? []).find((r) => host.isRemotePath(r))
+  if (remoteRoot) {
+    // In a folder on another computer or in WSL the port is one there; paths are translated like for a launched program.
+    const conn = await connectRemote(remoteRoot, target.port, null, 'Python', 6)
+    return { child: null, io: { input: conn.socket, output: conn.socket }, closeOn: conn.socket, stderr: () => '', remote: host.parseRemote(remoteRoot)?.name, dispose: conn.tunnel.close, launch: { name: 'Python attach (remote)', type: 'python', request: 'attach', justMyCode: true, redirectOutput: true } }
+  }
+  const address = target.host || '127.0.0.1'
   // debugpy in the program speaks the Debug Adapter Protocol itself, so there is no adapter process: connect to it.
-  const socket = await connectTo(host, target.port, 'Python')
+  const socket = await connectTo(address, target.port, 'Python')
   return {
     child: null,
     io: { input: socket, output: socket },
@@ -425,6 +431,11 @@ export const goAdapter: Adapter = {
       return { child, io: { input: socket, output: socket }, stderr, pid: target.pid, launch: { name: 'Go attach', type: 'go', request: 'attach', mode: 'local', processId: target.pid } }
     }
     if (!target.port) throw new Error('Give a process id ("pid 1234") or the port of a Delve server (dlv attach --headless --listen=:2345).')
+    const remoteRoot = (target.roots ?? []).find((r) => host.isRemotePath(r))
+    if (remoteRoot) {
+      const conn = await connectRemote(remoteRoot, target.port, null, 'Go', 6)
+      return { child: null, io: { input: conn.socket, output: conn.socket }, closeOn: conn.socket, stderr: () => '', remote: host.parseRemote(remoteRoot)?.name, dispose: conn.tunnel.close, launch: { name: 'Go attach (remote)', type: 'go', request: 'attach', mode: 'remote' } }
+    }
     const socket = await connectTo(target.host || '127.0.0.1', target.port, 'Go')
     return { child: null, io: { input: socket, output: socket }, closeOn: socket, stderr: () => '', launch: { name: 'Go attach', type: 'go', request: 'attach', mode: 'remote' } }
   }
