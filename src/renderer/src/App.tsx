@@ -53,6 +53,7 @@ import { validSshTarget, wslUnc } from '../../main/shellspec'
 import type { ConnectResult } from '../../main/sshfs'
 import { extensionCommands, initExtensions, onExtensionsChanged } from './extStore'
 import { attachExtEditorMenus } from './extEditorMenus'
+import { fileMenuEntries, fileMenuItems, runFileMenuEntry } from './extFileMenus'
 import { attachDebugEditor, toggleBreakpointAtCaret } from './debugEditor'
 import { attachDebugging, getDebug, initDebug, isActive as debugActive, startDebugging, stepDebug, stopDebugging, clearBreakpoints as clearAllBreakpoints } from './debugStore'
 import { initBackground, needsAttention, useBgTasks } from './bgStore'
@@ -572,6 +573,7 @@ export function App(): JSX.Element {
   const [showSidebar, setShowSidebar] = useState(true)
   const [recent, setRecent] = useState<string[]>(getRecentFolders)
   const [tabMenu, setTabMenu] = useState<{ x: number; y: number; path: string } | null>(null)
+  const [titleMenu, setTitleMenu] = useState<{ x: number; y: number; path: string; langId: string } | null>(null)
   const [problems, setProblems] = useState({ errors: 0, warnings: 0 })
   const closedStack = useRef<string[]>([]) // paths of recently closed tabs, newest last
   const diskText = useRef(new Map<string, string>()) // what each open file contained on disk when we last read or wrote it
@@ -1490,7 +1492,8 @@ export function App(): JSX.Element {
           if (p) void openMerge(p)
         }
       },
-      { label: 'Git: File History', run: () => showFileHistory(path), separator: true, disabled: !rootsRef.current.some((x) => relIfInside(x, path) && git.byRoot[x]?.state === 'ok') }
+      { label: 'Git: File History', run: () => showFileHistory(path), separator: true, disabled: !rootsRef.current.some((x) => relIfInside(x, path) && git.byRoot[x]?.state === 'ok') },
+      ...fileMenuItems('tabMenus', path)
     ]
   }
 
@@ -1513,6 +1516,7 @@ export function App(): JSX.Element {
     items.push({ label: 'Reveal in File Explorer', run: () => void window.api.fsReveal(entry?.path ?? r), separator: true })
     items.push({ label: 'Copy Path', run: () => void window.api.copyText(entry?.path ?? r) })
     if (entry) items.push({ label: 'Copy Relative Path', run: () => void window.api.copyText(relIfInside(r, entry.path) ?? entry.name) })
+    if (entry) items.push(...fileMenuItems('explorerMenus', entry.path, { isDir: entry.isDir, isRoot: samePath(entry.path) === samePath(r) }))
     return items
   }
 
@@ -2424,6 +2428,38 @@ export function App(): JSX.Element {
               </span>
             </div>
           ))}
+          {(() => {
+            // Buttons that extensions add for the file in the active tab ("editor/title"); the ones outside the navigation group share a "…" menu.
+            const cur = active && !diffView && !mergeView ? tabs.find((t) => t.path === active) : undefined
+            if (!cur) return null
+            const all = fileMenuEntries('editorTitleMenus', cur.path, { langId: cur.model.getLanguageId() })
+            const buttons = all.filter((m) => m.group === 'navigation' || m.group.startsWith('navigation@'))
+            const more = all.filter((m) => !buttons.includes(m))
+            if (!all.length) return null
+            return (
+              <div className="tab-ext-actions" role="toolbar" aria-label="Extension actions for this file">
+                {buttons.map((m) => (
+                  <button key={m.extId + m.command} data-ext-editor-title={m.command} title={m.title} aria-label={m.title} onClick={() => runFileMenuEntry(m, cur.path)}>
+                    {m.title}
+                  </button>
+                ))}
+                {more.length > 0 && (
+                  <button
+                    data-ext-editor-title-more
+                    title="More actions"
+                    aria-label="More actions"
+                    aria-haspopup="menu"
+                    onClick={(e) => {
+                      const r = e.currentTarget.getBoundingClientRect()
+                      setTitleMenu({ x: r.left, y: r.bottom, path: cur.path, langId: cur.model.getLanguageId() })
+                    }}
+                  >
+                    …
+                  </button>
+                )}
+              </div>
+            )
+          })()}
         </div>
         {webviewPanels.some((w) => !w.view) && (
           <div className="tabs webview-tabs" role="tablist" aria-label="Extension pages">
@@ -2674,6 +2710,16 @@ export function App(): JSX.Element {
       )}
       {applyState && <ApprovalDialog approval={applyState.approval} unsavedWarning={false} onDecide={decideApply} />}
       {tabMenu && <ContextMenu x={tabMenu.x} y={tabMenu.y} items={tabMenuItems(tabMenu.path)} onClose={() => setTabMenu(null)} />}
+      {titleMenu && (
+        <ContextMenu
+          x={titleMenu.x}
+          y={titleMenu.y}
+          items={fileMenuEntries('editorTitleMenus', titleMenu.path, { langId: titleMenu.langId })
+            .filter((m) => !(m.group === 'navigation' || m.group.startsWith('navigation@')))
+            .map((m) => ({ label: m.title, run: () => runFileMenuEntry(m, titleMenu.path) }))}
+          onClose={() => setTitleMenu(null)}
+        />
+      )}
       {treeMenu && (
         <ContextMenu x={treeMenu.x} y={treeMenu.y} items={treeMenuItems(treeMenu.entry)} onClose={() => setTreeMenu(null)} />
       )}

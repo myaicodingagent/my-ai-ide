@@ -13,12 +13,12 @@ const tmp = path.join(os.tmpdir(), 'ext-tree-' + process.pid)
 fs.rmSync(tmp, { recursive: true, force: true })
 const proj = path.join(tmp, 'proj'), data = path.join(tmp, 'data'), extDir = path.join(tmp, 'demo-tree')
 for (const d of [proj, path.join(data, 'extensions'), extDir]) fs.mkdirSync(d, { recursive: true })
-fs.writeFileSync(path.join(proj, 'readme.txt'), 'hello\n')
+fs.writeFileSync(path.join(proj, 'readme.txt'), 'hello\n'); fs.writeFileSync(path.join(proj, 'tool.py'), 'print(1)\n'); fs.mkdirSync(path.join(proj, 'docs'))
 fs.writeFileSync(path.join(extDir, 'package.json'), JSON.stringify({
   name: 'demo-tree', publisher: 'local', version: '1.0.0', main: './extension.js', activationEvents: ['*'], engines: { vscode: '^1.85.0' },
   contributes: {
-    commands: [{ command: 'demo.refresh', title: 'Demo: Refresh' }, { command: 'demo.count', title: 'Demo Count Lines' }, { command: 'demo.pyonly', title: 'Demo Python Only' }, { command: 'demo.rename', title: 'Rename' }, { command: 'demo.eat', title: 'Eat' }, { command: 'demo.openfolder', title: 'Open Folder' }, { command: 'demo.wave', title: 'Wave' }, { command: 'demo.hidden', title: 'Never Shown' }],
-    menus: { 'view/title': [{ command: 'demo.refresh', when: 'view == demo.tree', group: 'navigation' }, { command: 'demo.refresh', when: 'view == other.tree', group: 'navigation' }], 'editor/context': [{ command: 'demo.count', when: 'resourceExtname == .txt', group: 'navigation' }, { command: 'demo.pyonly', when: 'editorLangId == python', group: 'navigation' }], commandPalette: [{ command: 'demo.hidden', when: 'false' }], 'view/item/context': [
+    commands: [{ command: 'demo.refresh', title: 'Demo: Refresh' }, { command: 'demo.count', title: 'Demo Count Lines' }, { command: 'demo.pyonly', title: 'Demo Python Only' }, { command: 'demo.rename', title: 'Rename' }, { command: 'demo.eat', title: 'Eat' }, { command: 'demo.openfolder', title: 'Open Folder' }, { command: 'demo.wave', title: 'Wave' }, { command: 'demo.hidden', title: 'Never Shown' }, { command: 'demo.exfolder', title: 'Demo Folder Action' }, { command: 'demo.extxt', title: 'Demo Text File Action' }, { command: 'demo.tabinfo', title: 'Demo Tab Info' }, { command: 'demo.titlebtn', title: 'Demo Title Button' }, { command: 'demo.titlemore', title: 'Demo More Action' }, { command: 'demo.titlepy', title: 'Demo Python Title' }],
+    menus: { 'view/title': [{ command: 'demo.refresh', when: 'view == demo.tree', group: 'navigation' }, { command: 'demo.refresh', when: 'view == other.tree', group: 'navigation' }], 'editor/context': [{ command: 'demo.count', when: 'resourceExtname == .txt', group: 'navigation' }, { command: 'demo.pyonly', when: 'editorLangId == python', group: 'navigation' }], 'explorer/context': [{ command: 'demo.exfolder', when: 'explorerResourceIsFolder', group: '2_work' }, { command: 'demo.extxt', when: 'resourceExtname == .txt && !explorerResourceIsFolder', group: '2_work' }], 'editor/title/context': [{ command: 'demo.tabinfo', when: 'resourceLangId == plaintext', group: '1_info' }], 'editor/title': [{ command: 'demo.titlebtn', when: 'resourceExtname == .txt', group: 'navigation' }, { command: 'demo.titlemore', when: 'resourceFilename == readme.txt', group: '1_more' }, { command: 'demo.titlepy', when: 'resourceLangId == python', group: 'navigation' }], commandPalette: [{ command: 'demo.hidden', when: 'false' }], 'view/item/context': [
       { command: 'demo.eat', when: 'view == demo.tree && viewItem =~ /^(fruit|veg)$/', group: '2_eat@2' },
       { command: 'demo.rename', when: 'view == demo.tree && viewItem == fruit', group: '1_modify@1' },
       { command: 'demo.openfolder', when: "view == demo.tree && viewItem == 'group'", group: 'navigation' },
@@ -62,6 +62,7 @@ exports.activate = (context) => {
   vscode.window.registerTreeDataProvider('demo.bar', { getChildren: () => ['one', 'two', 'three'], getTreeItem: (n) => new vscode.TreeItem(n) })
   for (const [cmd, word] of [['demo.rename', 'renamed'], ['demo.eat', 'ate'], ['demo.openfolder', 'opened'], ['demo.wave', 'waved']]) context.subscriptions.push(vscode.commands.registerCommand(cmd, (el, all) => vscode.window.showInformationMessage(word + ' ' + el.name + ' of ' + all.length)))
   context.subscriptions.push(vscode.commands.registerCommand('demo.count', (uri) => vscode.window.showInformationMessage('counted in ' + path.basename(uri.fsPath) + ' / ' + (vscode.window.activeTextEditor ? vscode.window.activeTextEditor.document.lineCount : 'no editor'))))
+  for (const [cmd, word] of [['demo.exfolder', 'folder action on'], ['demo.extxt', 'text file action on'], ['demo.tabinfo', 'tab info for'], ['demo.titlebtn', 'title button for'], ['demo.titlemore', 'more action for']]) context.subscriptions.push(vscode.commands.registerCommand(cmd, (uri) => vscode.window.showInformationMessage(word + ' ' + path.basename(uri.fsPath))))
   context.subscriptions.push(vscode.commands.registerCommand('demo.picked', (name) => vscode.window.showInformationMessage('picked ' + name)))
   context.subscriptions.push(vscode.commands.registerCommand('demo.refresh', () => { tick++; groups.Fruits.push('cherry'); emitter.fire(undefined) }))
 }
@@ -184,6 +185,42 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
   const at = JSON.parse(await ev(`(() => { const e = ${menuItems}.find((x) => /Demo Count Lines/.test(x.textContent)); const r = e.getBoundingClientRect(); return JSON.stringify({ x: r.left + r.width / 2, y: r.top + r.height / 2 }) })()`))
   await mouse(at.x, at.y)
   check('choosing it runs the command of the extension with the file (a Uri) and the editor it was chosen in', await waitFor(() => ev(`document.body.innerText.includes('counted in readme.txt')`), 15000), await ev(`document.body.innerText.slice(-200)`))
+  // ---- editor/title (buttons at the end of the tab bar), editor/title/context (a tab's menu), explorer/context (the explorer's menu)
+  const treeRow = (name) => `[...document.querySelectorAll('.tree-row')].find((e) => (e.getAttribute('data-tree-path') || '').endsWith(${JSON.stringify(name)}))`
+  const titleBtns = () => ev(`JSON.stringify([...document.querySelectorAll('[data-ext-editor-title]')].map((e) => e.getAttribute('data-ext-editor-title')))`).then((x) => JSON.parse(x || '[]'))
+  check('the tab bar has the button of the entry whose clause fits the file, not the Python one', JSON.stringify(await titleBtns()) === JSON.stringify(['demo.titlebtn']), JSON.stringify(await titleBtns()))
+  await realClick(`document.querySelector('[data-ext-editor-title="demo.titlebtn"]')`)
+  check('clicking it runs the command with the file', await waitFor(() => ev(`document.body.innerText.includes('title button for readme.txt')`), 15000))
+  check('an entry outside the navigation group is behind the "…" button', !!(await ev(`!!document.querySelector('[data-ext-editor-title-more]')`)))
+  await realClick(`document.querySelector('[data-ext-editor-title-more]')`); await sleep(500)
+  check('which lists it', JSON.stringify(await menuLabels()) === JSON.stringify(['Demo More Action']), JSON.stringify(await menuLabels()))
+  await ev(`[...document.querySelectorAll('[data-context-menu] [role="menuitem"]')].find((e) => e.textContent === 'Demo More Action').click()`)
+  check('and choosing it runs the command with the file', await waitFor(() => ev(`document.body.innerText.includes('more action for readme.txt')`), 15000))
+  await rightClick(`document.querySelector('.tab.active')`); await sleep(500)
+  labels = await menuLabels()
+  check('a tab\'s right-click menu ends with the entries of extensions that fit the file', labels.includes('Close') && labels[labels.length - 1] === 'Demo Tab Info', JSON.stringify(labels))
+  await ev(`[...document.querySelectorAll('[data-context-menu] [role="menuitem"]')].find((e) => e.textContent === 'Demo Tab Info').click()`)
+  check('choosing it runs the command with the file', await waitFor(() => ev(`document.body.innerText.includes('tab info for readme.txt')`), 15000))
+  await ev(`document.querySelector('[data-view="files"]').click()`); await sleep(500)
+  await rightClick(treeRow('readme.txt')); await sleep(500)
+  labels = await menuLabels()
+  check('a file in the explorer gets the entry for files of its kind, not the one for folders', labels.includes('Demo Text File Action') && !labels.includes('Demo Folder Action') && labels.indexOf('Demo Text File Action') > labels.indexOf('Copy Relative Path'), JSON.stringify(labels))
+  await ev(`[...document.querySelectorAll('[data-context-menu] [role="menuitem"]')].find((e) => e.textContent === 'Demo Text File Action').click()`)
+  check('choosing it runs the command with the file', await waitFor(() => ev(`document.body.innerText.includes('text file action on readme.txt')`), 15000))
+  await rightClick(treeRow('docs')); await sleep(500)
+  labels = await menuLabels()
+  check('a folder gets the entry for folders only', labels.includes('Demo Folder Action') && !labels.includes('Demo Text File Action'), JSON.stringify(labels))
+  await ev(`[...document.querySelectorAll('[data-context-menu] [role="menuitem"]')].find((e) => e.textContent === 'Demo Folder Action').click()`)
+  check('and it is run with the folder', await waitFor(() => ev(`document.body.innerText.includes('folder action on docs')`), 15000))
+  await rightClick(treeRow('tool.py')); await sleep(500)
+  labels = await menuLabels()
+  check('a Python file gets neither', !labels.includes('Demo Text File Action') && !labels.includes('Demo Folder Action'), JSON.stringify(labels))
+  await esc()
+  await ev(`${treeRow('tool.py')}.click()`); await sleep(1500)
+  check('with a Python file active the tab bar switches to the Python entry and the text one goes', JSON.stringify(await titleBtns()) === JSON.stringify(['demo.titlepy']) && !(await ev(`!!document.querySelector('[data-ext-editor-title-more]')`)), JSON.stringify(await titleBtns()))
+  await rightClick(`document.querySelector('.tab.active')`); await sleep(500)
+  check('and its tab menu has no "Demo Tab Info"', !(await menuLabels()).includes('Demo Tab Info'), JSON.stringify(await menuLabels()))
+  await esc()
   // the view container of its own
   check('the extension\'s own container has a button in the activity bar', await waitFor(() => ev(`!!document.querySelector('[data-view="xc:demo-bar"]')`)))
   await realClick(`document.querySelector('[data-view="xc:demo-bar"]')`); await sleep(1200)

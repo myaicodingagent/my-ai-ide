@@ -41,6 +41,9 @@ export interface ExtRecord {
   treeMenus: { command: string; title: string; when: string; group: string }[]
   viewTitleMenus: { command: string; title: string; when: string; group: string }[] // buttons in the header of a view ("view/title")
   editorMenus: { command: string; title: string; when: string; group: string }[] // entries of the editor's right-click menu ("editor/context")
+  explorerMenus: { command: string; title: string; when: string; group: string }[] // entries of a file or folder's right-click menu in the explorer ("explorer/context")
+  editorTitleMenus: { command: string; title: string; when: string; group: string }[] // buttons at the end of the tab bar ("editor/title")
+  tabMenus: { command: string; title: string; when: string; group: string }[] // entries of a tab's right-click menu ("editor/title/context")
   hiddenCommands: string[] // commands the palette must not list ("commandPalette" entries whose when is false)
   unsupported: string[] // contributions that are ignored (grammars, languages, debuggers...)
   codeIgnored: boolean // a VS Code extension with code (main) that cannot run here
@@ -107,7 +110,7 @@ async function readExtension(dir: string, source: ExtRecord['source']): Promise<
       : []
   const unsupported = Object.keys(c).filter((k) => !SUPPORTED.has(k) && k !== 'menus')
   const menus = (c.menus && typeof c.menus === 'object' ? c.menus : {}) as Record<string, unknown>
-  const otherMenus = Object.keys(menus).filter((k) => !['view/item/context', 'view/title', 'editor/context', 'commandPalette'].includes(k))
+  const otherMenus = Object.keys(menus).filter((k) => !['view/item/context', 'view/title', 'editor/context', 'commandPalette', 'explorer/context', 'editor/title', 'editor/title/context'].includes(k))
   if (otherMenus.length) unsupported.push('menus (' + otherMenus.join(', ') + ')')
   const titleOf = new Map(commands.map((x) => [x.id, x.title]))
   const menuList = (key: string): ExtRecord['treeMenus'] =>
@@ -150,6 +153,9 @@ async function readExtension(dir: string, source: ExtRecord['source']): Promise<
     treeMenus,
     viewTitleMenus: menuList('view/title'),
     editorMenus: menuList('editor/context'),
+    explorerMenus: menuList('explorer/context'),
+    editorTitleMenus: menuList('editor/title'),
+    tabMenus: menuList('editor/title/context'),
     hiddenCommands,
     unsupported,
     codeIgnored: false,
