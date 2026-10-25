@@ -6,7 +6,7 @@ import { homedir } from 'os'
 import { basename, delimiter, dirname, join } from 'path'
 import type { DbgBreakpoint, DbgEvent, DbgFrame, DbgScope, DbgVar } from './debugger'
 import { findPython, hasDebugpy } from './pythonenv'
-import * as ssh from './sshfs'
+import * as host from './hostenv'
 import { NETCOREDBG_HELP, findNetcoredbg } from './netcoredbg'
 import { CPP_HELP, compileCpp, findCppDebugger, isCppSource } from './cpptools'
 import { JAVA_HELP, compileJava, ensureJavaAdapter, findJdk } from './javatools'
@@ -197,7 +197,7 @@ export const pythonAdapter: Adapter = {
   label: 'Python',
   files: /\.pyw?$/i,
   async start(opts) {
-    if (ssh.isRemotePath(opts.file)) return startRemotePython(opts)
+    if (host.isRemotePath(opts.file)) return startRemotePython(opts)
     const py = await findPython()
     if (!py) throw new Error('Python 3 was not found. Install it from python.org (tick "Add to PATH").')
     if (!(await hasDebugpy(py))) throw new Error(DEBUGPY_HELP)
@@ -230,8 +230,8 @@ export const pythonAdapter: Adapter = {
 const randomPort = (): number => 30000 + Math.floor(Math.random() * 20000)
 
 /** Opens a tunnel to a port on the remote computer and connects once something is listening there. */
-async function connectRemote(unc: string, port: number, proc: ssh.RemoteProcess, what: string): Promise<{ socket: Socket; tunnel: { close(): void } }> {
-  const tunnel = await ssh.forwardPort(unc, port)
+async function connectRemote(unc: string, port: number, proc: host.RemoteProcess, what: string): Promise<{ socket: Socket; tunnel: { close(): void } }> {
+  const tunnel = await host.forwardPort(unc, port)
   try {
     for (let i = 0; i < 80; i++) {
       if (proc.exitCode !== null) break
@@ -256,10 +256,10 @@ async function connectRemote(unc: string, port: number, proc: ssh.RemoteProcess,
 const REMOTE_PYTHON = 'port=$1; shift; for p in python3 python; do if $p -c "import sys" >/dev/null 2>&1; then exec $p -m debugpy --listen 127.0.0.1:$port --wait-for-client "$@"; fi; done; echo "Python was not found on this computer." >&2; exit 127'
 
 async function startRemotePython(opts: DebugOptions): Promise<Started> {
-  const name = ssh.parseRemote(opts.file)?.name as string
+  const name = host.parseRemote(opts.file)?.name as string
   const cwdUnc = opts.cwd || dirname(opts.file)
   const port = randomPort()
-  const proc = ssh.spawnRemote(cwdUnc, ['sh', '-c', REMOTE_PYTHON, 'sh', String(port), ssh.nativePath(opts.file) as string, ...(opts.args ?? [])], { env: { PYTHONIOENCODING: 'utf-8', ...(opts.env ?? {}) } })
+  const proc = host.spawnRemote(cwdUnc, ['sh', '-c', REMOTE_PYTHON, 'sh', String(port), host.nativePath(opts.file) as string, ...(opts.args ?? [])], { env: { PYTHONIOENCODING: 'utf-8', ...(opts.env ?? {}) } })
   let stderr = ''
   proc.stderr.on('data', (b: Buffer) => (stderr = (stderr + b.toString('utf-8')).slice(-2000)))
   proc.stdout.resume()
@@ -326,7 +326,7 @@ const freePort = (): Promise<number> =>
 
 // Delve speaks the Debug Adapter Protocol over TCP: `dlv dap --listen=...`, then connect to that port.
 async function spawnDelve(cwd: string, emit: (e: DbgEvent) => void): Promise<{ child: ChildProcess; socket: Socket; stderr: () => string; dispose?: () => void }> {
-  const remote = ssh.isRemotePath(cwd)
+  const remote = host.isRemotePath(cwd)
   let dlv = ''
   if (!remote) {
     const found = findDelve()
@@ -335,7 +335,7 @@ async function spawnDelve(cwd: string, emit: (e: DbgEvent) => void): Promise<{ c
   }
   const port = remote ? randomPort() : await freePort()
   const child = remote
-    ? (ssh.spawnRemote(cwd, ['sh', '-c', 'PATH="$PATH:$HOME/go/bin:/usr/local/go/bin:/usr/local/bin"; exec dlv dap --listen=127.0.0.1:' + port]) as unknown as ChildProcess)
+    ? (host.spawnRemote(cwd, ['sh', '-c', 'PATH="$PATH:$HOME/go/bin:/usr/local/go/bin:/usr/local/bin"; exec dlv dap --listen=127.0.0.1:' + port]) as unknown as ChildProcess)
     : spawn(dlv, ['dap', `--listen=127.0.0.1:${port}`], { cwd, env: cleanEnv(), stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
   let stderr = ''
   let said = ''
@@ -365,7 +365,7 @@ async function spawnDelve(cwd: string, emit: (e: DbgEvent) => void): Promise<{ c
   })
   let tunnel: { port: number; close(): void } | undefined
   if (remote) {
-    tunnel = await ssh.forwardPort(cwd, port).catch((e) => {
+    tunnel = await host.forwardPort(cwd, port).catch((e) => {
       child.kill()
       throw new Error(`Could not reach Delve on the other computer: ${e instanceof Error ? e.message : String(e)}`)
     })
@@ -390,15 +390,15 @@ export const goAdapter: Adapter = {
   files: /\.go$/i,
   async start(opts, emit) {
     const cwd = opts.cwd || dirname(opts.file)
-    const remote = ssh.isRemotePath(opts.file)
+    const remote = host.isRemotePath(opts.file)
     const { child, socket, stderr, dispose } = await spawnDelve(cwd, emit)
-    const native = (p: string): string => (remote ? (ssh.nativePath(p) as string) : p)
+    const native = (p: string): string => (remote ? (host.nativePath(p) as string) : p)
     return {
       child,
       io: { input: socket, output: socket },
       stderr,
       dispose,
-      remote: remote ? ssh.parseRemote(opts.file)?.name : undefined,
+      remote: remote ? host.parseRemote(opts.file)?.name : undefined,
       launch: {
         name: 'Go',
         type: 'go',
@@ -475,7 +475,7 @@ export const csharpAdapter: Adapter = {
     }
   },
   async start(opts, emit) {
-    if (ssh.isRemotePath(opts.file)) throw new Error('C# programs on another computer cannot be debugged yet.')
+    if (host.isRemotePath(opts.file)) throw new Error('C# programs on another computer cannot be debugged yet.')
     const dbg = findNetcoredbg()
     if (!dbg) throw new Error(NETCOREDBG_HELP)
     const proj = findProject(dirname(opts.file))
@@ -517,7 +517,7 @@ export const cppAdapter: Adapter = {
     }
   },
   async start(opts, emit) {
-    if (ssh.isRemotePath(opts.file)) throw new Error('C and C++ programs on another computer cannot be debugged yet.')
+    if (host.isRemotePath(opts.file)) throw new Error('C and C++ programs on another computer cannot be debugged yet.')
     if (!isCppSource(opts.file)) throw new Error('Open a .c or .cpp file to debug it (a header cannot be run).')
     const dbg = findCppDebugger()
     if (!dbg) throw new Error(CPP_HELP)
@@ -544,7 +544,7 @@ export const javaAdapter: Adapter = {
   label: 'Java',
   files: /\.java$/i,
   async start(opts, emit) {
-    if (ssh.isRemotePath(opts.file)) throw new Error('Java programs on another computer cannot be debugged yet.')
+    if (host.isRemotePath(opts.file)) throw new Error('Java programs on another computer cannot be debugged yet.')
     const jdk = findJdk()
     if (!jdk) throw new Error(JAVA_HELP)
     emit({ type: 'output', stream: 'info', text: `Compiling ${basename(opts.file)}...\n` })
@@ -608,7 +608,7 @@ export function startPythonDebug(opts: DebugOptions, emit: (e: DbgEvent) => void
 
 /** Starts a program under a debug adapter. Resolves when it is running (breakpoints set), rejects with a readable message. */
 export async function startDapDebug(adapter: Adapter, opts: DebugOptions, emit: (e: DbgEvent) => void): Promise<DapSession> {
-  if (ssh.isRemotePath(opts.file)) await ssh.requireFile(opts.file)
+  if (host.isRemotePath(opts.file)) await host.requireFile(opts.file)
   else if (!existsSync(opts.file)) throw new Error(`The file does not exist: ${opts.file}`)
   return runDap(adapter, await adapter.start(opts, emit), opts.breakpoints, [opts.file], false, emit)
 }
@@ -639,8 +639,8 @@ async function runDap(adapter: Adapter, started: Started, breakpointsByFile: Rec
   // reports is turned back into the editor's address.
   const remote = started.remote
   const toAdapter = (file: string): string | null => {
-    if (!remote) return ssh.isRemotePath(file) ? null : (adapter.adapterPath?.(file) ?? file)
-    return ssh.parseRemote(file)?.name === remote ? ssh.nativePath(file) : null
+    if (!remote) return host.isRemotePath(file) ? null : (adapter.adapterPath?.(file) ?? file)
+    return host.parseRemote(file)?.name === remote ? host.nativePath(file) : null
   }
   const breakpointArgs = (bps: DbgBreakpoint[]): Json[] => bps.map((b) => ({ line: b.line, ...(b.condition?.trim() ? { condition: b.condition } : {}) }))
   let frames: { id: number }[] = []
@@ -697,7 +697,7 @@ async function runDap(adapter: Adapter, started: Started, breakpointsByFile: Rec
       const list: DbgFrame[] = st.stackFrames.map((f, i) => ({
         index: i,
         name: adapter.frameName ? adapter.frameName(String(f.name)) : String(f.name),
-        file: f.source?.path ? (remote ? ssh.fromNativePath(remote, String(f.source.path)) : existsSync(String(f.source.path)) ? spellAs(String(f.source.path)) : null) : null,
+        file: f.source?.path ? (remote ? host.fromNativePath(remote, String(f.source.path)) : existsSync(String(f.source.path)) ? spellAs(String(f.source.path)) : null) : null,
         url: String(f.source?.path ?? ''),
         line: Number(f.line) || 1,
         column: Number(f.column) || 1

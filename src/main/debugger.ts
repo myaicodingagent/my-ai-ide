@@ -8,8 +8,8 @@ import WebSocket from 'ws'
 import { SourceMapIndex, parseSourceMap } from './sourcemap'
 import { installNetcoredbg } from './netcoredbg'
 import { DapSession, adapterFor, cppAdapter, csharpAdapter, goAdapter, javaAdapter, killTree, pythonAdapter, startDapAttach, startDapDebug } from './dap'
-import * as ssh from './sshfs'
-import { isRemotePath } from './sshfs'
+import * as host from './hostenv'
+import { isRemotePath } from './hostenv'
 
 // A JavaScript debugger: the program runs under `node --inspect-brk` and this talks to Node's built-in inspector
 // (the Chrome DevTools protocol) over a WebSocket. One session at a time.
@@ -108,7 +108,7 @@ function regexForHref(href: string): string {
 function fileFromUrl(url: string, remote?: string): string | null {
   if (!url.startsWith('file:')) return null
   try {
-    if (remote) return ssh.fromNativePath(remote, decodeURIComponent(new URL(url).pathname).replace(/^\/(?=[A-Za-z]:)/, ''))
+    if (remote) return host.fromNativePath(remote, decodeURIComponent(new URL(url).pathname).replace(/^\/(?=[A-Za-z]:)/, ''))
     return fileURLToPath(url)
   } catch {
     return null
@@ -154,7 +154,7 @@ async function applyBreakpoints(s: Session, file: string, bps: DbgBreakpoint[]):
       let urlRegex: string
       if (s.remote) {
         // Only files on the computer the program runs on can have breakpoints in it.
-        const native = ssh.parseRemote(file)?.name === s.remote ? ssh.nativePath(file) : null
+        const native = host.parseRemote(file)?.name === s.remote ? host.nativePath(file) : null
         if (!native) continue
         urlRegex = urlRegexForNative(native)
       } else if (isRemotePath(file)) continue
@@ -308,11 +308,11 @@ async function start(opts: {
   breakpoints: Record<string, DbgBreakpoint[]>
 }): Promise<{ ok: true } | { ok: false; error: string }> {
   if (session && !session.exited) return { ok: false, error: 'A debug session is already running. Stop it first.' }
-  const remote = isRemotePath(opts.file) ? ssh.parseRemote(opts.file)?.name : undefined
+  const remote = isRemotePath(opts.file) ? host.parseRemote(opts.file)?.name : undefined
   if (remote) {
     if (TS_FILE.test(opts.file)) return { ok: false, error: 'TypeScript programs on another computer cannot be debugged yet. Compile it there and debug the JavaScript file.' }
     try {
-      await ssh.requireFile(opts.file)
+      await host.requireFile(opts.file)
     } catch (e) {
       return { ok: false, error: e instanceof Error ? e.message : String(e) }
     }
@@ -340,7 +340,7 @@ async function start(opts: {
   try {
     if (remote) {
       // On the other computer: its own node, started over SSH; the debugger port is reached through the same connection.
-      child = ssh.spawnRemote(cwd, ['node', '--inspect-brk=127.0.0.1:0', ssh.nativePath(opts.file) as string, ...(opts.args ?? [])], { env: opts.env }) as unknown as ChildProcess
+      child = host.spawnRemote(cwd, ['node', '--inspect-brk=127.0.0.1:0', host.nativePath(opts.file) as string, ...(opts.args ?? [])], { env: opts.env }) as unknown as ChildProcess
     } else
     child = spawn(file, ['--inspect-brk=127.0.0.1:0', program, ...(opts.args ?? [])], {
       cwd,
@@ -404,7 +404,7 @@ async function start(opts: {
           ws.on('error', (e) => fail(`Could not connect to the debugger: ${e.message}`))
         }
         if (remote) {
-          ssh.forwardPort(cwd, Number(m[2])).then(
+          host.forwardPort(cwd, Number(m[2])).then(
             (t) => {
               s.tunnel = t
               open(m[0].replace(/^ws:\/\/[^/]+/, `ws://127.0.0.1:${t.port}`))
