@@ -13,11 +13,13 @@ fs.mkdirSync(path.dirname(stub), { recursive: true })
 fs.writeFileSync(stub, 'module.exports = global.__electronStub')
 const entry = path.join(root, 'node_modules', '.cache', 'ssh-git-entry.ts')
 fs.writeFileSync(entry, `export * as ssh from ${JSON.stringify(path.join(root, 'src/main/sshfs.ts').split(require('path').sep).join('/'))}\nexport * as git from ${JSON.stringify(path.join(root, 'src/main/git.ts').split(require('path').sep).join('/'))}\n`)
-fs.appendFileSync(entry, `export * as agent from ${JSON.stringify(path.join(root, 'src/main/agent.ts').split(path.sep).join('/'))}
+fs.appendFileSync(entry, `export * as codeindex from ${JSON.stringify(path.join(root, 'src/main/codeindex.ts').split(path.sep).join('/'))}
+export { setEmbedderForTests } from ${JSON.stringify(path.join(root, 'src/main/embeddings.ts').split(path.sep).join('/'))}
+export * as agent from ${JSON.stringify(path.join(root, 'src/main/agent.ts').split(path.sep).join('/'))}
 `)
 require('esbuild').buildSync({ entryPoints: [entry], bundle: true, platform: 'node', format: 'cjs', external: ['ssh2', '@anthropic-ai/sdk'], alias: { electron: stub }, outfile: bundle, logLevel: 'error' })
-const { ssh, git, agent } = require(bundle)
-ssh.registerSshHandlers(); git.registerGitHandlers()
+const { ssh, git, agent, codeindex, setEmbedderForTests } = require(bundle)
+ssh.registerSshHandlers(); git.registerGitHandlers(); codeindex.registerCodeIndexHandlers()
 const call = (n, ...a) => handlers[n]({}, ...a)
 const results = []
 const check = (name, ok, detail = '') => { results.push(ok); console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  -> ' + String(detail).slice(0, 220) : ''}`) }
@@ -86,6 +88,36 @@ const sh = (cwd, ...args) => cp.execFileSync('git', ['-c', 'user.name=t', '-c', 
   fs.writeFileSync(path.join(proj, 'util', 'maths.js'), ['export function addNumbers(a, b) {', '  return a + b', '}', 'export function farewellUser() {}', ''].join(NL))
   const later = await agent.runTool(dir, 'search_codebase', { query: 'farewell user' }).catch((e) => 'ERR ' + e.message)
   check('and a file changed on the server is searched again', /maths[.]js/.test(later), later)
+
+  // search by meaning over SSH: a fake embedder knows a few synonyms and stands in for the model
+  const CONCEPTS = [['login', 'authenticate', 'signin', 'credentials', 'session'], ['invoice', 'bill', 'payment', 'charge', 'total']]
+  let embedded = 0
+  const fakeEmbed = async (texts) => { embedded += texts.length; return texts.map((t) => {
+    const v = new Float32Array(384)
+    for (const wd of String(t).toLowerCase().match(/[a-z]+/g) || []) CONCEPTS.forEach((group, gi) => { if (group.some((g) => wd.includes(g))) v[gi] += 1 })
+    v[100] = 0.05
+    const n = Math.hypot(...v) || 1
+    return v.map((x) => x / n)
+  }) }
+  fs.mkdirSync(path.join(proj, 'auth'), { recursive: true }); fs.mkdirSync(path.join(proj, 'pay'), { recursive: true })
+  fs.writeFileSync(path.join(proj, 'auth', 'gate.ts'), 'export function authenticate(credentials) {' + NL + '  return startSession(credentials)' + NL + '}' + NL)
+  fs.writeFileSync(path.join(proj, 'pay', 'charge.ts'), 'export function chargeCustomer(bill) {' + NL + '  return bill.total' + NL + '}' + NL)
+  setEmbedderForTests(fakeEmbed)
+  call('index:embeddings', true)
+  let sr = await call('index:search', [dir], 'how does a person signin', { ai: false })
+  const topRel = (x) => x.hits.map((h) => h.rel)
+  check('meaning: finds code that shares no word with the question in a folder on the server', sr.ok && topRel(sr)[0] === 'auth/gate.ts', JSON.stringify(topRel(sr)))
+  check('meaning: reports that vectors were used', sr.semantic && sr.semantic.used === true && sr.semantic.done === sr.semantic.total && sr.semantic.total >= 2, JSON.stringify(sr.semantic))
+  check('meaning: the hit opens the remote file', sr.hits[0] && sr.hits[0].abs === dir.replace(/[\\/]+$/, '') + '\\auth\\gate.ts', sr.hits[0] && sr.hits[0].abs)
+  call('index:embeddings', false)
+  sr = await call('index:search', [dir], 'how does a person signin', { ai: false })
+  check('meaning: with the toggle off the same question finds nothing by words', !sr.semantic && !topRel(sr).includes('auth/gate.ts'), JSON.stringify(topRel(sr)))
+  call('index:embeddings', true)
+  await call('index:reset', dir)
+  embedded = 0
+  sr = await call('index:search', [dir], 'a bill to pay', { ai: false })
+  check('meaning: vectors of the server folder are remembered (only the question is embedded again)', embedded === 1 && topRel(sr)[0] === 'pay/charge.ts', embedded + ' ' + JSON.stringify(topRel(sr)))
+  call('index:embeddings', false); setEmbedderForTests(null)
 
 
   ssh.disconnectAll(); server.close()

@@ -88,7 +88,7 @@ npm run test:debug   # the debugger against real Node programs
 npm run test:ext     # extensions: install, themes, snippets, host process, registry (fake)
 npm run test:shells  # WSL / SSH helpers
 npm run test:ssh     # editing files over SSH against a built-in test SSH server
-npm run test:ssh-git # git and the agent's tools over SSH (the test server runs the commands with local git and sh)
+npm run test:ssh-git # git, search by meaning (words and vectors) and the agent's tools over SSH (the test server runs the commands with local git and sh)
 npm run test:packaged-debug # the PACKAGED app debugs a Java, a C++ and a C# program through the Run menu (needs npm run dist first; each language is skipped without its tools)
 # (If an editor that has the project open keeps release\win-unpacked locked, so that npm run dist fails: build elsewhere with
 #  npx electron-builder --win --dir -c.directories.output=C:\somewhere  and run the packaged tests with MY_AI_IDE_EXE=C:\somewhere\win-unpacked\My AI IDE.exe)
