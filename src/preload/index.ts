@@ -140,6 +140,17 @@ const api = {
   },
   nbHtmlPage: (html: string): Promise<string | null> => ipcRenderer.invoke('nb:htmlPage', html),
   nbKernels: (): Promise<KernelInfo[]> => ipcRenderer.invoke('nb:kernels'),
+  // Live Share: a host opens a session on a folder, guests join with its code (see src/main/liveshare.ts)
+  lsHost: (opts: { root: string; name?: string; readOnly?: boolean; network?: boolean }): Promise<{ ok: true; join: string; sid: string } | { ok: false; error: string }> => ipcRenderer.invoke('ls:host', opts),
+  lsJoin: (code: string, name: string): Promise<{ ok: true; sid: string; root: string; hostName: string; readOnly: boolean; id: string; peers: { id: string; name: string }[] } | { ok: false; error: string }> => ipcRenderer.invoke('ls:join', code, name),
+  lsStop: (): Promise<void> => ipcRenderer.invoke('ls:stop'),
+  lsStatus: (): Promise<{ role: 'none' } | { role: 'host' | 'guest'; sid: string; readOnly: boolean; peers: { id: string; name: string }[]; join?: string }> => ipcRenderer.invoke('ls:status'),
+  lsSend: (msg: Record<string, unknown>): Promise<void> => ipcRenderer.invoke('ls:send', msg),
+  onLsEvent: (cb: (e: Record<string, any>) => void): (() => void) => {
+    const h = (_e: unknown, payload: Record<string, any>): void => cb(payload)
+    ipcRenderer.on('ls:event', h)
+    return () => ipcRenderer.removeListener('ls:event', h)
+  },
   sshConnect: (address: string, secrets?: { password?: string; passphrase?: string; trust?: string }): Promise<ConnectResult> => ipcRenderer.invoke('ssh:connect', address, secrets),
   sshEnsure: (unc: string, secrets?: { password?: string; passphrase?: string; trust?: string }): Promise<ConnectResult> => ipcRenderer.invoke('ssh:ensure', unc, secrets),
   sshDisconnect: (name: string): Promise<void> => ipcRenderer.invoke('ssh:disconnect', name),

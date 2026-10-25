@@ -2,6 +2,7 @@ import { BrowserWindow, clipboard, ipcMain, shell } from 'electron'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'path'
 import { promises as fs, watch, FSWatcher, realpathSync } from 'fs'
 import * as ssh from './sshfs'
+import { isLiveSharePath, lsWriteFile } from './liveshare'
 
 // File operations for the explorer (create, rename, delete, reveal) and a watcher that tells the UI when
 // files change outside the app. Every path coming from the UI must stay inside the open project folder.
@@ -53,7 +54,10 @@ const fail = (e: unknown): { ok: false; error: string } => {
 }
 
 export function registerFsOps(getWin: () => BrowserWindow | null): void {
+  // In a Live Share session a guest can make new files in the shared folder; moving and deleting stay with the host.
+  const guestOnly: Result = { ok: false, error: 'Only the host can do that in a Live Share session.' }
   ipcMain.handle('fs:createFile', async (_e, root: string, target: string): Promise<Result> => {
+    if (isLiveSharePath(target)) return lsWriteFile(target, '', true).then(() => ({ ok: true as const }), fail)
     if (ssh.isRemotePath(target)) {
       const bad = remoteCheck(root, target)
       if (bad) return { ok: false, error: bad }
@@ -70,6 +74,7 @@ export function registerFsOps(getWin: () => BrowserWindow | null): void {
   })
 
   ipcMain.handle('fs:createDir', async (_e, root: string, target: string): Promise<Result> => {
+    if (isLiveSharePath(target)) return guestOnly
     if (ssh.isRemotePath(target)) {
       const bad = remoteCheck(root, target)
       if (bad) return { ok: false, error: bad }
@@ -86,6 +91,7 @@ export function registerFsOps(getWin: () => BrowserWindow | null): void {
   })
 
   ipcMain.handle('fs:rename', async (_e, root: string, from: string, to: string): Promise<Result> => {
+    if (isLiveSharePath(from) || isLiveSharePath(to)) return guestOnly
     if (ssh.isRemotePath(from) || ssh.isRemotePath(to)) {
       const bad = remoteCheck(root, to) ?? (ssh.isRemotePath(from) ? null : 'Files cannot be moved between computers.')
       if (bad) return { ok: false, error: bad }
@@ -109,6 +115,7 @@ export function registerFsOps(getWin: () => BrowserWindow | null): void {
 
   // To the Recycle Bin, so a mistake can be undone from Windows.
   ipcMain.handle('fs:trash', async (_e, root: string, target: string): Promise<Result> => {
+    if (isLiveSharePath(target)) return guestOnly
     // A server has no Recycle Bin: the item is deleted for good (the editor asks first).
     if (ssh.isRemotePath(target)) {
       if (remoteCheck(root, target)) return { ok: false, error: 'That item is outside the project folder.' }
@@ -248,7 +255,7 @@ export function registerFsOps(getWin: () => BrowserWindow | null): void {
     if (timer) clearTimeout(timer)
     timer = null
     for (const root of folders === null ? [] : Array.isArray(folders) ? folders : [folders]) {
-      if (!root || ssh.isRemotePath(root)) continue // nothing to watch on another computer; the tree refreshes when you come back to the window
+      if (!root || ssh.isRemotePath(root) || isLiveSharePath(root)) continue // nothing to watch on another computer; the tree refreshes when you come back to the window
       try {
         // Watch the real (long-name) spelling of the folder: with a short 8.3 name such as ABDULB~1 some Node/libuv versions abort the whole process.
         let watchRoot = root

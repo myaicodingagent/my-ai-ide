@@ -36,6 +36,7 @@ export function getRecentFolders(): string[] {
 
 /** Puts a folder at the top of the recent list. */
 export function addRecentFolder(root: string): void {
+  if (/^\\\\liveshare\./i.test(root)) return // a session's folder is gone when the session ends
   write(RECENT_KEY, [root, ...getRecentFolders().filter((f) => !sameFolder(f, root))].slice(0, MAX_RECENT))
 }
 

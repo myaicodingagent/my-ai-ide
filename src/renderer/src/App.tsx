@@ -53,6 +53,7 @@ import { validSshTarget, wslUnc } from '../../main/shellspec'
 import type { ConnectResult } from '../../main/sshfs'
 import { extensionCommands, initExtensions, onExtensionsChanged } from './extStore'
 import { attachExtEditorMenus } from './extEditorMenus'
+import { endSession, getLiveShare, initLiveShare, joinSession, onLiveShareClosed, startSession, useLiveShare } from './liveshare'
 import { fileMenuEntries, fileMenuItems, runFileMenuEntry } from './extFileMenus'
 import { attachDebugEditor, toggleBreakpointAtCaret } from './debugEditor'
 import { attachDebugging, getDebug, initDebug, isActive as debugActive, startDebugging, stepDebug, stopDebugging, clearBreakpoints as clearAllBreakpoints } from './debugStore'
@@ -587,6 +588,7 @@ export function App(): JSX.Element {
   extraRootsRef.current = extraRoots
   const rootsRef = useRef(roots)
   const lspServers = useLspServers()
+  const live = useLiveShare()
   const webviewPanels = useWebviewPanels()
   const activeWebview = useActiveWebview()
   useEffect(() => setActiveWebview(null), [active]) // opening a file leaves an extension's page
@@ -805,6 +807,74 @@ export function App(): JSX.Element {
   }, [])
   openFolderPathRef.current = openFolderPath
   sshAttemptRef.current = sshAttempt
+
+  // ---- Live Share: host a folder, or join somebody else's (see liveshare.ts) ----
+  const closeFolder = useCallback((): void => {
+    editorRef.current?.setModel(null)
+    splitEditorRef.current?.setModel(null)
+    for (const t of tabsRef.current) disposeModel(t.model)
+    diskText.current.clear()
+    setTabs([])
+    setActive(null)
+    setDiffView(null)
+    setSelected(null)
+    sessionReadyFor.current = null
+    setExtraRoots([])
+    setRoot(null)
+  }, [])
+  const liveShareStart = useCallback((): void => {
+    const r = rootRef.current
+    if (!r || r.startsWith('\\\\')) return void window.alert('Open a folder on this PC first: that is the folder that is shared.')
+    setChoice({
+      text: 'Who can join the session? Guests can open and edit the files of this folder, and nothing else: no terminal, no commands, no other folders. They need the session code.',
+      kind: 'info',
+      choices: ['This PC only', 'Computers on my network'],
+      resolve: (scope) => {
+        if (!scope) return
+        setChoice({
+          text: 'What can guests do?',
+          kind: 'info',
+          choices: ['Edit files', 'Only read'],
+          resolve: (mode) => {
+            if (!mode) return
+            void startSession(r, { network: scope.startsWith('Computers'), readOnly: mode === 'Only read' }).then((res) => {
+              if (!res.ok) return void window.alert(res.error)
+              void window.api.copyText(res.join)
+              showToast('Live Share is open. The session code is copied: ' + res.join)
+            })
+          }
+        })
+      }
+    })
+  }, [showToast])
+  const liveShareJoin = useCallback((): void => {
+    setInputRequest({
+      title: 'Join a Live Share session: paste the session code',
+      placeholder: '192.168.1.5:50123#…',
+      confirmLabel: 'Join',
+      validate: (v) => (/^(ls:\/\/)?[A-Za-z0-9.[\]:-]+:\d{1,5}#[0-9a-f]{32}$/.test(v.trim()) ? null : 'A session code looks like 192.168.1.5:50123#…'),
+      onSubmit: (v) => {
+        void joinSession(v.trim(), '').then(async (res) => {
+          if (!res.ok) return void window.alert(res.error)
+          await openFolderPathRef.current(res.root)
+          showToast('Joined ' + res.hostName + '’s session.')
+        })
+      }
+    })
+  }, [showToast])
+  const liveShareEnd = useCallback((): void => {
+    const wasGuest = getLiveShare().role === 'guest'
+    void endSession().then(() => {
+      if (wasGuest) closeFolder()
+    })
+  }, [closeFolder])
+  useEffect(() => {
+    initLiveShare()
+    onLiveShareClosed((reason) => {
+      showToast(reason, 'warning')
+      if (rootRef.current?.startsWith('\\\\liveshare.')) closeFolder()
+    })
+  }, [showToast, closeFolder])
 
   // ---- Workspace folders: more than one project folder in the same window ----
   const extrasLoadedFor = useRef<string | null>(null)
@@ -1864,6 +1934,10 @@ export function App(): JSX.Element {
         label: 'File: Open WSL Folder…',
         run: () => void openWslFolderPicker()
       },
+      { label: 'Live Share: Start a Session…', run: liveShareStart },
+      { label: 'Live Share: Join a Session…', run: liveShareJoin },
+      { label: 'Live Share: Copy the Session Code', run: () => void (getLiveShare().join ? window.api.copyText(getLiveShare().join).then(() => showToast('The session code is copied.')) : showToast('No session is open.')) },
+      { label: 'Live Share: End the Session or Leave It', run: liveShareEnd },
       { label: 'View: Toggle AI Chat', run: () => setShowChat((v) => !v) },
       { label: 'AI: Edit Selection (Ctrl+K)', run: () => startInlineRef.current() },
       { label: 'AI: Toggle Autocomplete', run: toggleAutocomplete },
@@ -2599,6 +2673,17 @@ export function App(): JSX.Element {
         <span className="sb-item" title={root ?? 'No folder open'}>
           {root ? baseName(root) : 'No folder'}
         </span>
+        {live.role !== 'none' && (
+          <button
+            className="sb-item sb-btn"
+            data-sb="liveshare"
+            title={(live.role === 'host' ? 'You are hosting a Live Share session. Click to copy the session code. ' : 'You joined a Live Share session. ') + live.peers.map((p) => p.name).join(', ')}
+            onClick={() => (live.role === 'host' ? void window.api.copyText(live.join).then(() => showToast('The session code is copied.')) : undefined)}
+          >
+            ⇆ Live Share: {live.role === 'host' ? 'hosting' : 'joined'} · {live.peers.length}
+            {live.readOnly ? ' (read-only)' : ''}
+          </button>
+        )}
         {root && /^\\\\ssh\./i.test(root) && (
           <span className="sb-item" data-sb="ssh" title="This folder is on another computer, opened over SSH">
             ⇄ SSH: {root.split('\\')[2]?.slice(4)}

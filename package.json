@@ -35,6 +35,7 @@
     "test:ssh-debug": "node tests/ssh-debug.cjs",
     "test:ssh-background": "node tests/ssh-background.cjs",
     "test:wsl-git": "node tests/wsl-git.cjs",
+    "test:liveshare": "node tests/liveshare.cjs",
     "test:cloud-agent": "node tests/cloud-agent.cjs",
     "test:cloud-packaged": "node tests/cloud-packaged.cjs",
     "test:wsl-background": "node tests/wsl-background.cjs",
@@ -68,7 +69,8 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "ssh2": "^1.17.0",
-    "ws": "^8.22.0"
+    "ws": "^8.22.0",
+    "yjs": "^13.6.33"
   },
   "devDependencies": {
     "@types/adm-zip": "^0.5.8",

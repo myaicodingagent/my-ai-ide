@@ -19,6 +19,7 @@ import { notebookPage, registerNotebookHandlers, stopAllKernels } from './notebo
 import { webviewMayRead, webviewPage } from './extensions'
 import { registerLspHandlers, stopAllLanguageServers } from './lsp'
 import * as ssh from './sshfs'
+import * as live from './liveshare'
 import { parseJsonc } from './jsonc'
 import { execFile } from 'child_process'
 import { parseWslList, sshArgs, validSshTarget, wslLocation, wslShellArgs } from './shellspec'
@@ -101,6 +102,7 @@ function createWindow(): void {
 ipcMain.handle('app:initialFolder', () => folderFromArgs())
 
 ipcMain.handle('fs:isDir', (_e, p: string) => {
+  if (live.isLiveSharePath(p)) return live.lsIsDir(p)
   if (ssh.isRemotePath(p)) return ssh.isDir(p)
   try {
     return statSync(p).isDirectory()
@@ -254,6 +256,7 @@ ipcMain.handle('workspace:save', async (_e, folders: string[]): Promise<string |
 })
 
 ipcMain.handle('fs:readDir', async (_e, dir: string): Promise<DirEntry[]> => {
+  if (live.isLiveSharePath(dir)) return live.lsReadDir(dir)
   if (ssh.isRemotePath(dir)) return ssh.readDir(dir)
   const entries = await fs.readdir(dir, { withFileTypes: true })
   return entries
@@ -262,13 +265,16 @@ ipcMain.handle('fs:readDir', async (_e, dir: string): Promise<DirEntry[]> => {
     .sort((a, b) => Number(b.isDir) - Number(a.isDir) || a.name.localeCompare(b.name))
 })
 
-ipcMain.handle('fs:readFile', (_e, file: string) => (ssh.isRemotePath(file) ? ssh.readFile(file) : fs.readFile(file, 'utf-8')))
+ipcMain.handle('fs:readFile', (_e, file: string) =>
+  live.isLiveSharePath(file) ? live.lsReadFile(file) : ssh.isRemotePath(file) ? ssh.readFile(file) : fs.readFile(file, 'utf-8')
+)
 
 ipcMain.handle('fs:writeFile', (_e, file: string, content: string) =>
-  ssh.isRemotePath(file) ? ssh.writeFile(file, content) : fs.writeFile(file, content, 'utf-8')
+  live.isLiveSharePath(file) ? live.lsWriteFile(file, content) : ssh.isRemotePath(file) ? ssh.writeFile(file, content) : fs.writeFile(file, content, 'utf-8')
 )
 
 ipcMain.handle('fs:listFiles', async (_e, root: string): Promise<string[]> => {
+  if (live.isLiveSharePath(root)) return live.lsListFiles(root)
   if (ssh.isRemotePath(root)) return ssh.listFiles(root)
   const out: string[] = []
   const walk = async (dir: string): Promise<void> => {
@@ -304,6 +310,7 @@ ipcMain.handle(
     opts: { caseSensitive: boolean; regex: boolean }
   ): Promise<{ matches: SearchMatch[]; truncated: boolean; error?: string }> => {
     if (!query) return { matches: [], truncated: false }
+    if (live.isLiveSharePath(root)) return live.lsSearch(root, query, opts).catch((e) => ({ matches: [], truncated: false, error: e instanceof Error ? e.message : String(e) }))
     if (ssh.isRemotePath(root)) return ssh.search(root, query, opts)
     let re: RegExp
     try {
@@ -516,6 +523,7 @@ app.whenReady().then(() => {
   registerNotebookHandlers(() => mainWin)
   registerLspHandlers(() => mainWin)
   ssh.registerSshHandlers()
+  live.registerLiveShareHandlers(() => mainWin)
   createWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -532,5 +540,6 @@ app.on('before-quit', () => {
   stopExtensions()
   stopAllKernels()
   stopAllLanguageServers()
+  live.stopLiveShare()
   ssh.disconnectAll()
 })
