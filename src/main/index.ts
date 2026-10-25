@@ -101,6 +101,10 @@ function createWindow(): void {
 
 ipcMain.handle('app:initialFolder', () => folderFromArgs())
 
+// Whether a screen reader is running (Chromium switches its accessibility tree on when one asks for it).
+ipcMain.handle('app:screenReader', () => app.isAccessibilitySupportEnabled())
+app.on('accessibility-support-changed', (_e, enabled) => mainWin?.webContents.send('app:screenReader', enabled))
+
 ipcMain.handle('fs:isDir', (_e, p: string) => {
   if (live.isLiveSharePath(p)) return live.lsIsDir(p)
   if (ssh.isRemotePath(p)) return ssh.isDir(p)

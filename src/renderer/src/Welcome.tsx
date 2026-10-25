@@ -28,7 +28,7 @@ export function Welcome({
   onThemes: () => void
 }): JSX.Element {
   return (
-    <div className="welcome">
+    <div className="welcome" role="document" aria-label="Welcome">
       <img className="welcome-logo" src={logo} alt="" />
       <h1>My AI IDE</h1>
       <p className="welcome-sub">

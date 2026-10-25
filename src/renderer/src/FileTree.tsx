@@ -14,6 +14,9 @@ export interface GitInfo {
 
 const key = (p: string): string => p.replace(/\\/g, '/').toLowerCase()
 
+// What the one-letter git marker next to a name means, for a screen reader.
+const GIT_WORDS: Record<string, string> = { M: 'modified', A: 'added', D: 'deleted', R: 'renamed', C: 'copied', U: 'untracked', '!': 'conflict' }
+
 // A folder can vanish between the moment we decide to read it and the read (deleted, moved, or removed by
 // another program), so a failed read means "nothing there" rather than an error.
 const readDir = (dir: string): Promise<DirEntry[]> => window.api.readDir(dir).catch(() => [])
@@ -114,14 +117,15 @@ function Node({ entry, depth, tabStop, ...tree }: { entry: DirEntry; depth: numb
           onSelect(entry)
           onMenu(entry, e.clientX, e.clientY)
         }}
-        title={entry.path}
       >
         <svg className={'tree-chevron' + (open ? ' open' : '')} viewBox="0 0 16 16" aria-hidden>
           {entry.isDir && <path d="M6 4l4 4-4 4" fill="none" stroke="currentColor" strokeWidth="1.6" />}
         </svg>
         {entry.isDir ? <FolderIcon open={open} /> : <FileIcon color={fileColor(entry.name)} />}
-        <span className={'tree-name' + (letter ? ` gc-${letter}` : '')}>{entry.name}</span>
-        {letter && <span className={`tree-git gs-${letter}`}>{letter}</span>}
+        {/* (the full path is a tooltip of the name only: on the row it would be read out as the description of every row) */}
+        <span className={'tree-name' + (letter ? ` gc-${letter}` : '')} title={entry.path}>{entry.name}</span>
+        {letter && <span className="sr-only">, {GIT_WORDS[letter] ?? letter}</span>}
+        {letter && <span className={`tree-git gs-${letter}`} aria-hidden>{letter}</span>}
         {dirty && !open && <span className="tree-dot" />}
       </div>
       {open && (

@@ -23,6 +23,27 @@ export function MenuBar({ menus, title }: { menus: MenuDef[]; title?: string }):
   const [hi, setHi] = useState(-1)
   const [altHeld, setAltHeld] = useState(false) // the underlined letters show while Alt is down
   const barRef = useRef<HTMLDivElement>(null)
+  const dropRef = useRef<HTMLDivElement>(null)
+
+  // Where the keyboard focus was before the menu took it, to give it back when the menu closes (the last place outside the menu bar).
+  const lastOutside = useRef<HTMLElement | null>(null)
+  useEffect(() => {
+    const onFocus = (e: FocusEvent): void => {
+      const t = e.target
+      if (t instanceof HTMLElement && !barRef.current?.contains(t)) lastOutside.current = t
+    }
+    document.addEventListener('focusin', onFocus)
+    return () => document.removeEventListener('focusin', onFocus)
+  }, [])
+  const giveFocusBack = (): void => {
+    const el = lastOutside.current
+    if (el && document.contains(el)) el.focus({ preventScroll: true })
+  }
+  // An open menu holds the keyboard focus itself (and points at its highlighted entry with aria-activedescendant), so that a screen
+  // reader says "File menu" and then each entry as the arrow keys move; the highlight alone is invisible to it.
+  useEffect(() => {
+    if (open !== null) dropRef.current?.focus({ preventScroll: true })
+  }, [open])
 
   // While a menu is open, the keys and outside clicks belong to it, wherever the focus happens to be.
   const keysRef = useRef<(e: KeyboardEvent) => void>(() => undefined)
@@ -76,6 +97,7 @@ export function MenuBar({ menus, title }: { menus: MenuDef[]; title?: string }):
   const choose = (it: MenuEntry): void => {
     if (it.disabled || !it.run) return
     setOpen(null)
+    giveFocusBack() // (before the command runs: it may take the focus for itself)
     // Let the menu close first: some commands (Monaco's own boxes, dialogs) take focus right away.
     setTimeout(() => it.run?.(), 0)
   }
@@ -86,6 +108,7 @@ export function MenuBar({ menus, title }: { menus: MenuDef[]; title?: string }):
       e.preventDefault()
       e.stopPropagation()
       setOpen(null)
+      giveFocusBack()
     } else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
       e.preventDefault()
       e.stopPropagation()
@@ -130,11 +153,12 @@ export function MenuBar({ menus, title }: { menus: MenuDef[]; title?: string }):
             {m.label.slice(1)}
           </button>
           {open === i && (
-            <div className="menu-drop" role="menu" aria-label={m.label}>
+            <div className="menu-drop" role="menu" aria-label={m.label} tabIndex={-1} ref={dropRef} aria-activedescendant={hi >= 0 ? `menu-entry-${i}-${hi}` : undefined}>
               {m.items.map((it, k) => (
                 <div key={k}>
                   {it.separator && <div className="menu-sep" role="separator" />}
                   <div
+                    id={`menu-entry-${i}-${k}`}
                     role="menuitem"
                     aria-disabled={it.disabled || !it.run ? true : undefined}
                     aria-checked={it.checked === undefined ? undefined : it.checked}

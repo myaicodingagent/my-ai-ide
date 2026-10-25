@@ -3,7 +3,7 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { subscribeTheme, terminalTheme } from './theme'
-import { fontStack, getSettings, prefersLessMotion, subscribeSettings, useSettings } from './settings'
+import { fontStack, getSettings, prefersLessMotion, screenReaderOn, subscribeSettings, useSettings } from './settings'
 
 // --- Routing of shell output --------------------------------------------------
 // A terminal's id is only known once the create call returns, but a shell can print before that (cmd.exe
@@ -82,7 +82,7 @@ function TerminalView({
       fontSize: getSettings().terminalFontSize,
       theme: terminalTheme(),
       cursorBlink: !prefersLessMotion(),
-      screenReaderMode: getSettings().screenReader
+      screenReaderMode: screenReaderOn()
     })
     const fit = new FitAddon()
     term.loadAddon(fit)
@@ -114,7 +114,7 @@ function TerminalView({
       const s = getSettings()
       term.options.fontFamily = fontStack(s.fontFamily)
       term.options.fontSize = s.terminalFontSize
-      term.options.screenReaderMode = s.screenReader
+      term.options.screenReaderMode = screenReaderOn(s)
       term.options.cursorBlink = !prefersLessMotion(s)
       refit()
     })

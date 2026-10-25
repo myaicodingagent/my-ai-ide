@@ -539,7 +539,7 @@ export function ChatPanel({
           </button>
         </span>
       </div>
-      <div className="chat-list" ref={listRef}>
+      <div className="chat-list" ref={listRef} role="document" tabIndex={0} aria-label="Conversation">
         {msgs.length === 0 && (
           <div className="empty">Ask about the open file, or anything about code.</div>
         )}

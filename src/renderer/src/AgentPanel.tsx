@@ -260,7 +260,7 @@ export function AgentPanel({
           <button onClick={reset}>New</button>
         </span>
       </div>
-      <div className="chat-list" ref={listRef}>
+      <div className="chat-list" ref={listRef} role="document" tabIndex={0} aria-label="Agent conversation">
         {!root && <div className="empty">Open a folder to use the agent.</div>}
         {root && items.length === 0 && (
           <div className="empty">

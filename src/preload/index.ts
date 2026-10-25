@@ -45,6 +45,12 @@ const api = {
   fsTrash: (root: string, target: string): Promise<GitResult> => ipcRenderer.invoke('fs:trash', root, target),
   fsReveal: (target: string): Promise<void> => ipcRenderer.invoke('fs:reveal', target),
   copyText: (text: string): Promise<void> => ipcRenderer.invoke('app:copyText', text),
+  screenReaderActive: (): Promise<boolean> => ipcRenderer.invoke('app:screenReader'),
+  onScreenReader: (cb: (on: boolean) => void): (() => void) => {
+    const h = (_e: unknown, on: boolean): void => cb(on)
+    ipcRenderer.on('app:screenReader', h)
+    return () => ipcRenderer.removeListener('app:screenReader', h)
+  },
   readText: (): Promise<string> => ipcRenderer.invoke('app:readText'),
   fsWatch: (folders: string | string[] | null): Promise<void> => ipcRenderer.invoke('fs:watch', folders),
   onFsChanged: (cb: (e: { paths: string[]; git: boolean }) => void): (() => void) => {

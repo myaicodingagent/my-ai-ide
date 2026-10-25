@@ -98,6 +98,15 @@ const listeners = new Set<() => void>()
 
 export const getSettings = (): Settings => current
 
+// Chromium knows when a screen reader (NVDA, JAWS, Narrator...) is running; that counts as the "screen reader" setting without changing it.
+let screenReaderDetected = false
+export const screenReaderOn = (s: Settings = current): boolean => s.screenReader || screenReaderDetected
+export function setScreenReaderDetected(on: boolean): void {
+  if (on === screenReaderDetected) return
+  screenReaderDetected = on
+  listeners.forEach((cb) => cb())
+}
+
 export function subscribeSettings(cb: () => void): () => void {
   listeners.add(cb)
   return () => {
@@ -125,7 +134,7 @@ export function editorOptions(s: Settings = current): {
     fontSize: s.fontSize,
     lineHeight: Math.round(s.fontSize * 1.6),
     fontLigatures: s.ligatures,
-    accessibilitySupport: s.screenReader ? 'on' : 'auto',
+    accessibilitySupport: screenReaderOn(s) ? 'on' : 'auto',
     smoothScrolling: !still,
     cursorSmoothCaretAnimation: still ? 'off' : 'on'
   }

@@ -548,6 +548,7 @@ html[data-platform="darwin"] .menubar { padding-left: 80px; }
 .menu-title { padding: 0 9px; margin: 3px 0; border-radius: 4px; color: var(--fg); background: none; border: 0; font: inherit; cursor: default; }
 .menu-title:hover, .menu-title.open { background: var(--hover); }
 .menu-drop { position: absolute; top: 100%; left: 0; z-index: 70; min-width: 260px; padding: 4px; background: var(--side); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow); }
+.menu-drop:focus { outline: none; }
 .menu-item { display: flex; justify-content: space-between; gap: 28px; padding: 5px 12px; border-radius: 5px; white-space: nowrap; cursor: default; }
 .menu-item.hi:not(.disabled) { background: var(--accent); color: var(--on-accent); }
 .menu-item.hi:not(.disabled) .menu-key { color: inherit; opacity: 0.85; }

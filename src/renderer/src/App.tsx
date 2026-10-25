@@ -808,6 +808,27 @@ export function App(): JSX.Element {
   openFolderPathRef.current = openFolderPath
   sshAttemptRef.current = sshAttempt
 
+  // A side bar view opened with the keyboard (Ctrl+Shift+G...) takes the keyboard focus into itself; with the mouse the focus stays where it
+  // was clicked. Without this a screen reader user would be left on nothing after the switch.
+  const lastInputKeyboard = useRef(false)
+  useEffect(() => {
+    const k = (): void => void (lastInputKeyboard.current = true)
+    const m = (): void => void (lastInputKeyboard.current = false)
+    window.addEventListener('keydown', k, true)
+    window.addEventListener('mousedown', m, true)
+    return () => {
+      window.removeEventListener('keydown', k, true)
+      window.removeEventListener('mousedown', m, true)
+    }
+  }, [])
+  useEffect(() => {
+    if (!lastInputKeyboard.current) return
+    const target = ({ git: '[data-git-message]', ext: '.sidebar input', debug: '.sidebar button' } as Record<string, string>)[sidebarView]
+    if (!target) return
+    const t = setTimeout(() => document.querySelector<HTMLElement>(target)?.focus(), 80)
+    return () => clearTimeout(t)
+  }, [sidebarView])
+
   // ---- Live Share: host a folder, or join somebody else's (see liveshare.ts) ----
   const closeFolder = useCallback((): void => {
     editorRef.current?.setModel(null)
@@ -999,6 +1020,7 @@ export function App(): JSX.Element {
           }
           const shared = model
           setTabs((ts) => (ts.some((t) => samePath(t.path) === key) ? ts : [...ts, { path, model: shared, dirty: false }]))
+          announce('Opened ' + baseName(path)) // (a screen reader hears nothing else when the focus stays in the explorer)
           return path
         })().finally(() => opening.current.delete(key))
         opening.current.set(key, pending)
@@ -1042,6 +1064,7 @@ export function App(): JSX.Element {
     diskText.current.set(tab.path, text)
     setTabs((ts) => ts.map((t) => (t.path === tab.path ? { ...t, dirty: false } : t)))
     void refreshGit(rootRef.current) // the change markers and the Source Control list follow a save
+    if (!opts.auto) announce('Saved ' + baseName(tab.path)) // (the only sign of it, for somebody who cannot see the dot on the tab go)
     return true
   }, [])
 
@@ -2277,7 +2300,9 @@ export function App(): JSX.Element {
   }, [save, openPalette, openFileSearch, showSearch, newTerminal, toggleTerminal])
 
   return (
-    <div className="app">
+    // role="application": a screen reader leaves the keys to the editor (it would otherwise keep its own browse mode, take Escape and the
+    // letter keys, and need Escape twice to close a box). The text areas to read (chat, agent, welcome) are marked as documents again.
+    <div className="app" role="application" aria-label="My AI IDE">
       <MenuBar menus={menus} title={windowTitle} />
       <div className="workbench">
       <nav className="activitybar" aria-label="Activity bar">
