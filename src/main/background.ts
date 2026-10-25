@@ -3,8 +3,8 @@ import { promises as fs } from 'fs'
 import { dirname, join, relative, resolve } from 'path'
 import { createHash, randomUUID } from 'crypto'
 import { runGit } from './git'
-import * as ssh from './sshfs'
-import { isRemotePath } from './sshfs'
+import * as host from './hostenv'
+import { isRemotePath } from './hostenv'
 import { AgentEvent, resetSession, runAgentTask } from './agent'
 
 // Background agents: a task is handed to the agent, which works on its own copy of the project (a git worktree on
@@ -159,13 +159,13 @@ async function seedWorktree(top: string, worktree: string, base: string): Promis
       // Over SSH: the files are copied on the other computer, with tar, once their sizes are known to be small enough.
       const keep: string[] = []
       for (let i = 0; i < rels.length; i += 25) {
-        const sizes = await Promise.all(rels.slice(i, i + 25).map((rel) => ssh.statSize(remoteChild(top, rel)).catch(() => -1)))
+        const sizes = await Promise.all(rels.slice(i, i + 25).map((rel) => host.statSize(remoteChild(top, rel)).catch(() => -1)))
         sizes.forEach((size, k) => {
           if (size >= 0 && size <= MAX_SEED_BYTES) keep.push(rels[i + k])
         })
       }
       if (keep.length) {
-        const r = await ssh.exec(top, ['sh', '-c', 'tar --null -T - -cf - | (cd "$1" && tar xf -)', 'sh', ssh.nativePath(worktree) as string], { input: keep.join('\0') + '\0', timeout: 120_000 })
+        const r = await host.exec(top, ['sh', '-c', 'tar --null -T - -cf - | (cd "$1" && tar xf -)', 'sh', host.nativePath(worktree) as string], { input: keep.join('\0') + '\0', timeout: 120_000 })
         if (r.code !== 0) throw new Error('Could not copy your untracked files: ' + (r.stderr || r.stdout).trim())
         copied = keep.length
       }
@@ -190,7 +190,7 @@ async function seedWorktree(top: string, worktree: string, base: string): Promis
     }
     const ignored = await runGit(top, ['check-ignore', '-q', 'node_modules'])
     if (remote) {
-      if (ignored.code === 0) await ssh.exec(top, ['sh', '-c', '[ -d node_modules ] && ln -s "$PWD/node_modules" "$1/node_modules"; true', 'sh', ssh.nativePath(worktree) as string])
+      if (ignored.code === 0) await host.exec(top, ['sh', '-c', '[ -d node_modules ] && ln -s "$PWD/node_modules" "$1/node_modules"; true', 'sh', host.nativePath(worktree) as string])
     } else {
       const nm = join(top, 'node_modules')
       if (ignored.code === 0 && (await fs.stat(nm).catch(() => null))?.isDirectory()) {
@@ -208,7 +208,7 @@ const remoteChild = (dirUnc: string, rel: string): string => dirUnc.replace(/\\+
 
 async function start(root: string, taskText: string, model: string): Promise<{ ok: true; task: BgTask } | { ok: false; error: string }> {
   await load()
-  const remote = isRemotePath(root) ? (ssh.parseRemote(root)?.name as string) : null
+  const remote = isRemotePath(root) ? (host.parseRemote(root)?.name as string) : null
   const running = [...tasks.values()].filter((t) => t.status === 'running' || t.status === 'waiting').length
   if (running >= MAX_RUNNING) return { ok: false, error: `${MAX_RUNNING} background agents are already working. Wait for one to finish or stop it.` }
   if (!taskText.trim()) return { ok: false, error: 'Describe the task first.' }
@@ -218,7 +218,7 @@ async function start(root: string, taskText: string, model: string): Promise<{ o
   if (top.code !== 0) return { ok: false, error: 'Background agents need the project to be a git repository (they work on a separate branch).' }
   const head = await runGit(root, ['rev-parse', 'HEAD'])
   if (head.code !== 0) return { ok: false, error: 'Make a first commit in this repository before starting a background agent.' }
-  const topDir = remote ? ssh.fromNativePath(remote, top.stdout.trim()) : resolve(top.stdout.trim())
+  const topDir = remote ? host.fromNativePath(remote, top.stdout.trim()) : resolve(top.stdout.trim())
 
   // Start from your files as they are now (changes to tracked files included), not just from the last commit.
   const snap = await runGit(topDir, ['stash', 'create'])
@@ -231,18 +231,18 @@ async function start(root: string, taskText: string, model: string): Promise<{ o
   if (remote) {
     // On the other computer the copy lives inside the repository's own .git folder: always writable, never listed by git status.
     const gd = await runGit(topDir, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
-    const common = gd.code === 0 && gd.stdout.trim() ? gd.stdout.trim() : (ssh.nativePath(topDir) as string) + '/.git'
-    worktree = ssh.fromNativePath(remote, common + '/my-ai-ide-worktrees/' + id)
+    const common = gd.code === 0 && gd.stdout.trim() ? gd.stdout.trim() : (host.nativePath(topDir) as string) + '/.git'
+    worktree = host.fromNativePath(remote, common + '/my-ai-ide-worktrees/' + id)
   } else {
     worktree = join(worktreesDir(), repoKey, id)
     await fs.mkdir(join(worktreesDir(), repoKey), { recursive: true })
   }
-  const add = await runGit(topDir, ['worktree', 'add', '-q', '-b', branch, remote ? (ssh.nativePath(worktree) as string) : worktree, base], { timeout: 120_000 })
+  const add = await runGit(topDir, ['worktree', 'add', '-q', '-b', branch, remote ? (host.nativePath(worktree) as string) : worktree, base], { timeout: 120_000 })
   if (add.code !== 0) return { ok: false, error: (add.stderr || add.stdout).trim() || 'Could not create the working copy.' }
 
   const seeded = await seedWorktree(topDir, worktree, base)
   if (!seeded.ok) {
-    await runGit(topDir, ['worktree', 'remove', '--force', remote ? (ssh.nativePath(worktree) as string) : worktree])
+    await runGit(topDir, ['worktree', 'remove', '--force', remote ? (host.nativePath(worktree) as string) : worktree])
     await runGit(topDir, ['branch', '-D', branch])
     return { ok: false, error: seeded.error }
   }
@@ -250,7 +250,7 @@ async function start(root: string, taskText: string, model: string): Promise<{ o
   let agentRoot = worktree
   if (remote) {
     // The same sub-folder inside the copy (both paths are as the other computer writes them).
-    const rootNative = ssh.nativePath(root) as string
+    const rootNative = host.nativePath(root) as string
     const topNative = top.stdout.trim().replace(/\/+$/, '')
     if (rootNative.startsWith(topNative + '/')) agentRoot = remoteChild(worktree, rootNative.slice(topNative.length + 1))
   } else {
@@ -408,8 +408,8 @@ async function discard(t: BgTask): Promise<void> {
   const cwd = t.top
   // Remove the node_modules link first so removing the copy can never reach into the real folder.
   if (isRemotePath(t.worktree)) {
-    await ssh.exec(t.worktree, ['sh', '-c', '[ -L node_modules ] && rm node_modules; true']).catch(() => undefined)
-    await runGit(cwd, ['worktree', 'remove', '--force', ssh.nativePath(t.worktree) as string], { timeout: 60_000 })
+    await host.exec(t.worktree, ['sh', '-c', '[ -L node_modules ] && rm node_modules; true']).catch(() => undefined)
+    await runGit(cwd, ['worktree', 'remove', '--force', host.nativePath(t.worktree) as string], { timeout: 60_000 })
   } else {
     await fs.rm(join(t.worktree, 'node_modules'), { force: true, recursive: false }).catch(() => undefined)
     await runGit(cwd, ['worktree', 'remove', '--force', t.worktree], { timeout: 60_000 })
@@ -427,9 +427,9 @@ export function registerBackgroundHandlers(getWin: () => BrowserWindow | null): 
   getWinRef = getWin
   ipcMain.handle('bg:list', async () => {
     await load()
-    const live = new Set(ssh.connected().map((c) => c.name))
+    const live = new Set(host.connected().map((c) => c.name))
     for (const t of tasks.values()) {
-      const name = isRemotePath(t.root) ? ssh.parseRemote(t.root)?.name : undefined
+      const name = isRemotePath(t.root) ? host.parseRemote(t.root)?.name : undefined
       if (name && live.has(name) && !t.committed && t.status === 'failed') void commitAndList(t)
     }
     return [...tasks.values()].sort((a, b) => b.started - a.started)

@@ -34,6 +34,8 @@
     "test:ssh": "node tests/ssh-handlers.cjs",
     "test:ssh-debug": "node tests/ssh-debug.cjs",
     "test:ssh-background": "node tests/ssh-background.cjs",
+    "test:wsl-git": "node tests/wsl-git.cjs",
+    "test:wsl-background": "node tests/wsl-background.cjs",
     "test:ssh-linux": "node tests/ssh-linux.cjs",
     "test:lsp-ssh": "node tests/lsp-ssh.cjs",
     "test:lsp-wsl": "node tests/lsp-wsl.cjs",

@@ -159,3 +159,55 @@ export function spawnRemote(unc: string, command: string[], opts: { env?: Record
   else child.stdin.end()
   return proc
 }
+
+/** Runs a command there, in the folder `unc` names, and collects its output (used for git). Code -1: it could not be run. */
+export function exec(
+  unc: string,
+  command: string[],
+  opts: { input?: string; timeout?: number; env?: Record<string, string>; signal?: AbortSignal } = {}
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const w = wslLocation(unc)
+  if (!w) return ssh.exec(unc, command, opts)
+  const env = Object.entries(opts.env ?? {}).map(([k, v]) => `${k}=${v}`)
+  return new Promise((resolve) => {
+    const child = spawn('wsl.exe', ['-d', w.distro, '--cd', w.path, '--exec', ...(env.length ? ['env', ...env] : []), ...command], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+    let stdout = ''
+    let stderr = ''
+    const timer = setTimeout(() => child.kill(), opts.timeout ?? 30_000)
+    const abort = (): void => void child.kill()
+    opts.signal?.addEventListener('abort', abort)
+    child.stdout.on('data', (d: Buffer) => {
+      if (stdout.length < 8_000_000) stdout += d.toString('utf-8')
+    })
+    child.stderr.on('data', (d: Buffer) => {
+      if (stderr.length < 8_000_000) stderr += d.toString('utf-8')
+    })
+    child.stdin.on('error', () => undefined)
+    child.on('error', (e) => {
+      clearTimeout(timer)
+      resolve({ code: -1, stdout, stderr: e.message })
+    })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      opts.signal?.removeEventListener('abort', abort)
+      resolve({ code: code ?? -1, stdout, stderr })
+    })
+    child.stdin.end(opts.input ?? '')
+  })
+}
+
+/** The editor's address of a place there, given its path as the programs there write it. */
+export function remoteUnc(name: string, p: string): string {
+  return name.startsWith('wsl:') ? wslUnc(name.slice(4), p) : ssh.remoteUnc(name, p)
+}
+
+/** The size of a file there. */
+export const statSize = async (unc: string): Promise<number> => (wslLocation(unc) ? (await fs.stat(unc)).size : ssh.statSize(unc))
+
+export const readFile = (unc: string): Promise<string> => (wslLocation(unc) ? fs.readFile(unc, 'utf-8') : ssh.readFile(unc))
+
+/** Deletes a file or folder there (no Recycle Bin on a server; in a distribution the file is simply removed too). */
+export const remove = (unc: string): Promise<void> => (wslLocation(unc) ? fs.rm(unc, { recursive: true, force: true }) : ssh.remove(unc))
+
+/** Names (as parseRemote gives them) of the computers and distributions that can be reached now. */
+export const connected = (): { name: string }[] => ssh.connected()

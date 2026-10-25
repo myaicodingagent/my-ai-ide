@@ -3,8 +3,9 @@ import { isAbsolute, join, relative, resolve } from 'path'
 import { promises as fs, realpathSync } from 'fs'
 import { spawn } from 'child_process'
 import * as llm from './llm'
-import * as ssh from './sshfs'
-import { isRemotePath } from './sshfs'
+import * as host from './hostenv'
+import { isRemotePath } from './hostenv'
+import { wslLocation } from './shellspec'
 
 // Everything here shells out to the user's own `git`, so it behaves exactly like git in a terminal.
 
@@ -19,13 +20,22 @@ const MAX_DIFF_FILE = 1_000_000
 
 export function runGit(cwd: string, args: string[], opts: { input?: string; timeout?: number } = {}): Promise<GitResult> {
   if (isRemotePath(cwd)) {
-    // On the other computer: the same git, run over the SSH connection.
-    return ssh.exec(cwd, ['git', '-c', 'core.quotepath=false', ...args], {
+    // On the other computer, or in the WSL distribution: the same git, run there (over the SSH connection, or by wsl.exe).
+    const inWsl = wslLocation(cwd) !== null
+    return host.exec(cwd, ['git', '-c', 'core.quotepath=false', ...args], {
       input: opts.input,
       timeout: opts.timeout,
       env: { GIT_TERMINAL_PROMPT: '0', GIT_EDITOR: 'true', LC_ALL: 'C', GIT_OPTIONAL_LOCKS: '0' }
-    }).then((r) => (r.code === 127 ? { ...r, stderr: 'git is not installed on the remote computer' } : r))
+    }).then((r) => {
+      // A distribution without git: Windows git works on its files too (see "trust" below for repositories of another user).
+      if (r.code === 127 && inWsl) return runGitHere(cwd, args, opts)
+      return r.code === 127 ? { ...r, stderr: 'git is not installed on the remote computer' } : r
+    })
   }
+  return runGitHere(cwd, args, opts)
+}
+
+function runGitHere(cwd: string, args: string[], opts: { input?: string; timeout?: number }): Promise<GitResult> {
   return new Promise((resolveResult) => {
     let child
     try {
@@ -118,8 +128,8 @@ async function topLevel(root: string): Promise<{ top: string } | { error: string
   const r = await runGit(root, ['rev-parse', '--show-toplevel'])
   if (r.code === 0) {
     const top = r.stdout.trim()
-    const remote = ssh.parseRemote(root)
-    return { top: remote ? ssh.remoteUnc(remote.name, top) : resolve(top) }
+    const remote = host.parseRemote(root)
+    return { top: remote ? host.remoteUnc(remote.name, top) : resolve(top) }
   }
   if (r.code === -1) return { error: r.stderr, nogit: true }
   return { error: r.stderr.trim(), nogit: false }
@@ -213,10 +223,10 @@ async function diffSides(
   }
   const original = await fileAt(root, `:${rel}`) // index; empty for a new file
   const remote = isRemotePath(root)
-  const size = remote ? await ssh.statSize(abs).catch(() => null) : (await fs.stat(abs).catch(() => null))?.size ?? null
+  const size = remote ? await host.statSize(abs).catch(() => null) : (await fs.stat(abs).catch(() => null))?.size ?? null
   if (size === null) return { original, modified: '' } // deleted in the working tree
   if (size > MAX_DIFF_FILE) return { error: 'This file is too large to show a diff.' }
-  const modified = remote ? await ssh.readFile(abs) : await fs.readFile(abs, 'utf-8')
+  const modified = remote ? await host.readFile(abs) : await fs.readFile(abs, 'utf-8')
   if (modified.slice(0, 1000).includes('\u0000')) return { error: 'This is a binary file.' }
   return { original, modified }
 }
@@ -274,7 +284,7 @@ export function registerGitHandlers(): void {
     }
     for (const rel of safeRels(root, untracked)) {
       const abs = resolve(root, rel)
-      if (isRemotePath(abs)) await ssh.remove(abs).catch(() => undefined) // a server has no Recycle Bin
+      if (isRemotePath(abs)) await host.remove(abs).catch(() => undefined) // a server has no Recycle Bin
       else if (process.env.MY_AI_IDE_NO_TRASH) await fs.rm(abs, { recursive: true, force: true }) // tests only
       else await shell.trashItem(abs).catch(() => undefined)
     }
