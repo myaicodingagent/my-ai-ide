@@ -36,6 +36,7 @@
     "test:ssh-background": "node tests/ssh-background.cjs",
     "test:ssh-linux": "node tests/ssh-linux.cjs",
     "test:lsp-ssh": "node tests/lsp-ssh.cjs",
+    "test:lsp-wsl": "node tests/lsp-wsl.cjs",
     "test:jupyter": "node tests/jupyter.cjs",
     "test:jupyter-ui": "node tests/jupyter-ui.cjs",
     "test:ext-restore": "node tests/ext-restore.cjs",

@@ -59,9 +59,14 @@ export const useLspServers = (): { label: string; root: string }[] => useSyncExt
 const uriOf = (model: monaco.editor.ITextModel): string => model.uri.toString()
 const norm = (p: string): string => p.split('\\').join('/').toLowerCase()
 // A folder on another computer is addressed as \\ssh.<name>\home\me\proj here and as /home/me/proj (or C:/x) there.
-const remoteName = (p: string): string | null => /^\\\\ssh\.([A-Za-z0-9-]+)/i.exec(p)?.[1].toLowerCase() ?? null
-const uncToNative = (p: string): string => p.replace(/^\\\\ssh\.[A-Za-z0-9-]+/i, '').split('\\').join('/').replace(/^\/(?=[A-Za-z]:)/, '') || '/'
-const nativeToUnc = (name: string, p: string): string => '\\\\ssh.' + name + (/^[A-Za-z]:/.test(p) ? '\\' : '') + p.split('/').join('\\')
+// A folder in a WSL distribution is \\wsl.localhost\Ubuntu\home\me\proj here and /home/me/proj there; its name is kept as "wsl:Ubuntu".
+const remoteName = (p: string): string | null => {
+  const w = /^\\\\(?:wsl\$|wsl\.localhost)\\([^\\/]+)/i.exec(p)
+  return w ? 'wsl:' + w[1] : (/^\\\\ssh\.([A-Za-z0-9-]+)/i.exec(p)?.[1].toLowerCase() ?? null)
+}
+const uncToNative = (p: string): string => p.replace(/^\\\\(?:ssh\.[A-Za-z0-9-]+|(?:wsl\$|wsl\.localhost)\\[^\\/]+)/i, '').split('\\').join('/').replace(/^\/(?=[A-Za-z]:)/, '') || '/'
+const nativeToUnc = (name: string, p: string): string =>
+  name.startsWith('wsl:') ? '\\\\wsl.localhost\\' + name.slice(4) + p.split('/').join('\\') : '\\\\ssh.' + name + (/^[A-Za-z]:/.test(p) ? '\\' : '') + p.split('/').join('\\')
 const toServerPath = (l: Live, p: string): string => {
   if (norm(p).startsWith(norm(l.root) + '/')) return l.realRoot + p.slice(l.root.length)
   return l.remote ? uncToNative(p) : p

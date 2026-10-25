@@ -1,11 +1,12 @@
 import { BrowserWindow, ipcMain } from 'electron'
-import { ChildProcess, spawn } from 'child_process'
+import { ChildProcess, execFile, spawn } from 'child_process'
 import { existsSync, promises as fsp } from 'fs'
 import { homedir } from 'os'
 import { delimiter, join } from 'path'
 import { pathToFileURL } from 'url'
 import * as ssh from './sshfs'
 import { isRemotePath } from './sshfs'
+import { wslLocation, WslLocation } from './shellspec'
 
 // Language servers (the Language Server Protocol): one process per language and project folder, spoken to over stdin and
 // stdout. This file starts them and carries the JSON messages; the editor side (src/renderer/src/lspClient.ts) turns
@@ -201,32 +202,45 @@ const CLIENT_CAPABILITIES = {
 const REMOTE_PATH = 'PATH="$PATH:$HOME/go/bin:$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/go/bin:/usr/local/bin"'
 
 /** The first candidate that the other computer has (looked for on its PATH and in the usual install folders). */
-async function resolveRemote(language: string, unc: string): Promise<{ spec: Spec; exe: string; args: string[] } | { spec: Spec; missing: true } | { error: string } | null> {
+async function resolveRemote(language: string, where: string | WslLocation): Promise<{ spec: Spec; exe: string; args: string[] } | { spec: Spec; missing: true } | { error: string } | null> {
   const spec = SPECS.find((s) => s.language === language)
   if (!spec) return null
-  const r = await ssh.exec(unc, ['sh', '-c', REMOTE_PATH + '; i=0; for c in "$@"; do if command -v "$c" >/dev/null 2>&1; then echo $i; exit 0; fi; i=$((i+1)); done; exit 1', 'sh', ...spec.candidates.map((c) => c.exe)], { timeout: 20_000 })
+  const argv = ['sh', '-c', REMOTE_PATH + '; i=0; for c in "$@"; do if command -v "$c" >/dev/null 2>&1; then echo $i; exit 0; fi; i=$((i+1)); done; exit 1', 'sh', ...spec.candidates.map((c) => c.exe)]
+  const r = typeof where === 'string' ? await ssh.exec(where, argv, { timeout: 20_000 }) : await inWsl(where, argv)
   if (r.code === -1) return { error: r.stderr || 'Could not reach the other computer.' }
   const i = r.code === 0 ? Number(r.stdout.trim()) : -1
   return i >= 0 && spec.candidates[i] ? { spec, exe: spec.candidates[i].exe, args: spec.candidates[i].args } : { spec, missing: true }
+}
+
+/** Runs a command inside a WSL distribution (code -1 when wsl.exe could not run it). */
+function inWsl(loc: WslLocation, argv: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((res) => {
+    // --exec: run the program itself; without it wsl.exe hands the joined arguments to the distribution's shell, which parses them again
+    execFile('wsl.exe', ['-d', loc.distro, '--cd', loc.path, '--exec', ...argv], { timeout: 20_000, windowsHide: true, encoding: 'utf8' }, (e, stdout, stderr) => {
+      const code = e ? (typeof (e as { code?: unknown }).code === 'number' ? (e as { code: number }).code : -1) : 0
+      res({ code, stdout: String(stdout), stderr: String(stderr) })
+    })
+  })
 }
 
 const fileUriOf = (nativePath: string): string => 'file://' + (nativePath.startsWith('/') ? '' : '/') + nativePath.split('/').map((seg, k) => (k === 0 && /^[A-Za-z]:$/.test(seg) ? seg : encodeURIComponent(seg))).join('/')
 
 async function start(language: string, appRoot: string): Promise<{ ok: true; server: string; capabilities: unknown; label: string; realRoot: string } | { ok: false; error: string }> {
   // Servers insist on the folder's real spelling (long names, true capitals), which the editor's path may not have.
-  const remote = isRemotePath(appRoot)
+  const wsl = wslLocation(appRoot)
+  const remote = isRemotePath(appRoot) || !!wsl // another computer, or another system on this one: its paths and process ids, not ours
   const root = remote ? appRoot.replace(/\\+$/, '') : await fsp.realpath(appRoot).catch(() => appRoot)
-  const nativeRoot = remote ? (ssh.nativePath(root) as string) : root
+  const nativeRoot = wsl ? wsl.path : remote ? (ssh.nativePath(root) as string) : root
   const key = language + '|' + root.toLowerCase()
   const existing = servers.get(key)
   if (existing && !existing.dead) {
     const r = await existing.ready.catch(() => null)
     if (r) return { ok: true, server: existing.id, capabilities: r.capabilities, label: SPECS.find((s) => s.language === language)?.label ?? language, realRoot: nativeRoot }
   }
-  const found = remote ? await resolveRemote(language, root) : resolve(language)
+  const found = remote ? await resolveRemote(language, wsl ?? root) : resolve(language)
   if (!found) return { ok: false, error: 'No language server is known for ' + language }
   if ('error' in found) return { ok: false, error: found.error }
-  if ('missing' in found) return { ok: false, error: found.spec.help + (remote ? '  (on the other computer)' : '') }
+  if ('missing' in found) return { ok: false, error: found.spec.help + (wsl ? `  (in ${wsl.distro})` : remote ? '  (on the other computer)' : '') }
   const env = { ...process.env }
   delete env.ANTHROPIC_API_KEY
   delete env.ANTHROPIC_AUTH_TOKEN
@@ -234,7 +248,9 @@ async function start(language: string, appRoot: string): Promise<{ ok: true; ser
   let child: ChildProcess
   try {
     child =
-      'exe' in found
+      'exe' in found && wsl
+        ? spawn('wsl.exe', ['-d', wsl.distro, '--cd', wsl.path, '--exec', 'sh', '-c', REMOTE_PATH + '; exec "$@"', 'sh', found.exe, ...found.args], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+        : 'exe' in found
         ? (ssh.spawnRemote(root, ['sh', '-c', REMOTE_PATH + '; exec "$@"', 'sh', found.exe, ...found.args], { stdin: true }) as unknown as ChildProcess)
         : spawn(found.file, found.args, { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: /\.(cmd|bat)$/i.test(found.file) })
   } catch (e) {
