@@ -25,8 +25,10 @@ const mod = require(bundleFile)
 mod.registerDebugHandlers(() => ({ webContents: { send: (_ch, e) => events.push(e) } }))
 const call = (n, ...a) => handlers[n]({}, ...a)
 
+// Bundle folders that an earlier (killed or just finished) run left behind are not this run's business.
+const bundlesBefore = new Set(fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('ai-ide-debug-')))
 const results = []
-const check = (name, ok, detail = '') => { results.push(ok); console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  -> ' + String(detail).slice(0, 220) : ''}`) }
+const check =(name, ok, detail = '') => { results.push(ok); console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  -> ' + String(detail).slice(0, 220) : ''}`) }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 async function waitEvent(pred, what, ms = 15000) {
   const t0 = Date.now()
@@ -210,7 +212,8 @@ const same = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLower
   check('the program ran with its package imports and finished', tsEnd.code === 0 && tsOut.includes('ts result **5') && tsOut.includes('end n'), JSON.stringify(tsOut))
   events.length = 0
   await sleep(700)
-  check('the temporary bundle is removed afterwards', fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('ai-ide-debug-')).length === 0, fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('ai-ide-debug-')).join())
+  const newBundles = () => fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('ai-ide-debug-') && !bundlesBefore.has(n))
+  check('the temporary bundle is removed afterwards', newBundles().length === 0, newBundles().join())
   // a line with no code moves to the next line that has some
   fs.writeFileSync(tsMain, 'interface A { x: number }\n\n\nconst v: A = { x: 1 }\nconsole.log(v.x)\n')
   r = await call('dbg:start', { file: tsMain, cwd: tsDir, breakpoints: { [tsMain]: [{ line: 1 }] } })
@@ -688,7 +691,12 @@ const same = (a, b) => path.resolve(a).toLowerCase() === path.resolve(b).toLower
       await sleep(600)
       check('Python attach: Stop only disconnects, the program keeps running', child.exitCode === null && child.signalCode === null)
       events.length = 0
-      a = await call('dbg:attach', { language: 'python', port, breakpoints: { [loop]: [{ line: 5 }] } })
+      // debugpy takes a moment to listen again after the first client let go
+      for (let i = 0; i < 6; i++) {
+        a = await call('dbg:attach', { language: 'python', port, breakpoints: { [loop]: [{ line: 5 }] } })
+        if (a.ok || !/ECONNREFUSED/.test(a.error || '')) break
+        await sleep(700)
+      }
       ap = a.ok ? await paused('py reattached') : null
       check('Python attach: it can be attached to again after letting go', a.ok === true && !!ap && ap.reason === 'breakpoint', JSON.stringify(a))
       await call('dbg:setBreakpoints', loop, []); await call('dbg:continue'); await sleep(300); await call('dbg:stop')

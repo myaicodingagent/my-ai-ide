@@ -439,7 +439,7 @@ async function start(opts: {
       if (!connected) fail(`Node exited before the debugger could connect (code ${code}).\n${stderrBuf.trim()}`)
       if (session === s) session = null
       s.tunnel?.close()
-      if (s.ts) void fsp.rm(s.ts.dir, { recursive: true, force: true }).catch(() => undefined)
+      if (s.ts) void fsp.rm(s.ts.dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }).catch(() => undefined)
       emit({ type: 'exited', code })
     })
     setTimeout(() => fail('Timed out waiting for Node to start the debugger.'), 20_000)
