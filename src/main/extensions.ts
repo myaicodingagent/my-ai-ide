@@ -5,6 +5,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'path'
 import AdmZip from 'adm-zip'
 import * as llm from './llm'
 import { parseJsonc } from './jsonc'
+import * as ssh from './sshfs'
 import { isRemotePath } from './sshfs'
 import HOST_SOURCE from './exthost.js?raw'
 
@@ -530,7 +531,7 @@ export function webviewPage(id: string): string | null {
 export function webviewMayRead(file: string): boolean {
   const norm = (p: string): string => p.split('\\').join('/').toLowerCase().replace(/\/+$/, '')
   const f = norm(file)
-  const roots = [...records.filter((r) => r.enabled).map((r) => r.dir), ...webviewRoots, ...(currentRoot ? [currentRoot] : [])]
+  const roots = [...records.filter((r) => r.enabled).map((r) => r.dir), ...webviewRoots, ...(currentRoot && !isRemotePath(currentRoot) ? [currentRoot] : [])]
   return !f.includes('/../') && roots.some((r) => f.startsWith(norm(r) + '/'))
 }
 let nextRun = 1
@@ -568,12 +569,58 @@ async function aiAsk(prompt: string): Promise<string> {
   return llm.text({ prompt: prompt.slice(0, 40_000), maxTokens: 1500 })
 }
 
+/** `vscode.workspace.fs`, `findFiles` and `openTextDocument` for a path on another computer; the extension itself runs on this PC. */
+async function remoteFs(p: { op: string; path: string; to?: string; data?: string; recursive?: boolean }): Promise<unknown> {
+  const path = String(p.path)
+  if (!isRemotePath(path)) throw new Error('Not a path on another computer.')
+  switch (p.op) {
+    case 'readFile':
+      return (await ssh.readBytes(path)).toString('base64')
+    case 'writeFile':
+      await ssh.mkdirp(path.slice(0, path.lastIndexOf('\\')))
+      await ssh.writeBytes(path, Buffer.from(String(p.data ?? ''), 'base64'))
+      getWinRef()?.webContents.send('ext:request', { reqId: 0, method: 'fileChanged', params: { path } })
+      return null
+    case 'stat':
+      return ssh.statInfo(path)
+    case 'readDirectory':
+      return ssh.readDirAll(path)
+    case 'createDirectory':
+      await ssh.mkdirp(path)
+      return null
+    case 'delete':
+      await ssh.remove(path)
+      return null
+    case 'rename':
+      if (!isRemotePath(String(p.to))) throw new Error('Not a path on another computer.')
+      await ssh.rename(path, String(p.to))
+      return null
+    case 'listFiles':
+      return ssh.listFiles(path)
+    default:
+      throw new Error('Unknown file operation ' + p.op)
+  }
+}
+
 async function hostRequest(method: string, params: any): Promise<unknown> {
   const root = currentRoot
   switch (method) {
+    case 'remoteFs':
+      return remoteFs(params)
     case 'readFile':
     case 'writeFile': {
       if (!root) throw new Error('No folder is open.')
+      if (isRemotePath(root)) {
+        // A folder on another computer: the same two calls, over the connection.
+        const parts = String(params.rel).split(/[\\/]+/).filter((x) => x && x !== '.')
+        if (parts.includes('..')) throw new Error('That path is outside the project folder.')
+        const unc = root.replace(/\\+$/, '') + '\\' + parts.join('\\')
+        if (method === 'readFile') return ssh.readFile(unc)
+        await ssh.mkdirp(unc.slice(0, unc.lastIndexOf('\\')))
+        await ssh.writeFile(unc, String(params.text))
+        getWinRef()?.webContents.send('ext:request', { reqId: 0, method: 'fileChanged', params: { path: unc } })
+        return null
+      }
       const abs = resolve(root, String(params.rel))
       const back = relative(root, abs)
       if (back.startsWith('..') || isAbsolute(back)) throw new Error('That path is outside the project folder.')
@@ -756,7 +803,6 @@ export function registerExtensionHandlers(getWin: () => BrowserWindow | null): v
     return records
   })
   ipcMain.handle('ext:setRoot', async (_e, root: string | null) => {
-    if (isRemotePath(root)) root = null // extensions work on this PC's files
     if (currentRoot !== root) {
       currentRoot = root
       restartHost()

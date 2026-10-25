@@ -39,6 +39,7 @@
     "test:jupyter": "node tests/jupyter.cjs",
     "test:jupyter-ui": "node tests/jupyter-ui.cjs",
     "test:ext-restore": "node tests/ext-restore.cjs",
+    "test:ext-ssh": "node tests/ext-ssh.cjs",
     "test:when": "node tests/when-clause.cjs",
     "test:packaged-debug": "node tests/packaged-debug.cjs"
   },

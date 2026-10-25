@@ -495,7 +495,7 @@ export async function requireFile(unc: string): Promise<void> {
   }
 }
 
-export async function readFile(unc: string): Promise<string> {
+export async function readBytes(unc: string): Promise<Buffer> {
   const { conn, path } = target(unc)
   const size = (await stat(conn.sftp, path).catch((e) => Promise.reject(errno(e)))).size
   if (size > MAX_FILE) throw new Error(`This file is ${(size / 1048576).toFixed(1)} MB; the editor opens files up to 5 MB over SSH.`)
@@ -504,19 +504,37 @@ export async function readFile(unc: string): Promise<string> {
     const s = conn.sftp.createReadStream(path)
     s.on('data', (c: Buffer) => chunks.push(c))
     s.on('error', (e: Error) => reject(errno(e)))
-    s.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')))
+    s.on('end', () => resolve(Buffer.concat(chunks)))
   })
 }
 
-export async function writeFile(unc: string, text: string, exclusive = false): Promise<void> {
+export const readFile = async (unc: string): Promise<string> => (await readBytes(unc)).toString('utf-8')
+
+export async function writeBytes(unc: string, bytes: Buffer, exclusive = false): Promise<void> {
   const { conn, path } = target(unc)
   if (exclusive && (await stat(conn.sftp, path).then(() => true, () => false))) throw Object.assign(new Error('A file or folder with that name already exists.'), { code: 'EEXIST' })
   await new Promise<void>((resolve, reject) => {
     const s = conn.sftp.createWriteStream(path)
     s.on('error', (e: Error) => reject(errno(e)))
     s.on('close', () => resolve())
-    s.end(Buffer.from(text, 'utf-8'))
+    s.end(bytes)
   })
+}
+
+export const writeFile = (unc: string, text: string, exclusive = false): Promise<void> => writeBytes(unc, Buffer.from(text, 'utf-8'), exclusive)
+
+/** Type, size and times of a file or folder, for an extension's `workspace.fs.stat`. */
+export async function statInfo(unc: string): Promise<{ isDir: boolean; size: number; mtime: number; ctime: number }> {
+  const { conn, path } = target(unc)
+  const s = await stat(conn.sftp, path).catch((e) => Promise.reject(errno(e)))
+  return { isDir: s.isDirectory(), size: s.size, mtime: s.mtime * 1000, ctime: s.mtime * 1000 }
+}
+
+/** Every entry of a folder, including `.git` and `node_modules` (which `readDir` leaves out for the explorer). */
+export async function readDirAll(unc: string): Promise<{ name: string; isDir: boolean }[]> {
+  const { conn, path } = target(unc)
+  const list = await new Promise<{ filename: string; attrs: Stats }[]>((resolve, reject) => conn.sftp.readdir(path, (e, l) => (e ? reject(errno(e)) : resolve(l as never))))
+  return list.map((f) => ({ name: f.filename, isDir: f.attrs.isDirectory() }))
 }
 
 /** Creates a folder and any missing parents; fine if it exists already. */

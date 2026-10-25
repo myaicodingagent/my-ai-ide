@@ -17,6 +17,9 @@ const ask = (method, params) =>
     waiting.set(reqId, { resolve, reject })
     process.send({ type: 'request', reqId, method, params })
   })
+// A path on another computer opened over SSH (\\ssh.name\folder): file access goes through the editor's connection, not Node's fs.
+const isRemote = (p) => typeof p === 'string' && /^\\\\ssh[.]/i.test(p)
+const rfs = (op, p, extra) => ask('remoteFs', { op, path: p, ...extra })
 const tell = (method, params) => process.send({ type: 'request', reqId: 0, method, params })
 const log = (text) => process.send({ type: 'log', text: String(text) })
 
@@ -94,7 +97,7 @@ class Uri {
     const m = /^([A-Za-z][A-Za-z0-9+.-]*):(?:\/\/([^/?#]*))?([^?#]*)(?:\?([^#]*))?(?:#(.*))?$/.exec(String(s))
     return m ? new Uri(m[1], m[2], decodeURIComponent(m[3] || ''), m[4], m[5]) : Uri.file(s)
   }
-  static joinPath(base, ...parts) { return new Uri(base.scheme, base.authority, path.posix.join(base.path, ...parts), base.query, base.fragment) }
+  static joinPath(base, ...parts) { const unc = base.path.startsWith('//') ? '/' : ''; return new Uri(base.scheme, base.authority, unc + path.posix.join(base.path, ...parts), base.query, base.fragment) }
   get fsPath() { return this.scheme === 'file' ? this.path.replace(/^\/([A-Za-z]:)/, '$1').replace(/\//g, process.platform === 'win32' ? '\\' : '/') : this.path }
   with(c) { return new Uri(c.scheme !== undefined ? c.scheme : this.scheme, c.authority !== undefined ? c.authority : this.authority, c.path !== undefined ? c.path : this.path, c.query !== undefined ? c.query : this.query, c.fragment !== undefined ? c.fragment : this.fragment) }
   toString() { return this.scheme + '://' + this.authority + encodeURI(this.path) + (this.query ? '?' + this.query : '') + (this.fragment ? '#' + this.fragment : '') }
@@ -457,6 +460,7 @@ function makeVscode(ext) {
         return { get, has: (k) => configDefaults[prefix + k] !== undefined, inspect: (k) => ({ key: prefix + k, defaultValue: configDefaults[prefix + k] }), update: () => Promise.resolve(), async: undefined }
       },
       async openTextDocument(arg) {
+        { const rp = typeof arg === 'string' ? arg : arg && arg.fsPath; if (isRemote(rp) && !(editorState && rp.toLowerCase() === editorState.path.toLowerCase())) return makeDocument(rp, path.extname(rp).slice(1), Buffer.from(await rfs('readFile', rp), 'base64').toString('utf-8')) }
         if (editorState && arg && (arg.fsPath || arg) && String(arg.fsPath || arg).toLowerCase() === editorState.path.toLowerCase()) return makeDocument(editorState.path, editorState.language, editorState.text)
         const p = typeof arg === 'string' ? arg : arg && arg.fsPath
         if (p) return makeDocument(p, path.extname(p).slice(1), fs.readFileSync(p, 'utf-8'))
@@ -472,6 +476,18 @@ function makeVscode(ext) {
       },
       async findFiles(include, exclude, maxResults) {
         if (!root) return []
+        if (isRemote(root)) {
+          const inc = globToRegex(typeof include === 'string' ? include : include && include.pattern || '**/*')
+          const exc = exclude ? globToRegex(typeof exclude === 'string' ? exclude : exclude.pattern) : /(^|\/)(node_modules|\.git)(\/|$)/
+          const base = root.replace(/[\\/]+$/, '')
+          const out = []
+          for (const full of await rfs('listFiles', root)) {
+            const rel = full.slice(base.length + 1).replace(/\\/g, '/')
+            if (!exc.test(rel) && inc.test(rel)) out.push(Uri.file(full))
+            if (out.length >= (maxResults || 5000)) break
+          }
+          return out
+        }
         const inc = globToRegex(typeof include === 'string' ? include : include && include.pattern || '**/*')
         const exc = exclude ? globToRegex(typeof exclude === 'string' ? exclude : exclude.pattern) : /(^|\/)(node_modules|\.git)(\/|$)/
         const out = []
@@ -489,12 +505,19 @@ function makeVscode(ext) {
         return out
       },
       fs: {
-        readFile: async (uri) => new Uint8Array(fs.readFileSync(uri.fsPath)),
-        writeFile: async (uri, bytes) => { fs.mkdirSync(path.dirname(uri.fsPath), { recursive: true }); fs.writeFileSync(uri.fsPath, Buffer.from(bytes)) },
-        stat: async (uri) => { const s = fs.statSync(uri.fsPath); return { type: s.isDirectory() ? 2 : 1, ctime: s.ctimeMs, mtime: s.mtimeMs, size: s.size } },
-        readDirectory: async (uri) => fs.readdirSync(uri.fsPath, { withFileTypes: true }).map((d) => [d.name, d.isDirectory() ? 2 : 1]),
-        createDirectory: async (uri) => { fs.mkdirSync(uri.fsPath, { recursive: true }) },
-        delete: async (uri, o) => { fs.rmSync(uri.fsPath, { recursive: !!(o && o.recursive), force: true }) }
+        readFile: async (uri) => isRemote(uri.fsPath) ? new Uint8Array(Buffer.from(await rfs('readFile', uri.fsPath), 'base64')) : new Uint8Array(fs.readFileSync(uri.fsPath)),
+        writeFile: async (uri, bytes) => {
+          if (isRemote(uri.fsPath)) { await rfs('writeFile', uri.fsPath, { data: Buffer.from(bytes).toString('base64') }); return }
+          fs.mkdirSync(path.dirname(uri.fsPath), { recursive: true }); fs.writeFileSync(uri.fsPath, Buffer.from(bytes))
+        },
+        stat: async (uri) => {
+          if (isRemote(uri.fsPath)) { const s = await rfs('stat', uri.fsPath); return { type: s.isDir ? 2 : 1, ctime: s.ctime, mtime: s.mtime, size: s.size } }
+          const s = fs.statSync(uri.fsPath); return { type: s.isDirectory() ? 2 : 1, ctime: s.ctimeMs, mtime: s.mtimeMs, size: s.size }
+        },
+        readDirectory: async (uri) => isRemote(uri.fsPath) ? (await rfs('readDirectory', uri.fsPath)).map((d) => [d.name, d.isDir ? 2 : 1]) : fs.readdirSync(uri.fsPath, { withFileTypes: true }).map((d) => [d.name, d.isDirectory() ? 2 : 1]),
+        createDirectory: async (uri) => { if (isRemote(uri.fsPath)) await rfs('createDirectory', uri.fsPath); else fs.mkdirSync(uri.fsPath, { recursive: true }) },
+        delete: async (uri, o) => { if (isRemote(uri.fsPath)) await rfs('delete', uri.fsPath); else fs.rmSync(uri.fsPath, { recursive: !!(o && o.recursive), force: true }) },
+        rename: async (from, to) => { if (isRemote(from.fsPath)) await rfs('rename', from.fsPath, { to: to.fsPath }); else fs.renameSync(from.fsPath, to.fsPath) }
       },
       onDidChangeTextDocument: (cb, t, d) => { const f = t ? cb.bind(t) : cb; listeners.textChange.push(f); const x = new Disposable(() => { listeners.textChange = listeners.textChange.filter((y) => y !== f) }); if (d) d.push(x); return x },
       onDidOpenTextDocument: () => new Disposable(() => {}),
