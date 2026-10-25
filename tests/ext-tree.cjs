@@ -14,11 +14,14 @@ fs.rmSync(tmp, { recursive: true, force: true })
 const proj = path.join(tmp, 'proj'), data = path.join(tmp, 'data'), extDir = path.join(tmp, 'demo-tree')
 for (const d of [proj, path.join(data, 'extensions'), extDir]) fs.mkdirSync(d, { recursive: true })
 fs.writeFileSync(path.join(proj, 'readme.txt'), 'hello\n'); fs.writeFileSync(path.join(proj, 'tool.py'), 'print(1)\n'); fs.mkdirSync(path.join(proj, 'docs'))
+// a repository with a changed and an untracked file, for the Source Control menus
+for (const a of [['init', '-q'], ['add', '-A'], ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'first']]) cp.execFileSync('git', a, { cwd: proj, stdio: 'ignore' })
+fs.writeFileSync(path.join(proj, 'readme.txt'), 'hello\nchanged\n'); fs.writeFileSync(path.join(proj, 'fresh.txt'), 'new\n')
 fs.writeFileSync(path.join(extDir, 'package.json'), JSON.stringify({
   name: 'demo-tree', publisher: 'local', version: '1.0.0', main: './extension.js', activationEvents: ['*'], engines: { vscode: '^1.85.0' },
   contributes: {
-    commands: [{ command: 'demo.refresh', title: 'Demo: Refresh' }, { command: 'demo.count', title: 'Demo Count Lines' }, { command: 'demo.pyonly', title: 'Demo Python Only' }, { command: 'demo.rename', title: 'Rename' }, { command: 'demo.eat', title: 'Eat' }, { command: 'demo.openfolder', title: 'Open Folder' }, { command: 'demo.wave', title: 'Wave' }, { command: 'demo.hidden', title: 'Never Shown' }, { command: 'demo.exfolder', title: 'Demo Folder Action' }, { command: 'demo.extxt', title: 'Demo Text File Action' }, { command: 'demo.tabinfo', title: 'Demo Tab Info' }, { command: 'demo.titlebtn', title: 'Demo Title Button' }, { command: 'demo.titlemore', title: 'Demo More Action' }, { command: 'demo.titlepy', title: 'Demo Python Title' }],
-    menus: { 'view/title': [{ command: 'demo.refresh', when: 'view == demo.tree', group: 'navigation' }, { command: 'demo.refresh', when: 'view == other.tree', group: 'navigation' }], 'editor/context': [{ command: 'demo.count', when: 'resourceExtname == .txt', group: 'navigation' }, { command: 'demo.pyonly', when: 'editorLangId == python', group: 'navigation' }], 'explorer/context': [{ command: 'demo.exfolder', when: 'explorerResourceIsFolder', group: '2_work' }, { command: 'demo.extxt', when: 'resourceExtname == .txt && !explorerResourceIsFolder', group: '2_work' }], 'editor/title/context': [{ command: 'demo.tabinfo', when: 'resourceLangId == plaintext', group: '1_info' }], 'editor/title': [{ command: 'demo.titlebtn', when: 'resourceExtname == .txt', group: 'navigation' }, { command: 'demo.titlemore', when: 'resourceFilename == readme.txt', group: '1_more' }, { command: 'demo.titlepy', when: 'resourceLangId == python', group: 'navigation' }], commandPalette: [{ command: 'demo.hidden', when: 'false' }], 'view/item/context': [
+    commands: [{ command: 'demo.refresh', title: 'Demo: Refresh' }, { command: 'demo.count', title: 'Demo Count Lines' }, { command: 'demo.pyonly', title: 'Demo Python Only' }, { command: 'demo.rename', title: 'Rename' }, { command: 'demo.eat', title: 'Eat' }, { command: 'demo.openfolder', title: 'Open Folder' }, { command: 'demo.wave', title: 'Wave' }, { command: 'demo.hidden', title: 'Never Shown' }, { command: 'demo.exfolder', title: 'Demo Folder Action' }, { command: 'demo.extxt', title: 'Demo Text File Action' }, { command: 'demo.tabinfo', title: 'Demo Tab Info' }, { command: 'demo.titlebtn', title: 'Demo Title Button' }, { command: 'demo.titlemore', title: 'Demo More Action' }, { command: 'demo.titlepy', title: 'Demo Python Title' }, { command: 'demo.scmtitle', title: 'Demo SCM Title' }, { command: 'demo.scmfile', title: 'Demo SCM File' }, { command: 'demo.scmnew', title: 'Demo SCM New' }],
+    menus: { 'view/title': [{ command: 'demo.refresh', when: 'view == demo.tree', group: 'navigation' }, { command: 'demo.refresh', when: 'view == other.tree', group: 'navigation' }], 'editor/context': [{ command: 'demo.count', when: 'resourceExtname == .txt', group: 'navigation' }, { command: 'demo.pyonly', when: 'editorLangId == python', group: 'navigation' }], 'explorer/context': [{ command: 'demo.exfolder', when: 'explorerResourceIsFolder', group: '2_work' }, { command: 'demo.extxt', when: 'resourceExtname == .txt && !explorerResourceIsFolder', group: '2_work' }], 'scm/title': [{ command: 'demo.scmtitle', when: 'scmProvider == git', group: 'navigation' }, { command: 'demo.hidden', when: 'scmProvider == hg', group: 'navigation' }], 'scm/resourceState/context': [{ command: 'demo.scmfile', when: 'scmProvider == git && scmResourceGroup == workingTree', group: 'inline' }, { command: 'demo.scmnew', when: 'scmProvider == git && scmResourceGroup == untracked', group: '1_x' }], 'editor/title/context': [{ command: 'demo.tabinfo', when: 'resourceLangId == plaintext', group: '1_info' }], 'editor/title': [{ command: 'demo.titlebtn', when: 'resourceExtname == .txt', group: 'navigation' }, { command: 'demo.titlemore', when: 'resourceFilename == readme.txt', group: '1_more' }, { command: 'demo.titlepy', when: 'resourceLangId == python', group: 'navigation' }], commandPalette: [{ command: 'demo.hidden', when: 'false' }], 'view/item/context': [
       { command: 'demo.eat', when: 'view == demo.tree && viewItem =~ /^(fruit|veg)$/', group: '2_eat@2' },
       { command: 'demo.rename', when: 'view == demo.tree && viewItem == fruit', group: '1_modify@1' },
       { command: 'demo.openfolder', when: "view == demo.tree && viewItem == 'group'", group: 'navigation' },
@@ -62,6 +65,8 @@ exports.activate = (context) => {
   vscode.window.registerTreeDataProvider('demo.bar', { getChildren: () => ['one', 'two', 'three'], getTreeItem: (n) => new vscode.TreeItem(n) })
   for (const [cmd, word] of [['demo.rename', 'renamed'], ['demo.eat', 'ate'], ['demo.openfolder', 'opened'], ['demo.wave', 'waved']]) context.subscriptions.push(vscode.commands.registerCommand(cmd, (el, all) => vscode.window.showInformationMessage(word + ' ' + el.name + ' of ' + all.length)))
   context.subscriptions.push(vscode.commands.registerCommand('demo.count', (uri) => vscode.window.showInformationMessage('counted in ' + path.basename(uri.fsPath) + ' / ' + (vscode.window.activeTextEditor ? vscode.window.activeTextEditor.document.lineCount : 'no editor'))))
+  context.subscriptions.push(vscode.commands.registerCommand('demo.scmtitle', (sc) => vscode.window.showInformationMessage('scm title for ' + sc.id + ' in ' + path.basename(sc.rootUri.fsPath))))
+  for (const cmd of ['demo.scmfile', 'demo.scmnew']) context.subscriptions.push(vscode.commands.registerCommand(cmd, (st) => vscode.window.showInformationMessage(cmd + ' on ' + path.basename(st.resourceUri.fsPath))))
   for (const [cmd, word] of [['demo.exfolder', 'folder action on'], ['demo.extxt', 'text file action on'], ['demo.tabinfo', 'tab info for'], ['demo.titlebtn', 'title button for'], ['demo.titlemore', 'more action for']]) context.subscriptions.push(vscode.commands.registerCommand(cmd, (uri) => vscode.window.showInformationMessage(word + ' ' + path.basename(uri.fsPath))))
   context.subscriptions.push(vscode.commands.registerCommand('demo.picked', (name) => vscode.window.showInformationMessage('picked ' + name)))
   context.subscriptions.push(vscode.commands.registerCommand('demo.refresh', () => { tick++; groups.Fruits.push('cherry'); emitter.fire(undefined) }))
@@ -221,6 +226,24 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
   await rightClick(`document.querySelector('.tab.active')`); await sleep(500)
   check('and its tab menu has no "Demo Tab Info"', !(await menuLabels()).includes('Demo Tab Info'), JSON.stringify(await menuLabels()))
   await esc()
+  // ---- scm/title (buttons in the header of Source Control) and scm/resourceState/context (a changed file's menu)
+  const said = (text) => waitFor(() => ev(`document.body.innerText.includes(${JSON.stringify(text)})`), 15000)
+  await ev(`document.querySelector('[data-view="git"]').click()`)
+  check('Source Control shows the changed and the new file', await waitFor(() => ev(`!!document.querySelector('[data-git-file="readme.txt"]') && !!document.querySelector('[data-git-file="fresh.txt"]')`)))
+  const scmTitles = JSON.parse(await ev(`JSON.stringify([...document.querySelectorAll('[data-ext-scm-title]')].map((e) => e.getAttribute('data-ext-scm-title')))`))
+  check('the header has the button of the scm/title entry for git, not the one for another provider', JSON.stringify(scmTitles) === JSON.stringify(['demo.scmtitle']), JSON.stringify(scmTitles))
+  await realClick(`document.querySelector('[data-ext-scm-title="demo.scmtitle"]')`)
+  check('it runs the command with the repository (id git, its folder)', await said('scm title for git in proj'), await ev(`document.body.innerText.slice(-200)`))
+  await rightClick(`document.querySelector('[data-git-file="readme.txt"]')`); await sleep(500)
+  labels = await menuLabels()
+  check('a changed file has the entry for the working tree list, not the one for untracked', JSON.stringify(labels) === JSON.stringify(['Demo SCM File']), JSON.stringify(labels))
+  await ev(`[...document.querySelectorAll('[data-context-menu] [role="menuitem"]')].find((e) => e.textContent === 'Demo SCM File').click()`)
+  check('it runs the command with the changed file (resourceUri)', await said('demo.scmfile on readme.txt'))
+  await rightClick(`document.querySelector('[data-git-file="fresh.txt"]')`); await sleep(500)
+  labels = await menuLabels()
+  check('a new file has the entry for untracked files only', JSON.stringify(labels) === JSON.stringify(['Demo SCM New']), JSON.stringify(labels))
+  await esc()
+  await ev(`document.querySelector('[data-view="files"]').click()`); await sleep(500)
   // the view container of its own
   check('the extension\'s own container has a button in the activity bar', await waitFor(() => ev(`!!document.querySelector('[data-view="xc:demo-bar"]')`)))
   await realClick(`document.querySelector('[data-view="xc:demo-bar"]')`); await sleep(1200)

@@ -7,7 +7,7 @@ import type { MenuItem } from './ContextMenu'
 // a tab's right-click menu ("editor/title/context") and the buttons at the end of the tab bar ("editor/title"). Each one shows when
 // its `when` clause holds for the file, and runs the extension's command with the file.
 
-export type FileMenuKind = 'explorerMenus' | 'tabMenus' | 'editorTitleMenus'
+export type FileMenuKind = 'explorerMenus' | 'tabMenus' | 'editorTitleMenus' | 'scmTitleMenus' | 'scmResourceMenus'
 export interface FileMenuEntry {
   extId: string
   command: string
@@ -26,7 +26,14 @@ export function languageOfPath(path: string): string {
   return hit?.id ?? 'plaintext'
 }
 
-export function fileContext(path: string, opts: { isDir?: boolean; isRoot?: boolean; langId?: string } = {}): WhenContext {
+export interface FileMenuOpts {
+  isDir?: boolean
+  isRoot?: boolean
+  langId?: string
+  scmGroup?: 'index' | 'workingTree' | 'merge' | 'untracked' // for the Source Control menus: which list the file is in
+}
+
+export function fileContext(path: string, opts: FileMenuOpts = {}): WhenContext {
   const base = baseName(path)
   return {
     resourceScheme: 'file',
@@ -42,8 +49,8 @@ export function fileContext(path: string, opts: { isDir?: boolean; isRoot?: bool
 }
 
 /** The entries of one menu that apply to this file, in VS Code's order: `navigation` first, then the groups by name, then by the number after @. */
-export function fileMenuEntries(kind: FileMenuKind, path: string, opts: { isDir?: boolean; isRoot?: boolean; langId?: string } = {}): FileMenuEntry[] {
-  const ctx = fileContext(path, opts)
+export function fileMenuEntries(kind: FileMenuKind, path: string, opts: FileMenuOpts = {}): FileMenuEntry[] {
+  const ctx = { ...fileContext(path, opts), ...(kind.startsWith('scm') ? { scmProvider: 'git', scmResourceGroup: opts.scmGroup } : {}) }
   return getExtensions()
     .filter((e) => e.enabled && (e.vscode || e.native))
     .flatMap((e) => (e[kind] ?? []).filter((m) => evalWhen(m.when, ctx)).map((m) => ({ extId: e.id, command: m.command, title: m.title, group: m.group })))
@@ -55,14 +62,15 @@ export function fileMenuEntries(kind: FileMenuKind, path: string, opts: { isDir?
     .map((x) => x.m)
 }
 
-export const runFileMenuEntry = (m: FileMenuEntry, path: string): void => void window.api.extRun(m.extId, m.command, [{ $uri: path }])
+/** What the command receives: the file as a Uri, or (Source Control) the object VS Code passes for a changed file / the repository. */
+export const runFileMenuEntry = (m: FileMenuEntry, path: string, arg?: unknown): void => void window.api.extRun(m.extId, m.command, [arg ?? { $uri: path }])
 
 /** The same entries as items of a right-click menu, with a divider between groups. */
-export function fileMenuItems(kind: FileMenuKind, path: string, opts: { isDir?: boolean; isRoot?: boolean; langId?: string } = {}): MenuItem[] {
+export function fileMenuItems(kind: FileMenuKind, path: string, opts: FileMenuOpts = {}, arg?: unknown): MenuItem[] {
   const list = fileMenuEntries(kind, path, opts)
   return list.map((m, i) => ({
     label: m.title,
-    run: () => runFileMenuEntry(m, path),
+    run: () => runFileMenuEntry(m, path, arg),
     separator: i === 0 || menuOrder(m.group).name !== menuOrder(list[i - 1].group).name
   }))
 }

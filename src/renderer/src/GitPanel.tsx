@@ -2,6 +2,9 @@ import { useEffect, useState } from 'react'
 import type { CommitEntry, CommitFile, GitFile, StashEntry } from '../../main/git'
 import { refreshGit, useGit } from './gitStore'
 import { Section } from './ExplorerSections'
+import { ContextMenu, MenuItem } from './ContextMenu'
+import { useExtensions } from './extStore'
+import { fileMenuEntries, fileMenuItems, runFileMenuEntry } from './extFileMenus'
 
 type Note = { kind: 'ok' | 'error'; text: string } | null
 
@@ -33,7 +36,8 @@ function Row({
   onUnstage,
   onDiscard,
   onTake,
-  onMerge
+  onMerge,
+  onMenu
 }: {
   file: GitFile
   letter: string
@@ -45,10 +49,25 @@ function Row({
   onDiscard: () => void
   onTake?: (side: 'ours' | 'theirs') => void
   onMerge?: () => void
+  onMenu?: (x: number, y: number) => void // right-click: the entries extensions add ("scm/resourceState/context")
 }): JSX.Element {
   const { name, dir } = split(file.rel)
   return (
-    <div className="git-row" data-git-file={file.rel} data-git-staged={staged} onClick={onDiff} title={file.rel}>
+    <div
+      className="git-row"
+      data-git-file={file.rel}
+      data-git-staged={staged}
+      onClick={onDiff}
+      title={file.rel}
+      onContextMenu={
+        onMenu
+          ? (e) => {
+              e.preventDefault()
+              onMenu(e.clientX, e.clientY)
+            }
+          : undefined
+      }
+    >
       <span className="git-name">
         {name}
         {dir && <span className="git-dir">{dir}</span>}
@@ -118,6 +137,8 @@ export function GitPanel({
   onChanged: () => void
 }): JSX.Element {
   const g = useGit()
+  useExtensions() // the menus follow the installed extensions
+  const [fileMenu, setFileMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null)
   const { version } = g
   const [picked, setPicked] = useState<string | null>(null)
   // The folder whose repository is shown: the picked one while it is still in the workspace, else the main one.
@@ -255,6 +276,12 @@ export function GitPanel({
     } finally {
       setBusy(null)
     }
+  }
+
+  // The right-click menu of a changed file holds only what extensions add (the row's own buttons do the rest).
+  const openFileMenu = (x: number, y: number, f: GitFile, scmGroup: 'index' | 'workingTree' | 'merge' | 'untracked'): void => {
+    const items = fileMenuItems('scmResourceMenus', f.abs, { scmGroup }, { resourceUri: { $uri: f.abs } })
+    if (items.length) setFileMenu({ x, y, items: items.map((it, i) => (i === 0 ? { ...it, separator: false } : it)) })
   }
 
   const commit = async (): Promise<void> => {
@@ -402,6 +429,11 @@ export function GitPanel({
           <button title="Refresh" data-git-action="refresh" onClick={() => void refreshGit(root)}>
             ⟳
           </button>
+          {fileMenuEntries('scmTitleMenus', root).map((m) => (
+            <button key={m.extId + m.command} title={m.title} data-ext-scm-title={m.command} onClick={() => runFileMenuEntry(m, root, { rootUri: { $uri: root }, id: 'git', label: 'Git' })}>
+              {m.title}
+            </button>
+          ))}
         </span>
       </div>
 
@@ -467,6 +499,7 @@ export function GitPanel({
           onStage={() => undefined}
           onUnstage={() => void run('unstage', () => window.api.gitUnstage(root, [f.rel]))}
           onDiscard={() => undefined}
+          onMenu={(x, y) => openFileMenu(x, y, f, 'index')}
         />
       ))}
       </Section>
@@ -494,6 +527,7 @@ export function GitPanel({
           onStage={() => void run('stage', () => window.api.gitStage(root, [f.rel]))}
           onUnstage={() => undefined}
           onDiscard={() => void discard(f)}
+          onMenu={(x, y) => openFileMenu(x, y, f, isConflict(f) ? 'merge' : f.work === '?' ? 'untracked' : 'workingTree')}
           onMerge={isConflict(f) ? () => onOpenMerge(f.abs, root) : undefined}
           onTake={isConflict(f) ? (side) => void run('take', () => window.api.gitTake(root, f.rel, side), side === 'ours' ? 'Kept the current version.' : 'Took the incoming version.') : undefined}
         />
@@ -540,6 +574,7 @@ export function GitPanel({
       </Section>
         </>
       )}
+      {fileMenu && <ContextMenu x={fileMenu.x} y={fileMenu.y} items={fileMenu.items} onClose={() => setFileMenu(null)} />}
     </div>
   )
 }

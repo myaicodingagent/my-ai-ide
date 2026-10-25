@@ -750,7 +750,9 @@ process.on('message', async (msg) => {
       const fn = handlers.get(msg.ext + ':' + msg.command) || commandRegistry.get(msg.command)
       if (!fn) return process.send({ type: 'done', runId: msg.runId, error: 'The extension did not register the command ' + msg.command + '.' })
       // a file given as { $uri: path } reaches the command as a vscode.Uri (what the editor's menus pass)
-      const callArgs = (Array.isArray(msg.args) ? msg.args : []).map((a) => (a && typeof a === 'object' && typeof a.$uri === 'string' ? Uri.file(a.$uri) : a))
+      // (also inside an object, such as the changed file Source Control passes: { resourceUri: { $uri } })
+      const toUris = (a) => (a && typeof a === 'object' ? (typeof a.$uri === 'string' ? Uri.file(a.$uri) : Array.isArray(a) ? a.map(toUris) : Object.fromEntries(Object.entries(a).map(([k, v]) => [k, toUris(v)]))) : a)
+      const callArgs = (Array.isArray(msg.args) ? msg.args : []).map(toUris)
       try { await fn(...callArgs); process.send({ type: 'done', runId: msg.runId }) } catch (e) { process.send({ type: 'done', runId: msg.runId, error: String(e && e.message || e) }) }
     } else if (msg.type === 'response') {
       const w = waiting.get(msg.reqId)

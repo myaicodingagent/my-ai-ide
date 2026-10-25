@@ -45,6 +45,8 @@ export interface ExtRecord {
   explorerMenus: { command: string; title: string; when: string; group: string }[] // entries of a file or folder's right-click menu in the explorer ("explorer/context")
   editorTitleMenus: { command: string; title: string; when: string; group: string }[] // buttons at the end of the tab bar ("editor/title")
   tabMenus: { command: string; title: string; when: string; group: string }[] // entries of a tab's right-click menu ("editor/title/context")
+  scmTitleMenus: { command: string; title: string; when: string; group: string }[] // buttons in the header of Source Control ("scm/title")
+  scmResourceMenus: { command: string; title: string; when: string; group: string }[] // entries of a changed file's right-click menu in Source Control ("scm/resourceState/context")
   hiddenCommands: string[] // commands the palette must not list ("commandPalette" entries whose when is false)
   unsupported: string[] // contributions that are ignored (grammars, languages, debuggers...)
   codeIgnored: boolean // a VS Code extension with code (main) that cannot run here
@@ -111,7 +113,7 @@ async function readExtension(dir: string, source: ExtRecord['source']): Promise<
       : []
   const unsupported = Object.keys(c).filter((k) => !SUPPORTED.has(k) && k !== 'menus')
   const menus = (c.menus && typeof c.menus === 'object' ? c.menus : {}) as Record<string, unknown>
-  const otherMenus = Object.keys(menus).filter((k) => !['view/item/context', 'view/title', 'editor/context', 'commandPalette', 'explorer/context', 'editor/title', 'editor/title/context'].includes(k))
+  const otherMenus = Object.keys(menus).filter((k) => !['view/item/context', 'view/title', 'editor/context', 'commandPalette', 'explorer/context', 'editor/title', 'editor/title/context', 'scm/title', 'scm/resourceState/context'].includes(k))
   if (otherMenus.length) unsupported.push('menus (' + otherMenus.join(', ') + ')')
   const titleOf = new Map(commands.map((x) => [x.id, x.title]))
   const menuList = (key: string): ExtRecord['treeMenus'] =>
@@ -157,6 +159,8 @@ async function readExtension(dir: string, source: ExtRecord['source']): Promise<
     explorerMenus: menuList('explorer/context'),
     editorTitleMenus: menuList('editor/title'),
     tabMenus: menuList('editor/title/context'),
+    scmTitleMenus: menuList('scm/title'),
+    scmResourceMenus: menuList('scm/resourceState/context'),
     hiddenCommands,
     unsupported,
     codeIgnored: false,
