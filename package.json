@@ -37,6 +37,7 @@
     "test:wsl-git": "node tests/wsl-git.cjs",
     "test:liveshare": "node tests/liveshare.cjs",
     "test:liveshare-remote": "node tests/liveshare-remote.cjs",
+    "test:liveshare-remote-ui": "node tests/liveshare-remote-ui.cjs",
     "test:nvda": "node tests/nvda.cjs",
     "test:cloud-agent": "node tests/cloud-agent.cjs",
     "test:cloud-packaged": "node tests/cloud-packaged.cjs",

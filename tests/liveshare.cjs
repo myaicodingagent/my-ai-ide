@@ -20,7 +20,7 @@ fs.writeFileSync(path.join(proj, 'node_modules', 'dep', 'x.js'), 'x\n')
 fs.writeFileSync(path.join(proj, '.git', 'config'), '[core]\n')
 fs.writeFileSync(path.join(tmp, 'secret.txt'), 'outside the shared folder\n')
 
-const env = { ...process.env }
+const env = { ...process.env, MY_AI_IDE_TEST_HOOKS: '1' }
 delete env.ELECTRON_RUN_AS_NODE
 const apps = []
 function launch(name, port, args) {
@@ -180,6 +180,35 @@ async function connect(port) {
     check('a terminal shared with typing lets a guest run a command', await guest.waitFor(() => guest.ev(`[...document.querySelectorAll('.term-tab-name')].some((t) => /\(shared\)/.test(t.textContent))`), 15000))
     await typeInTerm(guest, 'echo GUEST-' + 'RAN')
     check('and it runs in the host\'s shell', await host.waitFor(async () => (await termText(host)).split('GUEST-RAN').length > 2, 15000), (await termText(host)).slice(-110) + " || GUEST: " + (await termText(guest)).slice(-110))
+
+    // ---- the connection is lost and comes back
+    await guest.ev(`document.querySelector('[data-sb="liveshare"]') && window.api.lsTestDrop()`)
+    await guest.focusEditor()
+    await guest.send('Input.insertText', { text: 'OFFLINE-' }) // typed while the connection is down (the guest waits a second before trying again)
+    check('a guest whose connection is lost says it is reconnecting', await guest.waitFor(() => guest.ev(`/reconnecting/.test(document.querySelector('[data-sb="liveshare"]')?.textContent || '')`), 5000))
+    check('and is back in the session by itself', await guest.waitFor(() => guest.ev(`/joined · 2/.test(document.querySelector('[data-sb="liveshare"]')?.textContent || '')`), 30000) && await host.waitFor(() => host.ev(`/hosting · 2/.test(document.querySelector('[data-sb="liveshare"]')?.textContent || '')`), 30000))
+    check('what was typed while away reaches the host, and both have the same text', await host.waitFor(async () => { const a = await merged(host), b = await merged(guest); return a === b && /OFFLINE-/.test(a) }, 20000), (await merged(host)) + ' | ' + (await merged(guest)))
+    await host.focusEditor(); await host.send('Input.insertText', { text: 'HOST-AFTER ' })
+    check('edits go both ways again', await guest.waitFor(async () => /HOST-AFTER/.test(await guest.text()), 15000))
+    await typeInTerm(host, 'echo AFTER-' + 'RECONNECT')
+    check('the shared terminal shows new output again', await guest.waitFor(async () => /AFTER-RECONNECT/.test(await termText(guest)), 20000), (await termText(guest)).slice(-200))
+
+    // ---- following somebody
+    const activeTab = (side) => side.ev(`document.querySelector('.tab.active .tab-name')?.textContent`)
+    check('before following, the guest is in b.js', (await activeTab(guest)) === 'b.js', await activeTab(guest))
+    await guest.palette('live share', 'Live Share: Follow a Participant')
+    await guest.waitFor(() => guest.ev(`!!document.querySelector('[data-choice]')`))
+    await guest.ev(`document.querySelector('[data-choice]').click()`)
+    check('the status item says whom the guest follows', await guest.waitFor(() => guest.ev(`/following/.test(document.querySelector('[data-sb="liveshare"]')?.textContent || '')`), 8000))
+    await host.openFromTree('a.txt')
+    await host.focusEditor()
+    check('when the host goes to another file the guest\'s editor goes there too', await guest.waitFor(async () => (await activeTab(guest)) === 'a.txt', 15000), await activeTab(guest))
+    await guest.palette('live share', 'Live Share: Stop Following')
+    check('stopping removes it from the status item', await guest.waitFor(() => guest.ev(`!/following/.test(document.querySelector('[data-sb="liveshare"]')?.textContent || '')`), 8000))
+    await host.openFromTree('b.js')
+    await host.focusEditor()
+    await sleep(2000)
+    check('and the guest stays where it is', (await activeTab(guest)) === 'a.txt', await activeTab(guest))
 
     // ---- the host ends the session
     await host.palette('live share', 'Live Share: End the Session')

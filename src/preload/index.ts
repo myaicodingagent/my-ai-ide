@@ -151,6 +151,7 @@ const api = {
   lsJoin: (code: string, name: string): Promise<{ ok: true; sid: string; root: string; hostName: string; readOnly: boolean; id: string; peers: { id: string; name: string }[] } | { ok: false; error: string }> => ipcRenderer.invoke('ls:join', code, name),
   lsStop: (): Promise<void> => ipcRenderer.invoke('ls:stop'),
   lsStatus: (): Promise<{ role: 'none' } | { role: 'host' | 'guest'; sid: string; readOnly: boolean; peers: { id: string; name: string }[]; join?: string }> => ipcRenderer.invoke('ls:status'),
+  lsTestDrop: (): Promise<void> => ipcRenderer.invoke('ls:test-drop'), // only answers when the app runs with MY_AI_IDE_TEST_HOOKS=1
   lsTerms: (list: { id: number; write: boolean }[]): Promise<void> => ipcRenderer.invoke('ls:terms', list),
   lsSend: (msg: Record<string, unknown>): Promise<void> => ipcRenderer.invoke('ls:send', msg),
   onLsEvent: (cb: (e: Record<string, any>) => void): (() => void) => {

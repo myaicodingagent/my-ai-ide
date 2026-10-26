@@ -53,7 +53,7 @@ import { validSshTarget, wslUnc } from '../../main/shellspec'
 import type { ConnectResult } from '../../main/sshfs'
 import { extensionCommands, initExtensions, onExtensionsChanged } from './extStore'
 import { activeEditorContext, attachExtEditorMenus } from './extEditorMenus'
-import { endSession, getLiveShare, initLiveShare, joinSession, onLiveShareClosed, startSession, useLiveShare } from './liveshare'
+import { endSession, follow, getLiveShare, onLiveShareFollow, initLiveShare, joinSession, onLiveShareClosed, startSession, useLiveShare } from './liveshare'
 import { fileMenuEntries, fileMenuItems, runFileMenuEntry } from './extFileMenus'
 import { attachDebugEditor, toggleBreakpointAtCaret } from './debugEditor'
 import { attachDebugging, getDebug, initDebug, isActive as debugActive, startDebugging, stepDebug, stopDebugging, clearBreakpoints as clearAllBreakpoints } from './debugStore'
@@ -912,6 +912,22 @@ export function App(): JSX.Element {
       resolve: (c) => c && share(c.includes('type'))
     })
   }, [showToast])
+  const liveShareFollow = useCallback((): void => {
+    const s = getLiveShare()
+    const others = s.peers.filter((p) => p.id !== s.me)
+    if (s.role === 'none') return void window.alert('Start or join a Live Share session first.')
+    if (others.length === 0) return void window.alert('Nobody else is in the session.')
+    const labels = others.map((p, i) => (others.filter((q) => q.name === p.name).length > 1 ? `${p.name} (${i + 1})` : p.name))
+    setChoice({
+      text: 'Follow whom? Your editor then shows the file they are in, at their position, until you stop following.',
+      kind: 'info',
+      choices: labels,
+      resolve: (c) => {
+        const i = labels.indexOf(c ?? '')
+        if (i >= 0) follow(others[i].id)
+      }
+    })
+  }, [])
   const liveShareEnd = useCallback((): void => {
     const wasGuest = getLiveShare().role === 'guest'
     void endSession().then(() => {
@@ -920,6 +936,7 @@ export function App(): JSX.Element {
   }, [closeFolder])
   useEffect(() => {
     initLiveShare()
+    onLiveShareFollow((p) => openFileRef.current(p))
     onLiveShareClosed((reason) => {
       showToast(reason, 'warning')
       if (rootRef.current?.startsWith('\\\\liveshare.')) closeFolder()
@@ -1989,6 +2006,8 @@ export function App(): JSX.Element {
       { label: 'Live Share: Start a Session…', run: liveShareStart },
       { label: 'Live Share: Join a Session…', run: liveShareJoin },
       { label: 'Live Share: Copy the Session Code', run: () => void (getLiveShare().join ? window.api.copyText(getLiveShare().join).then(() => showToast('The session code is copied.')) : showToast('No session is open.')) },
+      { label: 'Live Share: Follow a Participant…', run: liveShareFollow },
+      { label: 'Live Share: Stop Following', run: () => follow('') },
       { label: 'Live Share: Share the Terminal…', run: liveShareTerminal },
       { label: 'Live Share: Stop Sharing the Terminal', run: () => void (unshareActiveTerminal() || showToast('The selected terminal is not shared.')) },
       { label: 'Live Share: End the Session or Leave It', run: liveShareEnd },
@@ -2734,11 +2753,12 @@ export function App(): JSX.Element {
             className="sb-item sb-btn"
             data-sb="liveshare"
             title={(live.role === 'host' ? 'You are hosting a Live Share session. Click to copy the session code. ' : 'You joined a Live Share session. ') + live.peers.map((p) => p.name).join(', ')}
-            aria-label={`Live Share: ${live.role === 'host' ? 'hosting' : 'joined'}${live.readOnly ? ', read-only' : ''}, ${live.peers.length} ${live.peers.length === 1 ? 'person' : 'people'}: ${live.peers.map((p) => p.name).join(', ')}${live.role === 'host' ? '. Press to copy the session code' : ''}`}
+            aria-label={`Live Share: ${live.role === 'host' ? 'hosting' : live.reconnecting ? 'reconnecting' : 'joined'}${live.readOnly ? ', read-only' : ''}, ${live.peers.length} ${live.peers.length === 1 ? 'person' : 'people'}: ${live.peers.map((p) => p.name).join(', ')}${live.role === 'host' ? '. Press to copy the session code' : ''}`}
             onClick={() => (live.role === 'host' ? void window.api.copyText(live.join).then(() => showToast('The session code is copied.')) : undefined)}
           >
-            <span aria-hidden="true">⇆ </span>Live Share: {live.role === 'host' ? 'hosting' : 'joined'} · {live.peers.length}
+            <span aria-hidden="true">⇆ </span>Live Share: {live.role === 'host' ? 'hosting' : live.reconnecting ? 'reconnecting…' : 'joined'} · {live.peers.length}
             {live.readOnly ? ' (read-only)' : ''}
+            {live.following ? ` · following ${live.peers.find((p) => p.id === live.following)?.name ?? ''}` : ''}
           </button>
         )}
         {root && /^\\\\ssh\./i.test(root) && (

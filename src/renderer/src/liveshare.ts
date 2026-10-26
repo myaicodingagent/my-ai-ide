@@ -32,9 +32,11 @@ export interface LiveState {
   me: string
   message: string // why a session ended, when it was not by choice
   terms: SharedTerm[] // terminals the host shares
+  following: string // the id of the person whose file and position this editor follows ('' = nobody)
+  reconnecting: boolean // a guest whose connection to the host was lost and is being made again
 }
 
-const NONE: LiveState = { role: 'none', readOnly: false, peers: [], sid: '', join: '', me: '', message: '', terms: [] }
+const NONE: LiveState = { role: 'none', readOnly: false, peers: [], sid: '', join: '', me: '', message: '', terms: [], following: '', reconnecting: false }
 let state: LiveState = NONE
 const listeners = new Set<() => void>()
 const emit = (next: Partial<LiveState>): void => {
@@ -47,6 +49,9 @@ export const getLiveShare = (): LiveState => state
 let hostRoot: string | null = null
 let started = false
 let closedCb: ((reason: string) => void) | null = null
+let openForFollow: ((path: string) => Promise<void>) | null = null
+/** How following opens a file: the editor's own "open this file". */
+export const onLiveShareFollow = (cb: (path: string) => Promise<void>): void => void (openForFollow = cb)
 export const onLiveShareClosed = (cb: (reason: string) => void): void => void (closedCb = cb)
 
 // ---- documents ----
@@ -84,6 +89,9 @@ function relOf(path: string): string | null {
   }
   return null
 }
+const BS = String.fromCharCode(92)
+/** The editor's path of a shared file. */
+const pathOf = (rel: string): string => (state.role === 'guest' ? BS + BS + 'liveshare.' + state.sid + BS + rel.replace(/[/]/g, BS) : absOf(rel))
 const absOf = (rel: string): string => (hostRoot ?? '').replace(/[\\/]+$/, '') + '\\' + rel.replace(/\//g, '\\')
 
 function applyDelta(model: monaco.editor.ITextModel, delta: { insert?: unknown; delete?: number; retain?: number }[]): void {
@@ -231,23 +239,26 @@ function forgetPeer(id: string): void {
 }
 
 let cursorTimer: ReturnType<typeof setTimeout> | null = null
+/** Tells the others where this editor's caret is (and so which file it shows: that is what following uses). */
+function sendCursor(ed: monaco.editor.ICodeEditor): void {
+  const model = ed.getModel(), sel = ed.getSelection()
+  if (state.role === 'none' || !model || !sel) return
+  const rel = relOf(model.uri.fsPath)
+  if (!rel) return
+  if (cursorTimer) clearTimeout(cursorTimer)
+  cursorTimer = setTimeout(() => {
+    const me = state.peers.find((p) => p.id === state.me)
+    send({ t: 'cursor', rel, name: me?.name ?? 'Guest', start: model.getOffsetAt(sel.getSelectionStart()), end: model.getOffsetAt(sel.getPosition()) })
+  }, 60)
+}
 function watchEditor(ed: monaco.editor.ICodeEditor): void {
   // A guest of a read-only session can look but not type.
   ed.onDidChangeModel(() => {
     const m = ed.getModel()
     if (state.role === 'guest' && state.readOnly && m && relOf(m.uri.fsPath)) ed.updateOptions({ readOnly: true })
+    sendCursor(ed) // switching to another file counts as a move: somebody following sees it
   })
-  ed.onDidChangeCursorSelection((e) => {
-    const model = ed.getModel()
-    if (state.role === 'none' || !model) return
-    const rel = relOf(model.uri.fsPath)
-    if (!rel) return
-    if (cursorTimer) clearTimeout(cursorTimer)
-    cursorTimer = setTimeout(() => {
-      const me = state.peers.find((p) => p.id === state.me)
-      send({ t: 'cursor', rel, name: me?.name ?? 'Guest', start: model.getOffsetAt(e.selection.getSelectionStart()), end: model.getOffsetAt(e.selection.getPosition()) })
-    }, 60)
-  })
+  ed.onDidChangeCursorSelection(() => sendCursor(ed))
 }
 
 // ---- shared terminals ----
@@ -303,6 +314,7 @@ export function resizeSharedTerminal(id: number, cols: number, rows: number): vo
 
 interface Watch {
   sink: (data: string) => void
+  reset: boolean // clear the screen before the snapshot (after a reconnect)
   snap: boolean
   end: number // output up to here is written
   queued: { data: string; end: number }[]
@@ -310,7 +322,7 @@ interface Watch {
 const watching = new Map<number, Watch>()
 /** A guest watches a shared terminal: `sink` gets its output, first what it showed before. Returns the way to stop. */
 export function watchSharedTerminal(id: number, sink: (data: string) => void): () => void {
-  watching.set(id, { sink, snap: false, end: 0, queued: [] })
+  watching.set(id, { sink, reset: false, snap: false, end: 0, queued: [] })
   send({ t: 'term-open', tid: id })
   return () => void watching.delete(id)
 }
@@ -361,6 +373,8 @@ async function onMessage(from: string, name: string | undefined, msg: Record<str
       w.end = chunkEnd
     }
     if (msg.snap === true) {
+      if (w.reset) w.sink(String.fromCharCode(27) + 'c') // the terminal starts again, the snapshot is all of it
+      w.reset = false
       w.sink(data)
       w.end = end
       w.snap = true
@@ -371,7 +385,34 @@ async function onMessage(from: string, name: string | undefined, msg: Record<str
   } else if (msg.t === 'cursor') {
     cursors.set(from, { rel, start: Number(msg.start) || 0, end: Number(msg.end) || 0, name: String(msg.name ?? name ?? 'Guest') })
     drawCursor(from)
+    if (state.following === from) void followTo(from)
   }
+}
+
+/** Shows what the followed person is looking at: their file (opened if need be) with their position in view. */
+async function followTo(id: string): Promise<void> {
+  const c = cursors.get(id)
+  if (!c || state.following !== id) return
+  const key = keyOf(c.rel)
+  let d = docs.get(key)
+  if (!d?.model || !monaco.editor.getEditors().some((e) => e.getModel() === d?.model && isShown(e))) {
+    await openForFollow?.(pathOf(c.rel))
+    for (let i = 0; i < 20 && !docs.get(key)?.model; i++) await new Promise((r) => setTimeout(r, 100)) // the model is bound as the editor creates it
+    d = docs.get(key)
+  }
+  const model = d?.model
+  if (!model || state.following !== id) return
+  const ed = monaco.editor.getEditors().find((e) => e.getModel() === model)
+  ed?.revealPositionInCenterIfOutsideViewport(model.getPositionAt(Math.min(c.end, model.getValueLength())))
+}
+const isShown = (e: monaco.editor.ICodeEditor): boolean => !!e.getDomNode()?.offsetParent
+
+/** Follow a person (their id from the list of people), or nobody (''). */
+export function follow(id: string): void {
+  const p = state.peers.find((x) => x.id === id)
+  emit({ following: p ? id : '' })
+  announce(p ? `Following ${p.name}` : 'Stopped following')
+  if (p) void followTo(id)
 }
 
 function reset(message: string): void {
@@ -388,6 +429,20 @@ function reset(message: string): void {
   emit({ ...NONE, message })
 }
 
+/** The connection to the host came back: the files and terminals that are open are brought up to date with what the host has. */
+function resync(): void {
+  for (const d of docs.values()) {
+    if (!d.model) continue
+    // What this side wrote while it was away goes to the host first; Yjs merges it, and the host's state comes back merged.
+    if (d.ready) send({ t: 'doc-update', rel: d.rel, update: toB64(Y.encodeStateAsUpdate(d.ydoc)) })
+    send({ t: 'doc-open', rel: d.rel })
+  }
+  for (const [id, w] of watching) {
+    Object.assign(w, { snap: false, end: 0, queued: [], reset: true })
+    send({ t: 'term-open', tid: id })
+  }
+}
+
 /** Starts listening to the main process and to the editor's models; safe to call more than once. */
 export function initLiveShare(): void {
   if (started) return
@@ -401,9 +456,20 @@ export function initLiveShare(): void {
         for (const w of was) if (w.id !== state.me && !now.some((p) => p.id === w.id)) announce(`${w.name} left the Live Share session`)
       }
       emit({ peers: e.peers as Peer[] })
+      if (state.following && !(e.peers as Peer[]).some((p) => p.id === state.following)) {
+        announce('The person you were following left the session')
+        emit({ following: '' })
+      }
       if (state.role === 'host' && hostTerms.size) send({ t: 'terms', terms: [...hostTerms.values()].map((t) => t.info) }) // for whoever just came in
     }
-    else if (e.type === 'gone') forgetPeer(String(e.id))
+    else if (e.type === 'reconnecting') {
+      emit({ reconnecting: true })
+      announce('The connection to the host was lost. Trying to reconnect.')
+    } else if (e.type === 'reconnected') {
+      emit({ reconnecting: false, me: String(e.id), peers: e.peers as Peer[] })
+      announce('Reconnected to the Live Share session')
+      resync()
+    } else if (e.type === 'gone') forgetPeer(String(e.id))
     else if (e.type === 'closed') {
       const had = state.role !== 'none'
       reset(String(e.reason ?? ''))

@@ -55,6 +55,8 @@ interface Guest {
   readOnly: boolean
   pending: Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>
   nextId: number
+  code: string // to come back with after a lost connection
+  endedByHost: boolean // the host closed the session: nothing to reconnect to
 }
 
 let host: Host | null = null
@@ -354,63 +356,124 @@ function stopHost(): void {
 
 // ---- the guest ----
 
-async function joinSession(code: string, name: string): Promise<{ ok: true; sid: string; root: string; hostName: string; readOnly: boolean; id: string; peers: { id: string; name: string }[] } | { ok: false; error: string }> {
-  if (guest || host) return { ok: false, error: 'End the current session first.' }
-  name = who(name)
+type JoinResult = { ok: true; sid: string; root: string; hostName: string; readOnly: boolean; id: string; peers: { id: string; name: string }[] } | { ok: false; error: string }
+type Dialed = { ok: true; ws: WebSocket; welcome: Record<string, unknown> } | { ok: false; error: string; refused: boolean }
+
+/** Connects to a session and says hello; resolves with the open connection and the host's welcome, or why not (`refused`: the host said no, so trying again is pointless). */
+function dial(code: string, name: string): Promise<Dialed> {
   const m = /^(?:ls:\/\/)?([A-Za-z0-9.\-[\]:]+?):(\d{1,5})#([0-9a-f]{32})$/.exec(code.trim())
-  if (!m) return { ok: false, error: 'That is not a Live Share code. It looks like 192.168.1.5:50123#abc…' }
+  if (!m) return Promise.resolve({ ok: false, error: 'That is not a Live Share code. It looks like 192.168.1.5:50123#abc…', refused: true })
   const ws = new WebSocket(`ws://${m[1].includes(':') && !m[1].startsWith('[') ? '[' + m[1] + ']' : m[1]}:${m[2]}`, { handshakeTimeout: 8000, maxPayload: 16 * 1024 * 1024 })
-  return new Promise((resolveJoin) => {
+  return new Promise((resolveDial) => {
     let settled = false
-    const done = (r: Awaited<ReturnType<typeof joinSession>>): void => {
+    const done = (r: Dialed): void => {
       if (settled) return
       settled = true
+      clearTimeout(timer)
       if (!r.ok) ws.close()
-      resolveJoin(r)
+      resolveDial(r)
     }
+    const timer = setTimeout(() => done({ ok: false, error: 'The host did not answer.', refused: false }), 12_000)
     ws.once('open', () => sendTo(ws, { t: 'hello', token: m[3], name: name.slice(0, 40) || 'Guest', v: 1 }))
-    ws.on('message', (raw) => {
+    const first = (raw: WebSocket.RawData): void => {
       let msg: Record<string, unknown>
       try {
         msg = JSON.parse(raw.toString())
       } catch {
         return
       }
-      if (!settled) {
-        if (msg.t === 'deny') return done({ ok: false, error: String(msg.reason ?? 'The host did not let you in.') })
-        if (msg.t !== 'welcome') return
-        const g: Guest = { ws, sid: String(msg.sid), id: String(msg.id), name, hostName: String(msg.hostName), readOnly: msg.readOnly === true, pending: new Map(), nextId: 1 }
-        guest = g
-        return done({ ok: true, sid: g.sid, root: lsUnc(g.sid, ''), hostName: g.hostName, readOnly: g.readOnly, id: g.id, peers: msg.peers as { id: string; name: string }[] })
-      }
-      const g = guest
-      if (!g) return
-      if (msg.t === 'fs-res') {
-        const p = g.pending.get(Number(msg.id))
-        if (!p) return
-        g.pending.delete(Number(msg.id))
-        clearTimeout(p.timer)
-        msg.ok ? p.resolve(msg.result) : p.reject(Object.assign(new Error(String(msg.error ?? 'The host could not do that.')), { code: msg.code }))
-      } else if (msg.t === 'peers') toRenderer({ type: 'peers', peers: msg.peers })
-      else if (msg.t === 'gone') toRenderer({ type: 'gone', id: msg.id })
-      else if (msg.t === 'closed') toRenderer({ type: 'closed', reason: String(msg.reason ?? '') })
-      else if (msg.t === 'doc-state' || msg.t === 'doc-update' || msg.t === 'cursor' || msg.t === 'terms' || msg.t === 'term-data') toRenderer({ type: 'msg', from: String(msg.from ?? 'host'), msg })
-    })
-    ws.on('error', (e) => done({ ok: false, error: `Could not connect: ${e.message}` }))
-    ws.on('close', () => {
-      if (!settled) return done({ ok: false, error: 'The host closed the connection.' })
-      if (guest?.ws === ws) {
-        const g = guest
-        guest = null
-        for (const p of g.pending.values()) {
-          clearTimeout(p.timer)
-          p.reject(new Error('The session ended.'))
-        }
-        toRenderer({ type: 'closed', reason: 'The connection to the host was lost.' })
-      }
-    })
-    setTimeout(() => done({ ok: false, error: 'The host did not answer.' }), 12_000)
+      if (msg.t === 'deny') return done({ ok: false, error: String(msg.reason ?? 'The host did not let you in.'), refused: true })
+      if (msg.t !== 'welcome') return
+      ws.off('message', first)
+      done({ ok: true, ws, welcome: msg })
+    }
+    ws.on('message', first)
+    ws.once('error', (e) => done({ ok: false, error: `Could not connect: ${e.message}`, refused: false }))
+    ws.once('close', () => done({ ok: false, error: 'The host closed the connection.', refused: false }))
   })
+}
+
+/** Listens to the host on this connection (the first one, or one made again after the connection was lost). */
+function listen(g: Guest, ws: WebSocket): void {
+  ws.on('message', (raw) => {
+    if (guest !== g || g.ws !== ws) return
+    let msg: Record<string, unknown>
+    try {
+      msg = JSON.parse(raw.toString())
+    } catch {
+      return
+    }
+    if (msg.t === 'fs-res') {
+      const p = g.pending.get(Number(msg.id))
+      if (!p) return
+      g.pending.delete(Number(msg.id))
+      clearTimeout(p.timer)
+      msg.ok ? p.resolve(msg.result) : p.reject(Object.assign(new Error(String(msg.error ?? 'The host could not do that.')), { code: msg.code }))
+    } else if (msg.t === 'peers') toRenderer({ type: 'peers', peers: msg.peers })
+    else if (msg.t === 'gone') toRenderer({ type: 'gone', id: msg.id })
+    else if (msg.t === 'closed') {
+      g.endedByHost = true // not a lost connection: there is nothing to come back to
+      toRenderer({ type: 'closed', reason: String(msg.reason ?? '') })
+    } else if (msg.t === 'doc-state' || msg.t === 'doc-update' || msg.t === 'cursor' || msg.t === 'terms' || msg.t === 'term-data') toRenderer({ type: 'msg', from: String(msg.from ?? 'host'), msg })
+  })
+  ws.on('error', () => ws.close())
+  ws.on('close', () => {
+    if (guest !== g || g.ws !== ws) return
+    for (const p of g.pending.values()) {
+      clearTimeout(p.timer)
+      p.reject(new Error('The connection to the host was lost.'))
+    }
+    g.pending.clear()
+    if (g.endedByHost) {
+      guest = null
+      return
+    }
+    void reconnect(g)
+  })
+}
+
+const RECONNECT_WAITS = [1000, 2000, 4000, 8000, 8000, 8000]
+/** The connection to the host dropped: try again for about half a minute, as a new guest with the same code; the editor then brings the shared files up to date. */
+async function reconnect(g: Guest): Promise<void> {
+  toRenderer({ type: 'reconnecting' })
+  for (const wait of RECONNECT_WAITS) {
+    await new Promise((r) => setTimeout(r, wait))
+    if (guest !== g) return // left in the meantime
+    const r = await dial(g.code, g.name)
+    if (guest !== g) {
+      if (r.ok) r.ws.close()
+      return
+    }
+    if (!r.ok) {
+      if (r.refused) break
+      continue
+    }
+    g.ws = r.ws
+    g.id = String(r.welcome.id)
+    listen(g, r.ws)
+    toRenderer({ type: 'reconnected', id: g.id, peers: r.welcome.peers })
+    return
+  }
+  if (guest === g) {
+    guest = null
+    toRenderer({ type: 'closed', reason: 'The connection to the host was lost and could not be restored.' })
+  }
+}
+
+async function joinSession(code: string, name: string): Promise<JoinResult> {
+  if (guest || host) return { ok: false, error: 'End the current session first.' }
+  name = who(name)
+  const r = await dial(code, name)
+  if (!r.ok) return r
+  if (guest || host) {
+    r.ws.close()
+    return { ok: false, error: 'End the current session first.' }
+  }
+  const msg = r.welcome
+  const g: Guest = { ws: r.ws, sid: String(msg.sid), id: String(msg.id), name, hostName: String(msg.hostName), readOnly: msg.readOnly === true, pending: new Map(), nextId: 1, code, endedByHost: false }
+  guest = g
+  listen(g, r.ws)
+  return { ok: true, sid: g.sid, root: lsUnc(g.sid, ''), hostName: g.hostName, readOnly: g.readOnly, id: g.id, peers: msg.peers as { id: string; name: string }[] }
 }
 
 function leave(): void {
@@ -483,6 +546,13 @@ export function registerLiveShareHandlers(getWin: () => BrowserWindow | null): v
         ? { role: 'guest' as const, sid: guest.sid, readOnly: guest.readOnly, peers: [] }
         : { role: 'none' as const }
   )
+  // For tests only: cut the connections as if the network had failed (the session stays open; a guest comes back by itself).
+  if (process.env.MY_AI_IDE_TEST_HOOKS === '1') {
+    ipcMain.handle('ls:test-drop', () => {
+      for (const p of host?.peers.values() ?? []) p.ws.terminate()
+      guest?.ws.terminate()
+    })
+  }
   // The terminals the host shares, and whether guests may type in each: the host's renderer says, this side enforces it.
   ipcMain.handle('ls:terms', (_e, list: { id: number; write: boolean }[]) => {
     if (!host || !Array.isArray(list)) return
