@@ -13,15 +13,15 @@ const tmp = path.join(os.tmpdir(), 'ext-tree-' + process.pid)
 fs.rmSync(tmp, { recursive: true, force: true })
 const proj = path.join(tmp, 'proj'), data = path.join(tmp, 'data'), extDir = path.join(tmp, 'demo-tree')
 for (const d of [proj, path.join(data, 'extensions'), extDir]) fs.mkdirSync(d, { recursive: true })
-fs.writeFileSync(path.join(proj, 'readme.txt'), 'hello\n'); fs.writeFileSync(path.join(proj, 'tool.py'), 'print(1)\n'); fs.mkdirSync(path.join(proj, 'docs'))
+fs.writeFileSync(path.join(proj, 'dbg.js'), 'function f(a) {\n  debugger\n  return a\n}\nf(7)\n'); fs.writeFileSync(path.join(proj, 'readme.txt'), 'hello\n'); fs.writeFileSync(path.join(proj, 'tool.py'), 'print(1)\n'); fs.mkdirSync(path.join(proj, 'docs'))
 // a repository with a changed and an untracked file, for the Source Control menus
 for (const a of [['init', '-q'], ['add', '-A'], ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'first']]) cp.execFileSync('git', a, { cwd: proj, stdio: 'ignore' })
 fs.writeFileSync(path.join(proj, 'readme.txt'), 'hello\nchanged\n'); fs.writeFileSync(path.join(proj, 'fresh.txt'), 'new\n')
 fs.writeFileSync(path.join(extDir, 'package.json'), JSON.stringify({
   name: 'demo-tree', publisher: 'local', version: '1.0.0', main: './extension.js', activationEvents: ['*'], engines: { vscode: '^1.85.0' },
   contributes: {
-    commands: [{ command: 'demo.refresh', title: 'Demo: Refresh' }, { command: 'demo.count', title: 'Demo Count Lines' }, { command: 'demo.pyonly', title: 'Demo Python Only' }, { command: 'demo.rename', title: 'Rename' }, { command: 'demo.eat', title: 'Eat' }, { command: 'demo.openfolder', title: 'Open Folder' }, { command: 'demo.wave', title: 'Wave' }, { command: 'demo.hidden', title: 'Never Shown' }, { command: 'demo.exfolder', title: 'Demo Folder Action' }, { command: 'demo.extxt', title: 'Demo Text File Action' }, { command: 'demo.tabinfo', title: 'Demo Tab Info' }, { command: 'demo.titlebtn', title: 'Demo Title Button' }, { command: 'demo.titlemore', title: 'Demo More Action' }, { command: 'demo.titlepy', title: 'Demo Python Title' }, { command: 'demo.scmtitle', title: 'Demo SCM Title' }, { command: 'demo.scmfile', title: 'Demo SCM File' }, { command: 'demo.scmnew', title: 'Demo SCM New' }],
-    menus: { 'view/title': [{ command: 'demo.refresh', when: 'view == demo.tree', group: 'navigation' }, { command: 'demo.refresh', when: 'view == other.tree', group: 'navigation' }], 'editor/context': [{ command: 'demo.count', when: 'resourceExtname == .txt', group: 'navigation' }, { command: 'demo.pyonly', when: 'editorLangId == python', group: 'navigation' }], 'explorer/context': [{ command: 'demo.exfolder', when: 'explorerResourceIsFolder', group: '2_work' }, { command: 'demo.extxt', when: 'resourceExtname == .txt && !explorerResourceIsFolder', group: '2_work' }], 'scm/title': [{ command: 'demo.scmtitle', when: 'scmProvider == git', group: 'navigation' }, { command: 'demo.hidden', when: 'scmProvider == hg', group: 'navigation' }], 'scm/resourceState/context': [{ command: 'demo.scmfile', when: 'scmProvider == git && scmResourceGroup == workingTree', group: 'inline' }, { command: 'demo.scmnew', when: 'scmProvider == git && scmResourceGroup == untracked', group: '1_x' }], 'editor/title/context': [{ command: 'demo.tabinfo', when: 'resourceLangId == plaintext', group: '1_info' }], 'editor/title': [{ command: 'demo.titlebtn', when: 'resourceExtname == .txt', group: 'navigation' }, { command: 'demo.titlemore', when: 'resourceFilename == readme.txt', group: '1_more' }, { command: 'demo.titlepy', when: 'resourceLangId == python', group: 'navigation' }], commandPalette: [{ command: 'demo.hidden', when: 'false' }], 'view/item/context': [
+    commands: [{ command: 'demo.scmgroup', title: 'Demo SCM Group' }, { command: 'demo.dbgbar', title: 'Demo Dbg Bar' }, { command: 'demo.dbgidle', title: 'Demo Dbg Idle' }, { command: 'demo.dbgvar', title: 'Demo Dbg Var' }, { command: 'demo.dbgframe', title: 'Demo Dbg Frame' }, { command: 'demo.palpy', title: 'Demo Python Palette' }, { command: 'demo.refresh', title: 'Demo: Refresh' }, { command: 'demo.count', title: 'Demo Count Lines' }, { command: 'demo.pyonly', title: 'Demo Python Only' }, { command: 'demo.rename', title: 'Rename' }, { command: 'demo.eat', title: 'Eat' }, { command: 'demo.openfolder', title: 'Open Folder' }, { command: 'demo.wave', title: 'Wave' }, { command: 'demo.hidden', title: 'Never Shown' }, { command: 'demo.exfolder', title: 'Demo Folder Action' }, { command: 'demo.extxt', title: 'Demo Text File Action' }, { command: 'demo.tabinfo', title: 'Demo Tab Info' }, { command: 'demo.titlebtn', title: 'Demo Title Button' }, { command: 'demo.titlemore', title: 'Demo More Action' }, { command: 'demo.titlepy', title: 'Demo Python Title' }, { command: 'demo.scmtitle', title: 'Demo SCM Title' }, { command: 'demo.scmfile', title: 'Demo SCM File' }, { command: 'demo.scmnew', title: 'Demo SCM New' }],
+    menus: { 'view/title': [{ command: 'demo.refresh', when: 'view == demo.tree', group: 'navigation' }, { command: 'demo.refresh', when: 'view == other.tree', group: 'navigation' }], 'editor/context': [{ command: 'demo.count', when: 'resourceExtname == .txt', group: 'navigation' }, { command: 'demo.pyonly', when: 'editorLangId == python', group: 'navigation' }], 'explorer/context': [{ command: 'demo.exfolder', when: 'explorerResourceIsFolder', group: '2_work' }, { command: 'demo.extxt', when: 'resourceExtname == .txt && !explorerResourceIsFolder', group: '2_work' }], 'scm/title': [{ command: 'demo.scmtitle', when: 'scmProvider == git', group: 'navigation' }, { command: 'demo.hidden', when: 'scmProvider == hg', group: 'navigation' }], 'scm/resourceState/context': [{ command: 'demo.scmfile', when: 'scmProvider == git && scmResourceGroup == workingTree', group: 'inline' }, { command: 'demo.scmnew', when: 'scmProvider == git && scmResourceGroup == untracked', group: '1_x' }], 'editor/title/context': [{ command: 'demo.tabinfo', when: 'resourceLangId == plaintext', group: '1_info' }], 'editor/title': [{ command: 'demo.titlebtn', when: 'resourceExtname == .txt', group: 'navigation' }, { command: 'demo.titlemore', when: 'resourceFilename == readme.txt', group: '1_more' }, { command: 'demo.titlepy', when: 'resourceLangId == python', group: 'navigation' }], commandPalette: [{ command: 'demo.hidden', when: 'false' }, { command: 'demo.palpy', when: 'editorLangId == python' }], 'scm/resourceGroup/context': [{ command: 'demo.scmgroup', when: 'scmProvider == git && scmResourceGroup == workingTree', group: '1_x' }, { command: 'demo.hidden', when: 'scmResourceGroup == index', group: '1_x' }], 'debug/toolBar': [{ command: 'demo.dbgbar', when: 'debugState == stopped', group: 'navigation' }, { command: 'demo.dbgidle', when: 'debugState == inactive', group: 'navigation' }], 'debug/variables/context': [{ command: 'demo.dbgvar', when: 'variableName == a', group: '1_x' }, { command: 'demo.hidden', when: 'variableName == zzz', group: '1_x' }], 'debug/callstack/context': [{ command: 'demo.dbgframe', when: 'callStackItemType == stackFrame', group: '1_x' }], 'view/item/context': [
       { command: 'demo.eat', when: 'view == demo.tree && viewItem =~ /^(fruit|veg)$/', group: '2_eat@2' },
       { command: 'demo.rename', when: 'view == demo.tree && viewItem == fruit', group: '1_modify@1' },
       { command: 'demo.openfolder', when: "view == demo.tree && viewItem == 'group'", group: 'navigation' },
@@ -68,6 +68,10 @@ exports.activate = (context) => {
   context.subscriptions.push(vscode.commands.registerCommand('demo.scmtitle', (sc) => vscode.window.showInformationMessage('scm title for ' + sc.id + ' in ' + path.basename(sc.rootUri.fsPath))))
   for (const cmd of ['demo.scmfile', 'demo.scmnew']) context.subscriptions.push(vscode.commands.registerCommand(cmd, (st) => vscode.window.showInformationMessage(cmd + ' on ' + path.basename(st.resourceUri.fsPath))))
   for (const [cmd, word] of [['demo.exfolder', 'folder action on'], ['demo.extxt', 'text file action on'], ['demo.tabinfo', 'tab info for'], ['demo.titlebtn', 'title button for'], ['demo.titlemore', 'more action for']]) context.subscriptions.push(vscode.commands.registerCommand(cmd, (uri) => vscode.window.showInformationMessage(word + ' ' + path.basename(uri.fsPath))))
+  context.subscriptions.push(vscode.commands.registerCommand('demo.scmgroup', (g) => vscode.window.showInformationMessage('scmgroup ' + g.id + ' with ' + g.resourceStates.map((r) => path.basename(r.resourceUri.fsPath)).sort().join('+'))))
+  context.subscriptions.push(vscode.commands.registerCommand('demo.dbgbar', () => vscode.window.showInformationMessage('dbgbar pressed')))
+  context.subscriptions.push(vscode.commands.registerCommand('demo.dbgvar', (c) => vscode.window.showInformationMessage('dbgvar ' + c.variable.name + '=' + c.variable.value)))
+  context.subscriptions.push(vscode.commands.registerCommand('demo.dbgframe', (f) => vscode.window.showInformationMessage('dbgframe ' + f.name + ' at line ' + f.line + ' of ' + path.basename(f.source.path))))
   context.subscriptions.push(vscode.commands.registerCommand('demo.picked', (name) => vscode.window.showInformationMessage('picked ' + name)))
   context.subscriptions.push(vscode.commands.registerCommand('demo.refresh', () => { tick++; groups.Fruits.push('cherry'); emitter.fire(undefined) }))
 }
@@ -217,6 +221,8 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
   check('a folder gets the entry for folders only', labels.includes('Demo Folder Action') && !labels.includes('Demo Text File Action'), JSON.stringify(labels))
   await ev(`[...document.querySelectorAll('[data-context-menu] [role="menuitem"]')].find((e) => e.textContent === 'Demo Folder Action').click()`)
   check('and it is run with the folder', await waitFor(() => ev(`document.body.innerText.includes('folder action on docs')`), 15000))
+  const paletteHas = async (text) => { await ev(`window.dispatchEvent(new KeyboardEvent('keydown', { key: 'p', ctrlKey: true, shiftKey: true, bubbles: true }))`); await sleep(500); await ev(`(() => { const el = document.querySelector('.qp input'); Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, ${JSON.stringify(text)}); el.dispatchEvent(new Event('input', { bubbles: true })) })()`); await sleep(500); const r = await ev(`[...document.querySelectorAll('.qp-item')].some((i) => i.textContent.includes('Demo Python Palette'))`); await esc(); await sleep(300); return r }
+  check('and not listed while a text file is active', !(await paletteHas('Demo Python Palette')))
   await rightClick(treeRow('tool.py')); await sleep(500)
   labels = await menuLabels()
   check('a Python file gets neither', !labels.includes('Demo Text File Action') && !labels.includes('Demo Folder Action'), JSON.stringify(labels))
@@ -226,6 +232,7 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
   await rightClick(`document.querySelector('.tab.active')`); await sleep(500)
   check('and its tab menu has no "Demo Tab Info"', !(await menuLabels()).includes('Demo Tab Info'), JSON.stringify(await menuLabels()))
   await esc()
+  check('a palette entry with a when clause is listed while a Python file is active', await paletteHas('Demo Python Palette'))
   // ---- scm/title (buttons in the header of Source Control) and scm/resourceState/context (a changed file's menu)
   const said = (text) => waitFor(() => ev(`document.body.innerText.includes(${JSON.stringify(text)})`), 15000)
   await ev(`document.querySelector('[data-view="git"]').click()`)
@@ -243,6 +250,35 @@ const stopApp = () => { try { cp.execSync('taskkill /F /T /PID ' + app.pid, { st
   labels = await menuLabels()
   check('a new file has the entry for untracked files only', JSON.stringify(labels) === JSON.stringify(['Demo SCM New']), JSON.stringify(labels))
   await esc()
+  await rightClick(`document.querySelector('[data-ex-section="git-changes"] .ex-head')`); await sleep(500)
+  labels = await menuLabels()
+  check('the header of the list of changes has the scm/resourceGroup/context entry for the working tree', JSON.stringify(labels) === JSON.stringify(['Demo SCM Group']), JSON.stringify(labels))
+  await ev(`[...document.querySelectorAll('[data-context-menu] [role="menuitem"]')].find((e) => e.textContent === 'Demo SCM Group').click()`)
+  check('it runs the command with the group and its files', await said('scmgroup workingTree with fresh.txt+readme.txt'), await ev(`document.body.innerText.slice(-200)`))
+  await ev(`document.querySelector('[data-view="files"]').click()`); await sleep(500)
+  // ---- debug/toolBar, debug/variables/context and debug/callstack/context (a real Node program that stops on a debugger statement)
+  await ev(`${treeRow('dbg.js')}.click()`); await sleep(1500)
+  await ev(`document.querySelector('[data-view="debug"]').click()`); await sleep(500)
+  check('before debugging the bar has no extension buttons', await ev(`document.querySelectorAll('[data-ext-debug-toolbar]').length === 0`))
+  await realClick(`document.querySelector('[data-dbg-action="start"]')`)
+  check('the program stops on its debugger statement', await waitFor(() => ev(`document.querySelector('[data-dbg-status]')?.dataset.dbgStatus === 'paused'`), 30000))
+  const dbgBtns = JSON.parse(await ev(`JSON.stringify([...document.querySelectorAll('[data-ext-debug-toolbar]')].map((e) => e.getAttribute('data-ext-debug-toolbar')))`))
+  check('the debug bar has the button for a stopped program, not the one for no program', JSON.stringify(dbgBtns) === JSON.stringify(['demo.dbgbar']), JSON.stringify(dbgBtns))
+  await realClick(`document.querySelector('[data-ext-debug-toolbar="demo.dbgbar"]')`)
+  check('and it runs its command', await said('dbgbar pressed'))
+  await waitFor(() => ev(`!!document.querySelector('[data-dbg-var="a"]')`), 15000)
+  await rightClick(`document.querySelector('[data-dbg-var="a"]')`); await sleep(500)
+  labels = await menuLabels()
+  check('a variable has the entry whose when clause names it', JSON.stringify(labels) === JSON.stringify(['Demo Dbg Var']), JSON.stringify(labels))
+  await ev(`[...document.querySelectorAll('[data-context-menu] [role="menuitem"]')].find((e) => e.textContent === 'Demo Dbg Var').click()`)
+  check('the command gets the variable with its name and value', await said('dbgvar a=7'))
+  await rightClick(`document.querySelector('[data-dbg-frame="0"]')`); await sleep(500)
+  labels = await menuLabels()
+  check('a stack frame has its entry', JSON.stringify(labels) === JSON.stringify(['Demo Dbg Frame']), JSON.stringify(labels))
+  await ev(`[...document.querySelectorAll('[data-context-menu] [role="menuitem"]')].find((e) => e.textContent === 'Demo Dbg Frame').click()`)
+  check('the command gets the frame with its function, line and file', await said('dbgframe f at line 2 of dbg.js'), await ev(`document.body.innerText.slice(-200)`))
+  await ev(`document.querySelector('[data-dbg-action="continue"]').click()`)
+  await waitFor(() => ev(`document.querySelector('[data-dbg-status]')?.dataset.dbgStatus === 'ended'`), 20000)
   await ev(`document.querySelector('[data-view="files"]').click()`); await sleep(500)
   // the view container of its own
   check('the extension\'s own container has a button in the activity bar', await waitFor(() => ev(`!!document.querySelector('[data-view="xc:demo-bar"]')`)))

@@ -7,7 +7,8 @@ import type { MenuItem } from './ContextMenu'
 // a tab's right-click menu ("editor/title/context") and the buttons at the end of the tab bar ("editor/title"). Each one shows when
 // its `when` clause holds for the file, and runs the extension's command with the file.
 
-export type FileMenuKind = 'explorerMenus' | 'tabMenus' | 'editorTitleMenus' | 'scmTitleMenus' | 'scmResourceMenus'
+export type FileMenuKind = 'explorerMenus' | 'tabMenus' | 'editorTitleMenus' | 'scmTitleMenus' | 'scmResourceMenus' | 'scmGroupMenus'
+export type PlainMenuKind = 'debugToolbarMenus' | 'debugVariableMenus' | 'debugFrameMenus' // menus about something that is not a file: only the context says what applies
 export interface FileMenuEntry {
   extId: string
   command: string
@@ -50,7 +51,11 @@ export function fileContext(path: string, opts: FileMenuOpts = {}): WhenContext 
 
 /** The entries of one menu that apply to this file, in VS Code's order: `navigation` first, then the groups by name, then by the number after @. */
 export function fileMenuEntries(kind: FileMenuKind, path: string, opts: FileMenuOpts = {}): FileMenuEntry[] {
-  const ctx = { ...fileContext(path, opts), ...(kind.startsWith('scm') ? { scmProvider: 'git', scmResourceGroup: opts.scmGroup } : {}) }
+  return menuEntries(kind, { ...fileContext(path, opts), ...(kind.startsWith('scm') ? { scmProvider: 'git', scmResourceGroup: opts.scmGroup } : {}) })
+}
+
+/** The entries of any menu whose `when` clause holds in this context, in VS Code's order. */
+export function menuEntries(kind: FileMenuKind | PlainMenuKind, ctx: WhenContext): FileMenuEntry[] {
   return getExtensions()
     .filter((e) => e.enabled && (e.vscode || e.native))
     .flatMap((e) => (e[kind] ?? []).filter((m) => evalWhen(m.when, ctx)).map((m) => ({ extId: e.id, command: m.command, title: m.title, group: m.group })))

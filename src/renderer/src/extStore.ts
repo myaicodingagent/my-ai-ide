@@ -2,6 +2,7 @@ import { useSyncExternalStore } from 'react'
 import type { ExtRecord, SnippetSet } from '../../main/extensions'
 import { monaco } from './monaco-setup'
 import { loadCustomThemes } from './theme'
+import { evalWhen, WhenContext } from './whenClause'
 
 // The installed extensions, kept in sync with the main process, and what they bring to the editor:
 // themes (through the theme list) and snippets (as completions).
@@ -76,6 +77,12 @@ export const useExtensions = (): ExtRecord[] => useSyncExternalStore(subscribe, 
 export const useExtLog = (): string[] => useSyncExternalStore(subscribe, () => log)
 export const getExtensions = (): ExtRecord[] => list
 
-/** Commands of enabled native extensions, for the palette. */
-export const extensionCommands = (): { extId: string; id: string; title: string; ext: string }[] =>
-  list.filter((e) => e.enabled && (e.native || e.vscode)).flatMap((e) => e.commands.filter((c) => !(e.hiddenCommands ?? []).includes(c.id)).map((c) => ({ extId: e.id, id: c.id, title: c.title, ext: e.displayName })))
+/** Commands of enabled native extensions, for the palette. A command whose `commandPalette` entry has a `when` clause is listed only while it holds in `ctx`. */
+export const extensionCommands = (ctx: WhenContext = {}): { extId: string; id: string; title: string; ext: string }[] =>
+  list
+    .filter((e) => e.enabled && (e.native || e.vscode))
+    .flatMap((e) =>
+      e.commands
+        .filter((c) => !(e.hiddenCommands ?? []).includes(c.id) && (e.paletteWhen ?? []).filter((m) => m.command === c.id).every((m) => evalWhen(m.when, ctx)))
+        .map((c) => ({ extId: e.id, id: c.id, title: c.title, ext: e.displayName }))
+    )

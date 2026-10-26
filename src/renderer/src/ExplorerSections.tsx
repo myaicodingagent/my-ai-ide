@@ -11,7 +11,7 @@ const dirName = (p: string): string => {
 const norm = (p: string): string => p.replace(/\\/g, '/').toLowerCase()
 
 // A collapsible part of the Explorer. Open or closed is remembered.
-export function Section({ id, title, count, actions, children, grow }: { id: string; title: string; count?: number; actions?: ReactNode; children: ReactNode; grow?: boolean }): JSX.Element {
+export function Section({ id, title, count, actions, children, grow, onMenu }: { id: string; title: string; count?: number; actions?: ReactNode; children: ReactNode; grow?: boolean; onMenu?: (x: number, y: number) => void }): JSX.Element {
   const key = 'ex-open-' + id
   const [open, setOpen] = useState<boolean>(() => {
     try {
@@ -32,7 +32,17 @@ export function Section({ id, title, count, actions, children, grow }: { id: str
   }
   return (
     <section className={'ex-section' + (open ? ' open' : '') + (grow ? ' grow' : '')} data-ex-section={id} aria-label={title}>
-      <div className="ex-head">
+      <div
+        className="ex-head"
+        onContextMenu={
+          onMenu
+            ? (e) => {
+                e.preventDefault()
+                onMenu(e.clientX, e.clientY) // (also the Menu key and Shift+F10 on the header's button)
+              }
+            : undefined
+        }
+      >
         <button className="ex-toggle" aria-expanded={open} onClick={toggle} data-ex-toggle={id}>
           <span className={'ex-chevron' + (open ? ' open' : '')}>▸</span>
           <span className="ex-title">{title}</span>

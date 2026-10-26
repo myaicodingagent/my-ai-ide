@@ -284,6 +284,13 @@ export function GitPanel({
     if (items.length) setFileMenu({ x, y, items: items.map((it, i) => (i === 0 ? { ...it, separator: false } : it)) })
   }
 
+  // Right-click on the header of Staged Changes / Changes: what extensions add ("scm/resourceGroup/context"); the command gets the group.
+  const openGroupMenu = (x: number, y: number, scmGroup: 'index' | 'workingTree', label: string, files: GitFile[]): void => {
+    const arg = { id: scmGroup, label, resourceStates: files.map((f) => ({ resourceUri: { $uri: f.abs } })) }
+    const items = fileMenuItems('scmGroupMenus', root, { scmGroup, isDir: true }, arg)
+    if (items.length) setFileMenu({ x, y, items: items.map((it, i) => (i === 0 ? { ...it, separator: false } : it)) })
+  }
+
   const commit = async (): Promise<void> => {
     if (await run('commit', () => window.api.gitCommit(root, message), 'Committed.')) setMessage('')
   }
@@ -479,6 +486,7 @@ export function GitPanel({
       <Section
         id="git-staged"
         title="Staged Changes"
+        onMenu={(x, y) => openGroupMenu(x, y, 'index', 'Staged Changes', staged)}
         count={staged.length > 0 ? staged.length : undefined}
         actions={
           staged.length > 0 ? (
@@ -507,6 +515,7 @@ export function GitPanel({
       <Section
         id="git-changes"
         title="Changes"
+        onMenu={(x, y) => openGroupMenu(x, y, 'workingTree', 'Changes', changes)}
         count={changes.length > 0 ? changes.length : undefined}
         actions={
           changes.length > 0 ? (

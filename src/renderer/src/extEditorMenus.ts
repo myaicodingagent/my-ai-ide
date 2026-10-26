@@ -13,7 +13,7 @@ const entries = (): Entry[] =>
     .filter((e) => e.enabled && (e.vscode || e.native))
     .flatMap((e) => (e.editorMenus ?? []).map((m) => ({ ...m, extId: e.id })))
 
-function contextOf(ed: monaco.editor.IStandaloneCodeEditor): WhenContext {
+export function contextOf(ed: monaco.editor.IStandaloneCodeEditor): WhenContext {
   const model = ed.getModel()
   const file = model && model.uri.scheme === 'file' ? model.uri.fsPath : ''
   const base = file.split(/[\\/]/).pop() ?? ''
@@ -29,6 +29,13 @@ function contextOf(ed: monaco.editor.IStandaloneCodeEditor): WhenContext {
     editorReadonly: ed.getOption(monaco.editor.EditorOption.readOnly),
     editorTextFocus: ed.hasTextFocus()
   }
+}
+
+/** The context of the editor the person is working in (the focused one, else the first), for `when` clauses of the palette. */
+export function activeEditorContext(): WhenContext {
+  const eds = monaco.editor.getEditors() as monaco.editor.IStandaloneCodeEditor[]
+  const ed = eds.find((e) => e.hasTextFocus()) ?? eds[0]
+  return ed ? contextOf(ed) : {}
 }
 
 /** Adds the extensions' entries to this editor's context menu, and keeps them in step with the installed extensions. */

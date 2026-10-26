@@ -52,7 +52,7 @@ import { expandVars, taskChain } from './tasksRun'
 import { validSshTarget, wslUnc } from '../../main/shellspec'
 import type { ConnectResult } from '../../main/sshfs'
 import { extensionCommands, initExtensions, onExtensionsChanged } from './extStore'
-import { attachExtEditorMenus } from './extEditorMenus'
+import { activeEditorContext, attachExtEditorMenus } from './extEditorMenus'
 import { endSession, getLiveShare, initLiveShare, joinSession, onLiveShareClosed, startSession, useLiveShare } from './liveshare'
 import { fileMenuEntries, fileMenuItems, runFileMenuEntry } from './extFileMenus'
 import { attachDebugEditor, toggleBreakpointAtCaret } from './debugEditor'
@@ -1824,7 +1824,7 @@ export function App(): JSX.Element {
       { label: 'File: Save', run: () => void save() },
       { label: 'Agent: Run a Task in the Background…', run: () => showAgents() },
       { label: 'Extensions: Show Installed Extensions', run: () => { setShowSidebar(true); setSidebarView('ext') } },
-      ...extensionCommands().map((c) => ({ label: c.ext + ': ' + c.title, run: () => void runExtCommand(c) })),
+      ...extensionCommands(activeEditorContext()).map((c) => ({ label: c.ext + ': ' + c.title, run: () => void runExtCommand(c) })),
       { label: 'Notebook: Create New Notebook…', run: () => createNotebook() },
       {
         label: 'Notebook: Open as Notebook / as Text',

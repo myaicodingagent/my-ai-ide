@@ -1,4 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
+import { ContextMenu, MenuItem } from './ContextMenu'
+import { useExtensions } from './extStore'
+import { menuEntries, runFileMenuEntry } from './extFileMenus'
+import { menuOrder } from './whenClause'
 import type { DbgScope, DbgVar } from '../../main/debugger'
 import type { LaunchConfig } from '../../main/tasks'
 import {
@@ -18,7 +22,21 @@ import {
 
 const baseName = (p: string): string => p.split(/[\\/]/).pop() ?? p
 
-function VarRow({ v, depth }: { v: DbgVar; depth: number }): JSX.Element {
+
+// What extensions add to the debugger's menus: "debug/toolBar" (buttons in the bar), "debug/variables/context" (a variable's
+// right-click menu) and "debug/callstack/context" (a stack frame's). The `when` clauses see the state of the debugger.
+const debugContext = (status: string, extra: Record<string, string | boolean | undefined> = {}): Record<string, string | boolean | undefined> => ({
+  inDebugMode: status !== 'idle' && status !== 'ended',
+  debugState: status === 'paused' ? 'stopped' : status === 'running' ? 'running' : 'inactive',
+  ...extra
+})
+function debugItems(kind: 'debugVariableMenus' | 'debugFrameMenus', ctx: Record<string, string | boolean | undefined>, arg: unknown): MenuItem[] {
+  const list = menuEntries(kind, ctx)
+  return list.map((m, i) => ({ label: m.title, run: () => runFileMenuEntry(m, '', arg), separator: i > 0 && menuOrder(m.group).name !== menuOrder(list[i - 1].group).name }))
+}
+type VarMenu = (x: number, y: number, v: DbgVar, container: string) => void
+
+function VarRow({ v, depth, container, onMenu }: { v: DbgVar; depth: number; container: string; onMenu: VarMenu }): JSX.Element {
   const [open, setOpen] = useState(false)
   const [kids, setKids] = useState<DbgVar[] | null>(null)
   const toggle = async (): Promise<void> => {
@@ -28,14 +46,23 @@ function VarRow({ v, depth }: { v: DbgVar; depth: number }): JSX.Element {
   }
   return (
     <div>
-      <div className="dbg-var" data-dbg-var={v.name} style={{ paddingLeft: 8 + depth * 12 }} onClick={() => void toggle()}>
+      <div
+        className="dbg-var"
+        data-dbg-var={v.name}
+        style={{ paddingLeft: 8 + depth * 12 }}
+        onClick={() => void toggle()}
+        onContextMenu={(e) => {
+          e.preventDefault()
+          onMenu(e.clientX, e.clientY, v, container)
+        }}
+      >
         <span className="dbg-chevron">{v.objectId ? (open ? '▾' : '▸') : ''}</span>
         <span className="dbg-var-name">{v.name}</span>
         <span className={'dbg-var-value dbg-t-' + v.type} title={v.value}>
           {v.value}
         </span>
       </div>
-      {open && kids?.map((k) => <VarRow key={k.name} v={k} depth={depth + 1} />)}
+      {open && kids?.map((k) => <VarRow key={k.name} v={k} depth={depth + 1} container={v.name} onMenu={onMenu} />)}
     </div>
   )
 }
@@ -81,6 +108,13 @@ export function DebugPanel({
   onOpenFile: (path: string, line: number) => void
 }): JSX.Element {
   const d = useDebug()
+  useExtensions() // the menus follow the installed extensions
+  const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null)
+  const varMenu: VarMenu = (x, y, v, container) => {
+    const variable = { name: v.name, value: v.value, type: v.type, variablesReference: v.objectId ? 1 : 0 }
+    const items = debugItems('debugVariableMenus', debugContext(d.status, { variable: v.name, variableName: v.name, variableValue: v.value, variableType: v.type, variableEvaluateName: v.name, variableContainer: container }), { container: { name: container }, variable, sessionId: 'debug' })
+    if (items.length) setMenu({ x, y, items: items.map((it, i) => (i === 0 ? { ...it, separator: false } : it)) })
+  }
   const [scopes, setScopes] = useState<DbgScope[]>([])
   const [watchValues, setWatchValues] = useState<Record<string, { ok: boolean; text: string; v?: DbgVar }>>({})
   const [watchInput, setWatchInput] = useState('')
@@ -173,6 +207,11 @@ export function DebugPanel({
             <button data-dbg-action="stepOut" title="Step Out (Shift+F11)" disabled={d.status !== 'paused'} onClick={() => void stepDebug('stepOut')}>↑</button>
             <button data-dbg-action="pause" title="Pause" disabled={d.status !== 'running'} onClick={() => void stepDebug('pause')}>⏸</button>
             <button data-dbg-action="stop" title="Stop (Shift+F5)" onClick={() => void stopDebugging()}>■</button>
+            {menuEntries('debugToolbarMenus', debugContext(d.status)).map((m) => (
+              <button key={m.extId + m.command} data-ext-debug-toolbar={m.command} title={m.title} aria-label={m.title} onClick={() => runFileMenuEntry(m, '', undefined)}>
+                {m.title}
+              </button>
+            ))}
           </>
         )}
       </div>
@@ -189,7 +228,7 @@ export function DebugPanel({
           <div key={s.name} data-dbg-scope={s.name}>
             <div className="dbg-scope-name">{s.name}</div>
             {s.vars.map((v) => (
-              <VarRow key={s.name + v.name} v={v} depth={0} />
+              <VarRow key={s.name + v.name} v={v} depth={0} container={s.name} onMenu={varMenu} />
             ))}
           </div>
         ))}
@@ -230,6 +269,11 @@ export function DebugPanel({
             className={'dbg-frame' + (f.index === d.frame ? ' sel' : '') + (f.file ? '' : ' dim')}
             data-dbg-frame={f.index}
             onClick={() => (f.file ? selectFrame(f.index) : undefined)}
+            onContextMenu={(e) => {
+              e.preventDefault()
+              const items = debugItems('debugFrameMenus', debugContext(d.status, { callStackItemType: 'stackFrame', stackFrameName: f.name }), { frameId: f.index, name: f.name, line: f.line, source: f.file ? { path: f.file, name: baseName(f.file) } : undefined, sessionId: 'debug' })
+              if (items.length) setMenu({ x: e.clientX, y: e.clientY, items: items.map((it, i) => (i === 0 ? { ...it, separator: false } : it)) })
+            }}
             title={f.file ?? f.url}
           >
             <span>{f.name}</span>
@@ -286,6 +330,7 @@ export function DebugPanel({
           onKeyDown={(e) => e.key === 'Enter' && void evalConsole()}
         />
       </Section>
+      {menu && <ContextMenu x={menu.x} y={menu.y} items={menu.items} onClose={() => setMenu(null)} />}
     </div>
   )
 }

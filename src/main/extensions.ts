@@ -47,6 +47,11 @@ export interface ExtRecord {
   tabMenus: { command: string; title: string; when: string; group: string }[] // entries of a tab's right-click menu ("editor/title/context")
   scmTitleMenus: { command: string; title: string; when: string; group: string }[] // buttons in the header of Source Control ("scm/title")
   scmResourceMenus: { command: string; title: string; when: string; group: string }[] // entries of a changed file's right-click menu in Source Control ("scm/resourceState/context")
+  scmGroupMenus: { command: string; title: string; when: string; group: string }[] // entries of the right-click menu of a group of changes ("scm/resourceGroup/context")
+  debugToolbarMenus: { command: string; title: string; when: string; group: string }[] // buttons in the debug bar ("debug/toolBar")
+  debugVariableMenus: { command: string; title: string; when: string; group: string }[] // entries of a variable's right-click menu ("debug/variables/context")
+  debugFrameMenus: { command: string; title: string; when: string; group: string }[] // entries of a stack frame's right-click menu ("debug/callstack/context")
+  paletteWhen: { command: string; title: string; when: string; group: string }[] // palette entries that show only while their when clause holds ("commandPalette")
   hiddenCommands: string[] // commands the palette must not list ("commandPalette" entries whose when is false)
   unsupported: string[] // contributions that are ignored (grammars, languages, debuggers...)
   codeIgnored: boolean // a VS Code extension with code (main) that cannot run here
@@ -113,7 +118,7 @@ async function readExtension(dir: string, source: ExtRecord['source']): Promise<
       : []
   const unsupported = Object.keys(c).filter((k) => !SUPPORTED.has(k) && k !== 'menus')
   const menus = (c.menus && typeof c.menus === 'object' ? c.menus : {}) as Record<string, unknown>
-  const otherMenus = Object.keys(menus).filter((k) => !['view/item/context', 'view/title', 'editor/context', 'commandPalette', 'explorer/context', 'editor/title', 'editor/title/context', 'scm/title', 'scm/resourceState/context'].includes(k))
+  const otherMenus = Object.keys(menus).filter((k) => !['view/item/context', 'view/title', 'editor/context', 'commandPalette', 'explorer/context', 'editor/title', 'editor/title/context', 'scm/title', 'scm/resourceState/context', 'scm/resourceGroup/context', 'debug/toolBar', 'debug/variables/context', 'debug/callstack/context'].includes(k))
   if (otherMenus.length) unsupported.push('menus (' + otherMenus.join(', ') + ')')
   const titleOf = new Map(commands.map((x) => [x.id, x.title]))
   const menuList = (key: string): ExtRecord['treeMenus'] =>
@@ -161,6 +166,11 @@ async function readExtension(dir: string, source: ExtRecord['source']): Promise<
     tabMenus: menuList('editor/title/context'),
     scmTitleMenus: menuList('scm/title'),
     scmResourceMenus: menuList('scm/resourceState/context'),
+    scmGroupMenus: menuList('scm/resourceGroup/context'),
+    debugToolbarMenus: menuList('debug/toolBar'),
+    debugVariableMenus: menuList('debug/variables/context'),
+    debugFrameMenus: menuList('debug/callstack/context'),
+    paletteWhen: menuList('commandPalette').filter((m) => m.when.trim() !== '' && m.when.trim() !== 'false'),
     hiddenCommands,
     unsupported,
     codeIgnored: false,
