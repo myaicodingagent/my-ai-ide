@@ -1,5 +1,6 @@
 import { monaco } from './monaco-setup'
 import { breakpointsOf, getDebug, subscribeDebug, toggleBreakpoint } from './debugStore'
+import { sharedStopLine, subscribeLiveShare } from './liveshare'
 
 // Shows the debugger in an editor: a red dot in the margin for each breakpoint (click the margin, or F9, to toggle
 // one) and an arrow plus a highlighted line where the program is stopped.
@@ -33,10 +34,16 @@ export function attachDebugEditor(ed: monaco.editor.IStandaloneCodeEditor): mona
         options: { isWholeLine: true, className: 'debug-current-line', glyphMarginClassName: 'debug-arrow' }
       })
     }
+    // In a Live Share session the guest sees where the host's program is stopped in the shared files.
+    const shared = sharedStopLine(file)
+    if (shared !== null && shared <= lines) {
+      decos.push({ range: new monaco.Range(shared, 1, shared, 1), options: { isWholeLine: true, className: 'debug-current-line', glyphMarginClassName: 'debug-arrow' } })
+    }
     collection.set(decos)
   }
   const subs = [
     subscribeDebug(update),
+    subscribeLiveShare(update),
     ed.onDidChangeModel(update),
     ed.onMouseDown((e) => {
       const model = ed.getModel()

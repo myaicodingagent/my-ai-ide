@@ -3,6 +3,7 @@ import { ContextMenu, MenuItem } from './ContextMenu'
 import { useExtensions } from './extStore'
 import { menuEntries, runFileMenuEntry } from './extFileMenus'
 import { menuOrder } from './whenClause'
+import { sharedPath, useLiveShare } from './liveshare'
 import type { DbgScope, DbgVar } from '../../main/debugger'
 import type { LaunchConfig } from '../../main/tasks'
 import {
@@ -108,6 +109,7 @@ export function DebugPanel({
   onOpenFile: (path: string, line: number) => void
 }): JSX.Element {
   const d = useDebug()
+  const live = useLiveShare()
   useExtensions() // the menus follow the installed extensions
   const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null)
   const varMenu: VarMenu = (x, y, v, container) => {
@@ -193,6 +195,30 @@ export function DebugPanel({
         </select>
         <button data-dbg-edit-configs title="Edit launch.json" onClick={onEditConfigs}>⚙</button>
       </div>
+      {live.role === 'guest' && live.debug && (
+        <div className="dbg-shared" data-ls-debug role="region" aria-label="The host's debug session">
+          <div className="dbg-scope-name">Host's debug session (you can watch it, not control it)</div>
+          <div className="dbg-status" data-ls-debug-status={live.debug.status}>
+            {live.debug.status === 'paused' ? `Paused${live.debug.reason === 'breakpoint' ? ' on a breakpoint' : live.debug.reason === 'exception' ? ' on an exception' : ''}${live.debug.exception ? ': ' + live.debug.exception : ''}` : live.debug.status === 'running' ? 'Running…' : 'The program ended'}
+          </div>
+          {live.debug.frames.map((f, i) => (
+            <div
+              key={i}
+              className={'dbg-frame' + (i === live.debug!.frame ? ' sel' : '') + (f.rel ? '' : ' dim')}
+              data-ls-debug-frame={i}
+              role={f.rel ? 'button' : undefined}
+              tabIndex={f.rel ? 0 : undefined}
+              onClick={() => f.rel && onOpenFile(sharedPath(f.rel), f.line)}
+              onKeyDown={(e) => {
+                if (f.rel && (e.key === 'Enter' || e.key === ' ')) (e.preventDefault(), onOpenFile(sharedPath(f.rel), f.line))
+              }}
+            >
+              <span>{f.name}</span>
+              <span className="dbg-frame-loc">{f.rel ? `${f.rel.split('/').pop()}:${f.line}` : 'outside the shared folder'}</span>
+            </div>
+          ))}
+        </div>
+      )}
       {problems.length > 0 && <div className="chat-error" data-dbg-problems>{problems.join(' ')}</div>}
       <div className="dbg-bar">
         {!active ? (

@@ -414,7 +414,7 @@ function listen(g: Guest, ws: WebSocket): void {
     else if (msg.t === 'closed') {
       g.endedByHost = true // not a lost connection: there is nothing to come back to
       toRenderer({ type: 'closed', reason: String(msg.reason ?? '') })
-    } else if (msg.t === 'doc-state' || msg.t === 'doc-update' || msg.t === 'cursor' || msg.t === 'terms' || msg.t === 'term-data') toRenderer({ type: 'msg', from: String(msg.from ?? 'host'), msg })
+    } else if (msg.t === 'doc-state' || msg.t === 'doc-update' || msg.t === 'cursor' || msg.t === 'terms' || msg.t === 'term-data' || msg.t === 'debug') toRenderer({ type: 'msg', from: String(msg.from ?? 'host'), msg })
   })
   ws.on('error', () => ws.close())
   ws.on('close', () => {

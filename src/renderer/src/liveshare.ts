@@ -2,6 +2,7 @@ import * as Y from 'yjs'
 import { useSyncExternalStore } from 'react'
 import { monaco } from './monaco-setup'
 import { announce } from './a11y'
+import { getDebug, subscribeDebug } from './debugStore'
 
 // Live Share, the editor's side (the transport and the file server are in src/main/liveshare.ts).
 //
@@ -23,6 +24,14 @@ export interface SharedTerm {
   cols: number
   rows: number
 }
+/** Where the host's debugger is: shown to the guests (they watch; they cannot control it). */
+export interface SharedDebug {
+  status: 'running' | 'paused' | 'ended'
+  reason: string
+  exception?: string
+  frames: { name: string; rel: string | null; line: number }[] // `rel`: the file below the shared folder, null for code outside it
+  frame: number // the selected one
+}
 export interface LiveState {
   role: 'none' | 'host' | 'guest'
   readOnly: boolean
@@ -32,17 +41,19 @@ export interface LiveState {
   me: string
   message: string // why a session ended, when it was not by choice
   terms: SharedTerm[] // terminals the host shares
+  debug: SharedDebug | null // the host's debug session, as the guests see it
   following: string // the id of the person whose file and position this editor follows ('' = nobody)
   reconnecting: boolean // a guest whose connection to the host was lost and is being made again
 }
 
-const NONE: LiveState = { role: 'none', readOnly: false, peers: [], sid: '', join: '', me: '', message: '', terms: [], following: '', reconnecting: false }
+const NONE: LiveState = { role: 'none', readOnly: false, peers: [], sid: '', join: '', me: '', message: '', terms: [], debug: null, following: '', reconnecting: false }
 let state: LiveState = NONE
 const listeners = new Set<() => void>()
 const emit = (next: Partial<LiveState>): void => {
   state = { ...state, ...next }
   for (const l of listeners) l()
 }
+export const subscribeLiveShare = (cb: () => void): (() => void) => (listeners.add(cb), () => listeners.delete(cb))
 export const useLiveShare = (): LiveState => useSyncExternalStore((cb) => (listeners.add(cb), () => listeners.delete(cb)), () => state)
 export const getLiveShare = (): LiveState => state
 
@@ -355,6 +366,10 @@ async function onMessage(from: string, name: string | undefined, msg: Record<str
     const terms = Array.isArray(msg.terms) ? (msg.terms as SharedTerm[]) : []
     if (state.terms.length > terms.length) announce('The host stopped sharing a terminal')
     emit({ terms })
+  } else if (msg.t === 'debug' && state.role === 'guest') {
+    const d = msg.debug as SharedDebug | null
+    if (d && state.debug?.status !== 'paused' && d.status === 'paused') announce(`The program of the host stopped${d.frames[d.frame] ? ' in ' + d.frames[d.frame].name : ''}`)
+    emit({ debug: d && typeof d === 'object' ? d : null })
   } else if (msg.t === 'term-open' && state.role === 'host') {
     const t = hostTerms.get(Number(msg.tid))
     if (t) send({ t: 'term-data', tid: t.info.id, data: t.buf, end: t.total, snap: true, to: from })
@@ -407,6 +422,36 @@ async function followTo(id: string): Promise<void> {
 }
 const isShown = (e: monaco.editor.ICodeEditor): boolean => !!e.getDomNode()?.offsetParent
 
+// ---- the host's debugger ----
+
+let lastDebug = ''
+/** The host's debugger state in the form guests get (only what is in the shared folder is named). */
+function debugPayload(): SharedDebug | null {
+  const d = getDebug()
+  if (d.status === 'idle') return null
+  const frames = d.status === 'paused' ? d.frames.map((f) => ({ name: f.name, rel: f.file ? relOf(f.file) : null, line: f.line })) : []
+  return { status: d.status, reason: d.reason, exception: d.exception, frames, frame: d.frame }
+}
+function shareDebug(force = false): void {
+  if (state.role !== 'host') return
+  const payload = debugPayload()
+  const json = JSON.stringify(payload)
+  if (!force && json === lastDebug) return
+  lastDebug = json
+  send({ t: 'debug', debug: payload })
+}
+
+/** The line where the host's program is stopped in this file, as a guest sees it (null: not here). */
+export function sharedStopLine(path: string): number | null {
+  const d = state.debug
+  if (state.role !== 'guest' || !d || d.status !== 'paused') return null
+  const rel = relOf(path)
+  const f = d.frames[d.frame]
+  return rel && f?.rel && keyOf(f.rel) === keyOf(rel) ? f.line : null
+}
+/** The editor's path of a file of the shared folder. */
+export const sharedPath = (rel: string): string => pathOf(rel)
+
 /** Follow a person (their id from the list of people), or nobody (''). */
 export function follow(id: string): void {
   const p = state.peers.find((x) => x.id === id)
@@ -423,6 +468,7 @@ function reset(message: string): void {
   docs.clear()
   for (const id of [...cursors.keys()]) forgetPeer(id)
   hostRoot = null
+  lastDebug = ''
   for (const t of hostTerms.values()) if (t.timer) clearTimeout(t.timer)
   hostTerms.clear()
   watching.clear()
@@ -460,6 +506,7 @@ export function initLiveShare(): void {
         announce('The person you were following left the session')
         emit({ following: '' })
       }
+      if (state.role === 'host') shareDebug(true) // for whoever just came in
       if (state.role === 'host' && hostTerms.size) send({ t: 'terms', terms: [...hostTerms.values()].map((t) => t.info) }) // for whoever just came in
     }
     else if (e.type === 'reconnecting') {
@@ -476,6 +523,7 @@ export function initLiveShare(): void {
       if (had && e.reason) closedCb?.(String(e.reason))
     } else if (e.type === 'msg') void onMessage(String(e.from), e.name as string | undefined, e.msg as Record<string, any>)
   })
+  subscribeDebug(() => shareDebug())
   monaco.editor.onDidCreateModel((m) => void attach(m))
   for (const ed of monaco.editor.getEditors()) watchEditor(ed)
   monaco.editor.onDidCreateEditor((ed) => watchEditor(ed))
