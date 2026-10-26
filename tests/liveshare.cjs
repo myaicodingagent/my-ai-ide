@@ -144,6 +144,35 @@ async function connect(port) {
     const found = await guest.ev(`window.api.searchText(${JSON.stringify(unc(''))}, 'gamma', { caseSensitive: false, regex: false }).then((r) => JSON.stringify(r.matches.map((m) => m.rel)))`)
     check('search from the guest looks in the host\'s folder', /a\.txt/.test(found) && !/node_modules/.test(found), found)
 
+    // ---- a shared terminal
+    const termText = (side) => side.ev(`(() => { const v = [...document.querySelectorAll('.term-view')].find((v) => v.style.display !== 'none'); return v ? (v.querySelector('.xterm-rows')?.textContent || '').replace(/\u00a0/g, ' ') : '' })()`)
+    const typeInTerm = async (side, text) => { await side.ev(`[...document.querySelectorAll('.term-view')].find((v) => v.style.display !== 'none')?.querySelector('.xterm-helper-textarea')?.focus()`); await side.send('Input.insertText', { text }); await side.key('Enter', 'Enter', 13) }
+    await host.key('`', 'Backquote', 192, 2) // Ctrl+` opens the panel with a terminal
+    check('the host has a terminal', await host.waitFor(async () => /PS .*>/.test(await termText(host)), 30000))
+    check('a guest has no terminal tab before the host shares one', await guest.ev(`document.querySelectorAll('.term-tab').length === 0`))
+    await host.palette('live share', 'Live Share: Share the Terminal')
+    await host.choose('Let guests watch')
+    await host.ev(`Promise.resolve(0)`)
+    await typeInTerm(host, 'echo BEFORE-' + 'JOIN')
+    check('the guest gets a tab for the shared terminal', await guest.waitFor(() => guest.ev(`[...document.querySelectorAll('.term-tab-name')].some((t) => /\(shared\)/.test(t.textContent))`), 15000))
+    check('it shows what the host\'s terminal showed, and what the host types after', await guest.waitFor(async () => /BEFORE-JOIN/.test(await termText(guest)), 15000), await termText(guest))
+    await typeInTerm(host, 'echo AFTER-' + 'SHARE')
+    check('new output reaches the guest', await guest.waitFor(async () => /AFTER-SHARE/.test(await termText(guest)), 15000))
+    await typeInTerm(guest, 'echo GUEST-' + 'TYPED')
+    await sleep(1500)
+    check('a guest cannot type in a terminal shared for watching', !/GUEST-TYPED/.test(await termText(host)) && !/GUEST-TYPED/.test(await termText(guest)))
+    // the main process also refuses a guest's input that the host did not allow
+    for (let n = 1; n <= 6; n++) await guest.ev(`window.api.lsSend({ t: 'term-input', tid: ${n}, data: 'echo FORGED-' + 'INPUT\\r' })`)
+    await sleep(1000)
+    check('and input sent around the page is refused as well', !/FORGED-INPUT/.test(await termText(host)))
+    await host.palette('live share', 'Live Share: Stop Sharing the Terminal')
+    check('the guest\'s tab goes when sharing stops', await guest.waitFor(() => guest.ev(`![...document.querySelectorAll('.term-tab-name')].some((t) => /\(shared\)/.test(t.textContent))`), 10000))
+    await host.palette('live share', 'Live Share: Share the Terminal')
+    await host.choose('Let guests type too')
+    check('a terminal shared with typing lets a guest run a command', await guest.waitFor(() => guest.ev(`[...document.querySelectorAll('.term-tab-name')].some((t) => /\(shared\)/.test(t.textContent))`), 15000))
+    await typeInTerm(guest, 'echo GUEST-' + 'RAN')
+    check('and it runs in the host\'s shell', await host.waitFor(async () => (await termText(host)).split('GUEST-RAN').length > 2, 15000), (await termText(host)).slice(-110) + " || GUEST: " + (await termText(guest)).slice(-110))
+
     // ---- the host ends the session
     await host.palette('live share', 'Live Share: End the Session')
     check('the host\'s status item goes away', await host.waitFor(() => host.ev(`!document.querySelector('[data-sb="liveshare"]')`), 8000))

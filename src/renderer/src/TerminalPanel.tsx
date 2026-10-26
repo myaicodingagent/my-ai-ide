@@ -3,6 +3,7 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { subscribeTheme, terminalTheme } from './theme'
+import { feedTerminal, getLiveShare, isTerminalShared, resizeSharedTerminal, sendTerminalInput, shareTerminal, SharedTerm, unshareTerminal, useLiveShare, watchSharedTerminal } from './liveshare'
 import { fontStack, getSettings, prefersLessMotion, screenReaderOn, subscribeSettings, useSettings } from './settings'
 
 // --- Routing of shell output --------------------------------------------------
@@ -18,6 +19,7 @@ function wire(): void {
   if (wired) return
   wired = true
   window.api.onTermData((id, data) => {
+    feedTerminal(id, data) // a terminal the host shares in a Live Share session
     const sink = sinks.get(id)
     if (sink) sink(data)
     else earlyData.set(id, [...(earlyData.get(id) ?? []), data])
@@ -47,6 +49,25 @@ function detach(id: number): void {
 // What the terminals currently show, for the @terminal mention in chat.
 const readers = new Map<number, () => string>()
 let activeTerminalKey: number | null = null
+const ptys = new Map<number, { id: number; cols: () => number; rows: () => number }>() // tab key -> the shell behind it
+const titles = new Map<number, string>()
+
+/** Shares the selected terminal with the guests of the Live Share session. */
+export function shareActiveTerminal(write: boolean): string | null {
+  const key = activeTerminalKey
+  const pty = key !== null ? ptys.get(key) : undefined
+  if (key === null || !pty) return 'There is no terminal to share. Open one first.'
+  if (isTerminalShared(pty.id)) return 'That terminal is shared already.'
+  if (!shareTerminal(pty.id, titles.get(key) ?? 'Terminal', write, pty.cols(), pty.rows(), readers.get(key)?.() ?? '')) return 'Start a Live Share session first.'
+  return null
+}
+/** Stops sharing the selected terminal. */
+export function unshareActiveTerminal(): boolean {
+  const pty = activeTerminalKey !== null ? ptys.get(activeTerminalKey) : undefined
+  if (!pty || !isTerminalShared(pty.id)) return false
+  unshareTerminal(pty.id)
+  return true
+}
 
 /** The last couple of hundred lines on screen and in scrollback of the selected terminal. */
 export function readActiveTerminalText(): string {
@@ -61,6 +82,7 @@ function TerminalView({
   cwd,
   command,
   active,
+  shared,
   onExit
 }: {
   tabKey: number
@@ -68,10 +90,11 @@ function TerminalView({
   cwd: string | null
   command?: string
   active: boolean // visible and selected: refit and take keyboard focus
+  shared?: SharedTerm // the host's terminal in a Live Share session: shown here, not started here
   onExit: () => void
 }): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
-  const controls = useRef<{ refit: () => void; focus: () => void } | null>(null)
+  const controls = useRef<{ refit: () => void; focus: () => void; resize: (cols: number, rows: number) => void } | null>(null)
   const onExitRef = useRef(onExit)
   onExitRef.current = onExit
 
@@ -82,7 +105,9 @@ function TerminalView({
       fontSize: getSettings().terminalFontSize,
       theme: terminalTheme(),
       cursorBlink: !prefersLessMotion(),
-      screenReaderMode: screenReaderOn()
+      screenReaderMode: screenReaderOn(),
+      disableStdin: !!shared && !shared.write,
+      ...(shared ? { cols: shared.cols, rows: shared.rows } : {})
     })
     const fit = new FitAddon()
     term.loadAddon(fit)
@@ -93,11 +118,15 @@ function TerminalView({
 
     // A hidden terminal has no size; fitting then would collapse it to nothing.
     const refit = (): void => {
+      if (shared) return // it has the size of the host's terminal
       if (host.offsetWidth === 0 || host.offsetHeight === 0) return
       fit.fit()
-      if (id !== null) window.api.termResize(id, term.cols, term.rows)
+      if (id !== null) {
+        window.api.termResize(id, term.cols, term.rows)
+        resizeSharedTerminal(id, term.cols, term.rows)
+      }
     }
-    controls.current = { refit, focus: () => term.focus() }
+    controls.current = { refit, focus: () => term.focus(), resize: (c, r) => term.resize(c, r) }
     readers.set(tabKey, () => {
       const buf = term.buffer.active
       const lines: string[] = []
@@ -119,15 +148,25 @@ function TerminalView({
       refit()
     })
 
-    wire()
-    window.api.termCreate(shellId, cwd, term.cols, term.rows).then((tid) => {
-      if (disposed) return window.api.termKill(tid)
-      id = tid
-      attach(tid, (d) => term.write(d), () => onExitRef.current())
-      refit()
-      if (command) window.api.termWrite(tid, command + '\r') // the shell reads it when it is ready
-    })
-    term.onData((d) => id !== null && window.api.termWrite(id, d))
+    let unwatch: (() => void) | null = null
+    if (shared) {
+      unwatch = watchSharedTerminal(shared.id, (d) => term.write(d))
+      term.onData((d) => shared.write && sendTerminalInput(shared.id, d))
+    } else {
+      wire()
+      window.api.termCreate(shellId, cwd, term.cols, term.rows).then((tid) => {
+        if (disposed) return window.api.termKill(tid)
+        id = tid
+        ptys.set(tabKey, { id: tid, cols: () => term.cols, rows: () => term.rows })
+        attach(tid, (d) => term.write(d), () => {
+          unshareTerminal(tid)
+          onExitRef.current()
+        })
+        refit()
+        if (command) window.api.termWrite(tid, command + '\r') // the shell reads it when it is ready
+      })
+      term.onData((d) => id !== null && window.api.termWrite(id, d))
+    }
 
     const ro = new ResizeObserver(refit)
     ro.observe(host)
@@ -138,7 +177,11 @@ function TerminalView({
       offTheme()
       offSettings()
       readers.delete(tabKey)
+      ptys.delete(tabKey)
+      titles.delete(tabKey)
+      unwatch?.()
       if (id !== null) {
+        unshareTerminal(id)
         detach(id)
         window.api.termKill(id)
       }
@@ -147,6 +190,10 @@ function TerminalView({
     // A terminal keeps the shell and folder it was created with, so this runs once.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  useEffect(() => {
+    if (shared) controls.current?.resize(shared.cols, shared.rows)
+  }, [shared?.cols, shared?.rows]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!active) return
@@ -168,6 +215,7 @@ interface Tab {
   title: string
   cwd: string | null
   command?: string // typed into the shell once it has started (tasks)
+  sharedId?: number // the host's terminal this one shows (Live Share guest)
 }
 
 const MIN_HEIGHT = 120
@@ -236,6 +284,7 @@ export function TerminalPanel({
     counts.current.set(id, n)
     const key = nextKey.current++
     const title = extra ? extra.title : n === 1 ? label : `${label} ${n}`
+    titles.set(key, title)
     setTabs((t) => [...t, { key, shellId: id, title, cwd: extra ? extra.cwd : cwdRef.current, command: extra?.command }])
     setActive(key)
   }, [])
@@ -247,6 +296,7 @@ export function TerminalPanel({
   // closing the last tab must not start a new terminal while the panel is still on its way to hiding.
   useEffect(() => {
     if (!visible || panelTab !== 'terminal' || tabsRef.current.length > 0 || creating.current) return
+    if (getLiveShare().role === 'guest' && getLiveShare().terms.length) return // the host's terminals are about to appear
     creating.current = true
     // If the panel was opened by a request for a particular shell (an SSH session), that is the one to start.
     void addTab(newTabShell ?? undefined, newTabExtra).finally(() => {
@@ -263,6 +313,17 @@ export function TerminalPanel({
     void addTab(newTabShell ?? undefined, newTabExtra)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [newTabSignal, addTab])
+
+  // The host's shared terminals show up as tabs for a guest, and go when the host stops sharing.
+  const live = useLiveShare()
+  useEffect(() => {
+    const wanted = live.role === 'guest' ? live.terms : []
+    setTabs((prev) => {
+      const kept = prev.filter((t) => t.sharedId === undefined || wanted.some((w) => w.id === t.sharedId))
+      const added = wanted.filter((w) => !kept.some((t) => t.sharedId === w.id)).map((w) => ({ key: nextKey.current++, shellId: '', title: `${w.title} (shared)`, cwd: null, sharedId: w.id }))
+      return added.length || kept.length !== prev.length ? [...kept, ...added] : prev
+    })
+  }, [live.role, live.terms])
 
   const closeTab = useCallback((key: number): void => {
     setTabs((prev) => prev.filter((t) => t.key !== key))
@@ -389,6 +450,7 @@ export function TerminalPanel({
               cwd={t.cwd}
               command={t.command}
               active={visible && panelTab === 'terminal' && t.key === active}
+              shared={t.sharedId !== undefined ? live.terms.find((w) => w.id === t.sharedId) : undefined}
               onExit={() => closeTab(t.key)}
             />
           </div>

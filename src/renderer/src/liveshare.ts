@@ -15,6 +15,13 @@ export interface Peer {
   id: string
   name: string
 }
+export interface SharedTerm {
+  id: number // the host's terminal id
+  title: string
+  write: boolean // guests may type in it
+  cols: number
+  rows: number
+}
 export interface LiveState {
   role: 'none' | 'host' | 'guest'
   readOnly: boolean
@@ -23,9 +30,10 @@ export interface LiveState {
   join: string // the code to give to guests (host only)
   me: string
   message: string // why a session ended, when it was not by choice
+  terms: SharedTerm[] // terminals the host shares
 }
 
-const NONE: LiveState = { role: 'none', readOnly: false, peers: [], sid: '', join: '', me: '', message: '' }
+const NONE: LiveState = { role: 'none', readOnly: false, peers: [], sid: '', join: '', me: '', message: '', terms: [] }
 let state: LiveState = NONE
 const listeners = new Set<() => void>()
 const emit = (next: Partial<LiveState>): void => {
@@ -241,6 +249,72 @@ function watchEditor(ed: monaco.editor.ICodeEditor): void {
   })
 }
 
+// ---- shared terminals ----
+// The host chooses a terminal to share. Its output goes to the guests as it comes (and the last part of it to a guest who opens it
+// later); a guest sees it in a tab next to the terminals, sized like the host's. Typing is only possible where the host allowed it.
+
+const SNAPSHOT = 200_000
+const hostTerms = new Map<number, { info: SharedTerm; buf: string; total: number; pending: string; timer: ReturnType<typeof setTimeout> | null }>()
+const publishTerms = (): void => {
+  const terms = [...hostTerms.values()].map((t) => t.info)
+  emit({ terms })
+  void window.api.lsTerms(terms.map((t) => ({ id: t.id, write: t.write })))
+  send({ t: 'terms', terms })
+}
+
+/** The host shares a terminal (`seed`: what it shows now, as plain text). */
+export function shareTerminal(id: number, title: string, write: boolean, cols: number, rows: number, seed: string): boolean {
+  if (state.role !== 'host') return false
+  const buf = seed ? seed.replace(/\n/g, '\r\n') + '\r\n' : ''
+  hostTerms.set(id, { info: { id, title, write: write && !state.readOnly, cols, rows }, buf, total: buf.length, pending: '', timer: null })
+  publishTerms()
+  return true
+}
+export function unshareTerminal(id: number): void {
+  const t = hostTerms.get(id)
+  if (!t) return
+  if (t.timer) clearTimeout(t.timer)
+  hostTerms.delete(id)
+  publishTerms()
+}
+export const isTerminalShared = (id: number): boolean => hostTerms.has(id)
+
+/** Output of one of the host's terminals; sent on to the guests when it is shared. */
+export function feedTerminal(id: number, data: string): void {
+  const t = hostTerms.get(id)
+  if (!t) return
+  t.buf = (t.buf + data).slice(-SNAPSHOT)
+  t.total += data.length
+  t.pending += data
+  t.timer ??= setTimeout(() => {
+    t.timer = null
+    const chunk = t.pending
+    t.pending = ''
+    if (chunk) send({ t: 'term-data', tid: id, data: chunk, end: t.total })
+  }, 16)
+}
+export function resizeSharedTerminal(id: number, cols: number, rows: number): void {
+  const t = hostTerms.get(id)
+  if (!t || (t.info.cols === cols && t.info.rows === rows)) return
+  t.info = { ...t.info, cols, rows }
+  publishTerms()
+}
+
+interface Watch {
+  sink: (data: string) => void
+  snap: boolean
+  end: number // output up to here is written
+  queued: { data: string; end: number }[]
+}
+const watching = new Map<number, Watch>()
+/** A guest watches a shared terminal: `sink` gets its output, first what it showed before. Returns the way to stop. */
+export function watchSharedTerminal(id: number, sink: (data: string) => void): () => void {
+  watching.set(id, { sink, snap: false, end: 0, queued: [] })
+  send({ t: 'term-open', tid: id })
+  return () => void watching.delete(id)
+}
+export const sendTerminalInput = (id: number, data: string): void => send({ t: 'term-input', tid: id, data })
+
 // ---- messages from the other side ----
 
 async function onMessage(from: string, name: string | undefined, msg: Record<string, any>): Promise<void> {
@@ -264,6 +338,33 @@ async function onMessage(from: string, name: string | undefined, msg: Record<str
     const d = docs.get(keyOf(rel))
     if (!d) return // nobody here has this file open
     Y.applyUpdate(d.ydoc, fromB64(String(msg.update)), 'remote')
+  } else if (msg.t === 'terms' && state.role === 'guest') {
+    emit({ terms: Array.isArray(msg.terms) ? (msg.terms as SharedTerm[]) : [] })
+  } else if (msg.t === 'term-open' && state.role === 'host') {
+    const t = hostTerms.get(Number(msg.tid))
+    if (t) send({ t: 'term-data', tid: t.info.id, data: t.buf, end: t.total, snap: true, to: from })
+  } else if (msg.t === 'term-input' && state.role === 'host') {
+    const t = hostTerms.get(Number(msg.tid))
+    if (t?.info.write && typeof msg.data === 'string') window.api.termWrite(t.info.id, msg.data)
+  } else if (msg.t === 'term-data' && state.role === 'guest') {
+    const w = watching.get(Number(msg.tid))
+    if (!w) return
+    const data = String(msg.data ?? ''), end = Number(msg.end) || 0
+    // Every piece says where the output stood after it; whatever the snapshot already has is not written twice.
+    const write = (chunk: string, chunkEnd: number): void => {
+      if (chunkEnd <= w.end) return
+      const start = chunkEnd - chunk.length
+      w.sink(start >= w.end ? chunk : chunk.slice(w.end - start))
+      w.end = chunkEnd
+    }
+    if (msg.snap === true) {
+      w.sink(data)
+      w.end = end
+      w.snap = true
+      for (const q of w.queued) write(q.data, q.end)
+      w.queued = []
+    } else if (w.snap) write(data, end)
+    else w.queued.push({ data, end })
   } else if (msg.t === 'cursor') {
     cursors.set(from, { rel, start: Number(msg.start) || 0, end: Number(msg.end) || 0, name: String(msg.name ?? name ?? 'Guest') })
     drawCursor(from)
@@ -278,6 +379,9 @@ function reset(message: string): void {
   docs.clear()
   for (const id of [...cursors.keys()]) forgetPeer(id)
   hostRoot = null
+  for (const t of hostTerms.values()) if (t.timer) clearTimeout(t.timer)
+  hostTerms.clear()
+  watching.clear()
   emit({ ...NONE, message })
 }
 
@@ -286,7 +390,10 @@ export function initLiveShare(): void {
   if (started) return
   started = true
   window.api.onLsEvent((e) => {
-    if (e.type === 'peers') emit({ peers: e.peers as Peer[] })
+    if (e.type === 'peers') {
+      emit({ peers: e.peers as Peer[] })
+      if (state.role === 'host' && hostTerms.size) send({ t: 'terms', terms: [...hostTerms.values()].map((t) => t.info) }) // for whoever just came in
+    }
     else if (e.type === 'gone') forgetPeer(String(e.id))
     else if (e.type === 'closed') {
       const had = state.role !== 'none'

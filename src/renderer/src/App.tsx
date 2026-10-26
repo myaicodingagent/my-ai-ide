@@ -5,7 +5,7 @@ import { LiveRegions, announce } from './a11y'
 import { ContextMenu, MenuItem } from './ContextMenu'
 import { Breadcrumbs } from './Breadcrumbs'
 import { addRecentFolder, getRecentFolders, loadExtraFolders, loadSession, removeRecentFolder, saveExtraFolders, saveSession } from './session'
-import { TerminalPanel, PanelTab, readActiveTerminalText } from './TerminalPanel'
+import { TerminalPanel, PanelTab, readActiveTerminalText, shareActiveTerminal, unshareActiveTerminal } from './TerminalPanel'
 import { DebugConsoleView, OutputView, ProblemsView } from './PanelViews'
 import { OpenEditors, Outline, Timeline } from './ExplorerSections'
 import { ExtTreeView, ExtWebviewView, treeEvent, treeReset } from './ExtTreeView'
@@ -589,6 +589,20 @@ export function App(): JSX.Element {
   const rootsRef = useRef(roots)
   const lspServers = useLspServers()
   const live = useLiveShare()
+  // A guest sees the terminals the host shares: the panel comes up when one appears.
+  const seenTerms = useRef(new Set<number>())
+  useEffect(() => {
+    if (live.role !== 'guest') return void seenTerms.current.clear()
+    for (const id of [...seenTerms.current]) if (!live.terms.some((t) => t.id === id)) seenTerms.current.delete(id) // shared again later: new
+    const fresh = live.terms.filter((t) => !seenTerms.current.has(t.id))
+    for (const t of fresh) seenTerms.current.add(t.id)
+    if (fresh.length) {
+      setPanelTab('terminal')
+      setShowTerminal(true)
+      setTerminalOpened(true)
+      showToast(`${fresh[0].title} is shared by the host.`)
+    }
+  }, [live.role, live.terms, showToast])
   const webviewPanels = useWebviewPanels()
   const activeWebview = useActiveWebview()
   useEffect(() => setActiveWebview(null), [active]) // opening a file leaves an extension's page
@@ -847,7 +861,7 @@ export function App(): JSX.Element {
     const r = rootRef.current
     if (!r || r.startsWith('\\\\')) return void window.alert('Open a folder on this PC first: that is the folder that is shared.')
     setChoice({
-      text: 'Who can join the session? Guests can open and edit the files of this folder, and nothing else: no terminal, no commands, no other folders. They need the session code.',
+      text: 'Who can join the session? Guests can open and edit the files of this folder, and nothing else: no commands, no other folders. (You can share a terminal later; guests only see it unless you let them type.) They need the session code.',
       kind: 'info',
       choices: ['This PC only', 'Computers on my network'],
       resolve: (scope) => {
@@ -881,6 +895,21 @@ export function App(): JSX.Element {
           showToast('Joined ' + res.hostName + '’s session.')
         })
       }
+    })
+  }, [showToast])
+  const liveShareTerminal = useCallback((): void => {
+    const share = (write: boolean): void => {
+      const problem = shareActiveTerminal(write)
+      if (problem) window.alert(problem)
+      else showToast(write ? 'The terminal is shared. Guests can type in it.' : 'The terminal is shared. Guests can watch it.')
+    }
+    if (getLiveShare().role !== 'host') return void window.alert('Start a Live Share session first; then you can share a terminal.')
+    if (getLiveShare().readOnly) return share(false)
+    setChoice({
+      text: 'Share the selected terminal. Guests who can type in it can run commands on this PC as you.',
+      kind: 'warning',
+      choices: ['Let guests watch', 'Let guests type too'],
+      resolve: (c) => c && share(c.includes('type'))
     })
   }, [showToast])
   const liveShareEnd = useCallback((): void => {
@@ -1960,6 +1989,8 @@ export function App(): JSX.Element {
       { label: 'Live Share: Start a Session…', run: liveShareStart },
       { label: 'Live Share: Join a Session…', run: liveShareJoin },
       { label: 'Live Share: Copy the Session Code', run: () => void (getLiveShare().join ? window.api.copyText(getLiveShare().join).then(() => showToast('The session code is copied.')) : showToast('No session is open.')) },
+      { label: 'Live Share: Share the Terminal…', run: liveShareTerminal },
+      { label: 'Live Share: Stop Sharing the Terminal', run: () => void (unshareActiveTerminal() || showToast('The selected terminal is not shared.')) },
       { label: 'Live Share: End the Session or Leave It', run: liveShareEnd },
       { label: 'View: Toggle AI Chat', run: () => setShowChat((v) => !v) },
       { label: 'AI: Edit Selection (Ctrl+K)', run: () => startInlineRef.current() },

@@ -39,6 +39,7 @@ interface Host {
   peers: Map<string, Peer>
   name: string
   join: string // the code guests use
+  terms: Map<number, boolean> // terminals the host shares (id -> may guests type in it)
 }
 interface Guest {
   ws: WebSocket
@@ -200,7 +201,7 @@ async function startHost(opts: { root: string; name: string; readOnly: boolean; 
   }).catch((e) => {
     throw e
   })
-  const h: Host = { wss, token, sid, root: resolve(opts.root), realRoot, readOnly: opts.readOnly, peers: new Map(), name: who(opts.name), join: '' }
+  const h: Host = { wss, token, sid, root: resolve(opts.root), realRoot, readOnly: opts.readOnly, peers: new Map(), name: who(opts.name), join: '', terms: new Map() }
   host = h
   const port = (wss.address() as { port: number }).port
   wss.on('connection', (ws) => {
@@ -245,6 +246,14 @@ async function startHost(opts: { root: string; name: string; readOnly: boolean; 
         toRenderer({ type: 'msg', from: me.id, name: me.name, msg: out })
       } else if (msg.t === 'doc-open') {
         toRenderer({ type: 'msg', from: me.id, name: me.name, msg: { ...msg, from: me.id } })
+      } else if (msg.t === 'term-open') {
+        // Only terminals the host chose to share can be watched.
+        if (h.terms.has(Number(msg.tid))) toRenderer({ type: 'msg', from: me.id, name: me.name, msg: { t: 'term-open', tid: Number(msg.tid), from: me.id } })
+      } else if (msg.t === 'term-input') {
+        // Typing in a shared terminal runs commands on the host's PC: only where the host allowed it, never in a read-only session.
+        const data = msg.data
+        if (h.readOnly || h.terms.get(Number(msg.tid)) !== true || typeof data !== 'string' || data.length > 4096) return
+        toRenderer({ type: 'msg', from: me.id, name: me.name, msg: { t: 'term-input', tid: Number(msg.tid), data, from: me.id } })
       }
     })
     ws.on('close', () => {
@@ -316,7 +325,7 @@ async function joinSession(code: string, name: string): Promise<{ ok: true; sid:
       } else if (msg.t === 'peers') toRenderer({ type: 'peers', peers: msg.peers })
       else if (msg.t === 'gone') toRenderer({ type: 'gone', id: msg.id })
       else if (msg.t === 'closed') toRenderer({ type: 'closed', reason: String(msg.reason ?? '') })
-      else if (msg.t === 'doc-state' || msg.t === 'doc-update' || msg.t === 'cursor') toRenderer({ type: 'msg', from: String(msg.from ?? 'host'), msg })
+      else if (msg.t === 'doc-state' || msg.t === 'doc-update' || msg.t === 'cursor' || msg.t === 'terms' || msg.t === 'term-data') toRenderer({ type: 'msg', from: String(msg.from ?? 'host'), msg })
     })
     ws.on('error', (e) => done({ ok: false, error: `Could not connect: ${e.message}` }))
     ws.on('close', () => {
@@ -405,6 +414,11 @@ export function registerLiveShareHandlers(getWin: () => BrowserWindow | null): v
         ? { role: 'guest' as const, sid: guest.sid, readOnly: guest.readOnly, peers: [] }
         : { role: 'none' as const }
   )
+  // The terminals the host shares, and whether guests may type in each: the host's renderer says, this side enforces it.
+  ipcMain.handle('ls:terms', (_e, list: { id: number; write: boolean }[]) => {
+    if (!host || !Array.isArray(list)) return
+    host.terms = new Map(list.filter((t) => Number.isInteger(t?.id)).map((t) => [t.id, t.write === true]))
+  })
   // The renderer's messages about shared documents: a host sends to one guest (`to`) or to all, a guest to the host.
   ipcMain.handle('ls:send', (_e, msg: Record<string, unknown>) => {
     if (!msg || typeof msg.t !== 'string') return
