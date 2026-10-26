@@ -299,7 +299,9 @@ async function start(language: string, appRoot: string): Promise<{ ok: true; ser
       // gone
     }
     die(null)
-    return { ok: false, error: `${found.spec.label} did not start: ${e instanceof Error ? e.message : String(e)}${stderrTail ? '\n' + stderrTail.trim() : ''}` }
+    // A launcher (rustup's shim, for one) can exist while the program behind it is missing: its message says so, and the install hint helps.
+    const missing = found.spec.help && /unknown binary|not found|not installed|no such file|not recognized|not a valid/i.test(stderrTail)
+    return { ok: false, error: `${found.spec.label} did not start: ${e instanceof Error ? e.message : String(e)}${stderrTail ? '\n' + stderrTail.trim() : ''}${missing ? '\n' + found.spec.help : ''}` }
   }
 }
 

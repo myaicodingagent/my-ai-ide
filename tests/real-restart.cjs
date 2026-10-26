@@ -68,8 +68,14 @@ const errors = (c) => c.ev(`[...document.querySelectorAll('.chat-error')].map(e 
   const agentDir = path.join(PROFILE, 'agent')
   check('conversation files were written to disk', fs.existsSync(agentDir) && fs.readdirSync(agentDir).length === 2, fs.existsSync(agentDir) ? fs.readdirSync(agentDir).join(',') : 'no folder')
   const memFile = fs.readdirSync(agentDir).find((f) => !f.includes('.ui.'))
-  const saved = JSON.parse(fs.readFileSync(path.join(agentDir, memFile), 'utf8'))
-  console.log('  saved message blocks:', saved.messages.map((m) => m.role + ':' + (typeof m.content === 'string' ? 'text' : m.content.map((b) => b.type).join('+'))).join(' | '))
+  // Saved conversations are encrypted with Windows (safeStorage) when it is available: then the file is "AIDE1" + the encrypted bytes,
+  // which only the app can read (the second session below proves it can); otherwise it is plain JSON.
+  const raw = fs.readFileSync(path.join(agentDir, memFile))
+  if (raw.subarray(0, 5).toString() === 'AIDE1') check('the saved conversation is encrypted (the codeword is not in the file)', !raw.toString('latin1').includes('zephyr'))
+  else {
+    const saved = JSON.parse(raw.toString('utf8'))
+    console.log('  saved message blocks:', saved.messages.map((m) => m.role + ':' + (typeof m.content === 'string' ? 'text' : m.content.map((b) => b.type).join('+'))).join(' | '))
+  }
 
   // ---- Second session: same app data ----
   s = await launch()
