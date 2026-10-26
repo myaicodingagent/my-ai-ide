@@ -31,19 +31,10 @@ Branch `comments-api`. Files you own: `src/main/exthost.js` (the `vscode` API la
 > the real app driven through the debugging port) and an `npm run test:ext-comments` script. Update the README: the Extensions
 > row and *Known limits* (remove `comments/*` from the ignored menus).
 
-## 2. Live Share: undo, line endings, many guests
+## 2. (done) Live Share: undo, line endings, many guests
 
-Branch `liveshare-undo`. Files you own: `src/renderer/src/liveshare.ts`, `src/main/liveshare.ts`, `tests/liveshare*.cjs`.
-
-> Read README.md (Live Share row and *Known limits*) and both liveshare.ts files. Fix the two known limits and test eight guests:
-> (1) Undo after somebody else's edit is odd: make Ctrl+Z undo only your own edits, using a Yjs `UndoManager` scoped to the
-> 'local' origin and wired to the editor's undo/redo, so a guest's undo does not remove the host's typing. (2) Text files with
-> Windows line endings can drift when one side's pasted text has another line ending: normalise what goes into the shared
-> `Y.Text` to `\n`, convert offsets between the model (which counts `\r\n` as two) and the Y.Text, and keep each side's model
-> line ending. Add tests to `tests/liveshare.cjs` (a CRLF file edited from both sides ends identical on disk and in both editors;
-> undo after a remote edit) and a handler-level `tests/liveshare-many.cjs` with eight raw WebSocket guests that join, open a
-> document and type at the same time: all nine copies must converge, and a ninth guest must be refused with "The session is
-> full". Run `npm run test:liveshare`, `npm run test:liveshare-remote`, `npm run test:liveshare-remote-ui` (needs Docker) and the new one.
+Done in commit `389ff95`: undo through a Yjs undo manager, a Windows-line-endings test, `tests/liveshare-many.cjs` (eight guests).
+Not needed as a session any more.
 
 ## 3. macOS and Linux builds, and a Linux CI job
 
