@@ -26,7 +26,7 @@ jobs:
           set -e
           git config --global user.name ci
           git config --global user.email ci@example.com
-          for t in git fsops index merge contrast nbmodel when backend ext; do
+          for t in git fsops index merge contrast nbmodel when backend ext liveshare-many; do
             echo "=== test:$t"
             npm run test:$t
           done

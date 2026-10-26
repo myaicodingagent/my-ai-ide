@@ -16,6 +16,8 @@ fs.mkdirSync(path.join(proj, 'node_modules', 'dep'), { recursive: true })
 fs.mkdirSync(path.join(proj, '.git'), { recursive: true })
 fs.writeFileSync(path.join(proj, 'a.txt'), 'alpha\nbeta\ngamma\n')
 fs.writeFileSync(path.join(proj, 'dbg.js'), 'function f(a) {\n  debugger\n  return a\n}\nf(7)\n')
+fs.writeFileSync(path.join(proj, 'u.txt'), 'one\ntwo\n')
+fs.writeFileSync(path.join(proj, 'crlf.txt'), 'a\r\nb\r\nc\r\n')
 fs.writeFileSync(path.join(proj, 'sub', 'b.js'), 'const b = 1\n')
 fs.writeFileSync(path.join(proj, 'node_modules', 'dep', 'x.js'), 'x\n')
 fs.writeFileSync(path.join(proj, '.git', 'config'), '[core]\n')
@@ -210,6 +212,35 @@ async function connect(port) {
     await host.focusEditor()
     await sleep(2000)
     check('and the guest stays where it is', (await activeTab(guest)) === 'a.txt', await activeTab(guest))
+
+    // ---- undo only takes back one's own edits
+    await host.ev(`document.querySelector('[data-view="files"]').click()`); await guest.ev(`document.querySelector('[data-view="files"]').click()`)
+    await host.openFromTree('u.txt'); await guest.openFromTree('u.txt')
+    await guest.waitFor(async () => /one\s+two/.test(await guest.text()))
+    await host.focusEditor(); await guest.focusEditor()
+    await host.key('End', 'End', 35, 2); await guest.key('Home', 'Home', 36, 2) // Ctrl+End on the host, Ctrl+Home on the guest
+    await host.send('Input.insertText', { text: 'HOSTWROTE' })
+    await sleep(800)
+    await guest.send('Input.insertText', { text: 'GUESTWROTE-' })
+    check('both edits are in both editors', await host.waitFor(async () => { const a = await merged(host), b = await merged(guest); return a === b && /GUESTWROTE-one/.test(a) && /HOSTWROTE/.test(a) }, 15000), (await merged(host)) + ' | ' + (await merged(guest)))
+    await host.key('z', 'KeyZ', 90, 2) // Ctrl+Z on the host
+    check('Ctrl+Z on the host takes back its own text, not the text of the guest', await host.waitFor(async () => { const a = await merged(host), b = await merged(guest); return a === b && !/HOSTWROTE/.test(a) && /GUESTWROTE-one/.test(a) }, 15000), (await merged(host)) + ' | ' + (await merged(guest)))
+    await host.key('y', 'KeyY', 89, 2) // Ctrl+Y
+    check('and Ctrl+Y brings it back on both sides', await host.waitFor(async () => { const a = await merged(host), b = await merged(guest); return a === b && /HOSTWROTE/.test(a) && /GUESTWROTE-one/.test(a) }, 15000), (await merged(host)) + ' | ' + (await merged(guest)))
+    await guest.key('z', 'KeyZ', 90, 2)
+    check('Ctrl+Z on the guest takes back only the text of the guest', await host.waitFor(async () => { const a = await merged(host), b = await merged(guest); return a === b && /HOSTWROTE/.test(a) && !/GUESTWROTE/.test(a) }, 15000), (await merged(host)) + ' | ' + (await merged(guest)))
+
+    // ---- a file with Windows line endings
+    await host.openFromTree('crlf.txt'); await guest.openFromTree('crlf.txt')
+    await guest.waitFor(async () => /a\s+b\s+c/.test(await guest.text()))
+    await host.focusEditor(); await guest.focusEditor()
+    await host.key('Home', 'Home', 36, 2); await guest.key('End', 'End', 35, 2)
+    await Promise.all([host.send('Input.insertText', { text: 'H1' }), guest.send('Input.insertText', { text: 'G1' })])
+    await host.send('Input.insertText', { text: 'H2' }); await guest.send('Input.insertText', { text: String.fromCharCode(10) + 'G2' }) // a line break as in pasted text
+    check('a file with Windows line endings ends identical in both editors', await host.waitFor(async () => { const a = await merged(host), b = await merged(guest); return a === b && /H1H2a/.test(a) && /G2/.test(a) }, 15000), (await merged(host)) + ' | ' + (await merged(guest)))
+    await guest.key('s', 'KeyS', 83, 2)
+    const crlfOnDisk = () => fs.readFileSync(path.join(proj, 'crlf.txt'), 'utf-8')
+    check('and saved, it still has Windows line endings throughout', await host.waitFor(() => /G2/.test(crlfOnDisk()) && !/[^\r]\n/.test(crlfOnDisk()) && !/^\n/.test(crlfOnDisk()), 15000), JSON.stringify(crlfOnDisk()))
 
     // ---- watching the host's debugger
     await guest.ev(`document.querySelector('[data-view="debug"]').click()`)

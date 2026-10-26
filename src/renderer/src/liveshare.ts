@@ -74,6 +74,8 @@ interface Shared {
   model: monaco.editor.ITextModel | null
   ready: boolean // a guest has the host's state; the host's is ready as soon as it exists
   applying: boolean // the model is being changed by us (not by the person typing)
+  undo: Y.UndoManager // undoes this person's own edits only (the model's own undo would also take back, or trip over, other people's)
+  lastAt: number // where the last change of the text ended, so that undo can put the caret there
   subs: monaco.IDisposable[]
 }
 const docs = new Map<string, Shared>()
@@ -105,38 +107,43 @@ const BS = String.fromCharCode(92)
 const pathOf = (rel: string): string => (state.role === 'guest' ? BS + BS + 'liveshare.' + state.sid + BS + rel.replace(/[/]/g, BS) : absOf(rel))
 const absOf = (rel: string): string => (hostRoot ?? '').replace(/[\\/]+$/, '') + '\\' + rel.replace(/\//g, '\\')
 
-function applyDelta(model: monaco.editor.ITextModel, delta: { insert?: unknown; delete?: number; retain?: number }[]): void {
+/** Applies a Y.Text change to the model; returns where the change ends (as an offset in the new text). */
+function applyDelta(model: monaco.editor.ITextModel, delta: { insert?: unknown; delete?: number; retain?: number }[]): number {
   const edits: monaco.editor.IIdentifiedSingleEditOperation[] = []
-  let idx = 0
+  let idx = 0, at = 0
   for (const op of delta) {
     if (op.retain !== undefined) idx += op.retain
     else if (op.insert !== undefined) {
       const p = model.getPositionAt(idx)
       edits.push({ range: new monaco.Range(p.lineNumber, p.column, p.lineNumber, p.column), text: String(op.insert), forceMoveMarkers: true })
+      idx += String(op.insert).length
+      at = idx
     } else if (op.delete !== undefined) {
       edits.push({ range: monaco.Range.fromPositions(model.getPositionAt(idx), model.getPositionAt(idx + op.delete)), text: '' })
-      idx += op.delete
+      at = idx
     }
   }
   if (edits.length) model.applyEdits(edits)
+  return at
 }
 
 function makeDoc(rel: string, initial: string | null): Shared {
   const ydoc = new Y.Doc()
   const ytext = ydoc.getText('t')
-  const d: Shared = { rel, ydoc, ytext, model: null, ready: initial !== null, applying: false, subs: [] }
+  const undo = new Y.UndoManager(ytext, { trackedOrigins: new Set(['local']), captureTimeout: 500 })
+  const d: Shared = { rel, ydoc, ytext, model: null, ready: initial !== null, applying: false, undo, lastAt: 0, subs: [] }
   if (initial !== null) ydoc.transact(() => ytext.insert(0, initial), 'init')
   ytext.observe((ev, tr) => {
     if (tr.origin === 'local' || tr.origin === 'init' || !d.model || !d.ready) return
     d.applying = true
     try {
-      applyDelta(d.model, ev.delta as never)
+      d.lastAt = applyDelta(d.model, ev.delta as never)
     } finally {
       d.applying = false
     }
   })
   ydoc.on('update', (update: Uint8Array, origin: unknown) => {
-    if (origin === 'local') send({ t: 'doc-update', rel, update: toB64(update) })
+    if (origin === 'local' || origin === undo) send({ t: 'doc-update', rel, update: toB64(update) })
   })
   docs.set(keyOf(rel), d)
   return d
@@ -262,7 +269,35 @@ function sendCursor(ed: monaco.editor.ICodeEditor): void {
     send({ t: 'cursor', rel, name: me?.name ?? 'Guest', start: model.getOffsetAt(sel.getSelectionStart()), end: model.getOffsetAt(sel.getPosition()) })
   }, 60)
 }
+/** Ctrl+Z and Ctrl+Y/Ctrl+Shift+Z in a shared file go through the Yjs undo manager, which only knows this person's own edits. */
+function wireUndo(editor: monaco.editor.ICodeEditor): void {
+  const ed = editor as monaco.editor.IStandaloneCodeEditor // (every editor here is one)
+  const shared = ed.createContextKey<boolean>('lsSharedDoc', false)
+  const current = (): Shared | undefined => {
+    const m = ed.getModel()
+    const rel = m && state.role !== 'none' ? relOf(m.uri.fsPath) : null
+    const d = rel ? docs.get(keyOf(rel)) : undefined
+    return d?.model === m && d?.ready && !(state.role === 'guest' && state.readOnly) ? d : undefined
+  }
+  const refresh = (): void => shared.set(!!current())
+  ed.onDidChangeModel(refresh)
+  subscribeLiveShare(refresh)
+  const run = (redo: boolean): void => {
+    const d = current()
+    if (!d) return
+    if (redo) d.undo.redo()
+    else d.undo.undo()
+    const m = d.model
+    if (m) ed.setPosition(m.getPositionAt(Math.min(d.lastAt, m.getValueLength())))
+  }
+  const K = monaco.KeyCode, M = monaco.KeyMod
+  ed.addCommand(M.CtrlCmd | K.KeyZ, () => run(false), 'lsSharedDoc')
+  ed.addCommand(M.CtrlCmd | K.KeyY, () => run(true), 'lsSharedDoc')
+  ed.addCommand(M.CtrlCmd | M.Shift | K.KeyZ, () => run(true), 'lsSharedDoc')
+}
+
 function watchEditor(ed: monaco.editor.ICodeEditor): void {
+  wireUndo(ed)
   // A guest of a read-only session can look but not type.
   ed.onDidChangeModel(() => {
     const m = ed.getModel()
