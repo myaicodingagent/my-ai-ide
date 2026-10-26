@@ -6,11 +6,15 @@ import { hostname, networkInterfaces, userInfo } from 'os'
 const who = (given: string): string => given.trim() || (() => { try { return userInfo().username } catch { return hostname() } })()
 import { isAbsolute, join, relative, resolve, sep } from 'path'
 import WebSocket, { WebSocketServer } from 'ws'
+import * as ssh from './sshfs'
 
 // Live Share: one person (the host) opens a session on a folder, others (guests) join it with a code, see the folder, open its files
 // and edit them together with the host. This file is the transport and the file server; the shared text itself (a Yjs document per
 // file, cursors) lives in the renderer (src/renderer/src/liveshare.ts).
 //
+//   remote   the shared folder may also be one in a WSL distribution (reached as a Windows network path, so the host reads it like any
+//            folder) or one on another computer over SSH (the host's SFTP connection serves the guests; links that lead out of the
+//            folder are refused by asking the server for the real path).
 //   host     a WebSocket server that needs the session code (an address and a random token). It listens on this PC only, unless the
 //            host chooses to allow other computers. Guests can read and write files below the shared folder and nothing else:
 //            no terminal, no commands, no other folder.
@@ -35,6 +39,7 @@ interface Host {
   sid: string
   root: string
   realRoot: string
+  remote: boolean // a folder on another computer over SSH: files are reached through the SSH connection
   readOnly: boolean
   peers: Map<string, Peer>
   name: string
@@ -68,8 +73,31 @@ export function lsRel(p: string): string | null {
 }
 const lsUnc = (sid: string, rel: string): string => `\\\\liveshare.${sid}${rel ? '\\' + rel.replace(/\//g, '\\') : ''}`
 
-async function safe(h: Host, rel: string, forWrite = false): Promise<string> {
+const BS = String.fromCharCode(92)
+const OUTSIDE = 'That path is outside the shared folder.'
+/** A path below the shared folder on the SSH computer (`rel` is checked here), refused if a link on the way leads out of the folder. */
+async function safeRemote(h: Host, rel: string, forWrite: boolean, checkLinks: boolean): Promise<string> {
+  const parts = rel.split('/').filter(Boolean)
+  if (parts.includes('..')) throw new Error(OUTSIDE)
+  if (parts.some((s) => s === '.' || s.includes(BS) || s.includes(':'))) throw new Error('That path is not allowed.')
+  if (forWrite) {
+    if (h.readOnly) throw new Error('This session is read-only.')
+    if (parts.some((s) => s.toLowerCase() === '.git')) throw new Error('Guests cannot change git data.')
+  }
+  const unc = parts.length ? h.root + BS + parts.join(BS) : h.root
+  if (checkLinks && parts.length) {
+    // The real place of the file (or of the nearest folder that exists, for a new file) has to be below the real place of the folder.
+    const r = await ssh.exec(h.root, ['realpath', '-m', '--', parts.join('/')])
+    const real = r.stdout.trim()
+    if (r.code !== 0 || !real) throw new Error('This server cannot confirm that the path is inside the shared folder (realpath is needed).')
+    if (real !== h.realRoot && !real.startsWith(h.realRoot.replace(/\/+$/, '') + '/')) throw new Error(OUTSIDE)
+  }
+  return unc
+}
+
+async function safe(h: Host, rel: string, forWrite = false, checkLinks = true): Promise<string> {
   if (typeof rel !== 'string' || rel.includes('\0')) throw new Error('That path is not allowed.')
+  if (h.remote) return safeRemote(h, rel, forWrite, checkLinks)
   const abs = resolve(h.root, ...rel.split('/').filter(Boolean))
   const back = relative(h.root, abs)
   if (back.startsWith('..') || isAbsolute(back)) throw new Error('That path is outside the shared folder.')
@@ -98,7 +126,42 @@ async function walk(h: Host, dirAbs: string, out: string[], max: number): Promis
 }
 
 /** The host answers a guest's file request. */
+/** The same answers as serveFs, for a folder on another computer. */
+async function serveRemoteFs(h: Host, op: string, req: Record<string, unknown>): Promise<unknown> {
+  const rel = String(req.rel ?? '')
+  switch (op) {
+    case 'isDir':
+      return ssh.isDir(await safe(h, rel))
+    case 'readDir':
+      return (await ssh.readDir(await safe(h, rel))).map((d) => ({ name: d.name, isDir: d.isDir }))
+    case 'readFile':
+      return ssh.readFile(await safe(h, rel))
+    case 'writeFile':
+    case 'createFile': {
+      const unc = await safe(h, rel, true)
+      const content = String(req.content ?? '')
+      if (content.length > MAX_FILE) throw new Error('That file is too large to save in a shared session.')
+      await ssh.mkdirp(unc.slice(0, unc.lastIndexOf(BS)))
+      await ssh.writeFile(unc, content, op === 'createFile')
+      toRenderer({ type: 'file-written', rel })
+      return null
+    }
+    case 'listFiles': {
+      const root = await safe(h, rel, false, false)
+      const base = h.root.length + 1
+      return (await ssh.listFiles(root)).map((f) => f.slice(base).replace(/\\/g, '/'))
+    }
+    case 'search': {
+      const r = await ssh.search(h.root, String(req.query ?? ''), { caseSensitive: req.caseSensitive === true, regex: req.regex === true })
+      return { matches: r.matches.map((m) => ({ rel: m.rel, line: m.line, text: m.text })), truncated: r.truncated, error: r.error }
+    }
+    default:
+      throw new Error('Guests cannot do that: ' + op)
+  }
+}
+
 async function serveFs(h: Host, op: string, req: Record<string, unknown>): Promise<unknown> {
+  if (h.remote) return serveRemoteFs(h, op, req)
   const rel = String(req.rel ?? '')
   switch (op) {
     case 'isDir': {
@@ -188,11 +251,17 @@ function lanAddress(): string {
 async function startHost(opts: { root: string; name: string; readOnly: boolean; network: boolean }): Promise<{ ok: true; join: string; sid: string } | { ok: false; error: string }> {
   if (host) return { ok: false, error: 'A session is already open. End it first.' }
   if (guest) return { ok: false, error: 'You are in somebody else’s session. Leave it first.' }
-  const st = await fs.stat(opts.root).catch(() => null)
-  if (!st?.isDirectory()) return { ok: false, error: 'Open a folder on this PC to share it.' }
+  if (isLiveSharePath(opts.root)) return { ok: false, error: 'That folder belongs to somebody else’s session.' }
+  const remote = ssh.isRemotePath(opts.root)
+  if (remote ? !(await ssh.isDir(opts.root)) : !(await fs.stat(opts.root).catch(() => null))?.isDirectory()) return { ok: false, error: 'Open a folder to share it.' }
+  let realRoot = resolve(opts.root)
+  if (remote) {
+    const r = await ssh.exec(opts.root, ['pwd', '-P'])
+    realRoot = r.code === 0 ? r.stdout.trim() : ''
+    if (!realRoot) return { ok: false, error: 'Could not look at that folder on the server: ' + (r.stderr.trim() || 'no answer') }
+  } else realRoot = await fs.realpath(opts.root).catch(() => realRoot)
   const token = randomBytes(16).toString('hex')
   const sid = randomBytes(3).toString('hex')
-  const realRoot = await fs.realpath(opts.root).catch(() => opts.root)
   const bind = opts.network ? '0.0.0.0' : '127.0.0.1'
   const wss = new WebSocketServer({ host: bind, port: 0, maxPayload: 16 * 1024 * 1024 })
   await new Promise<void>((res, rej) => {
@@ -201,7 +270,7 @@ async function startHost(opts: { root: string; name: string; readOnly: boolean; 
   }).catch((e) => {
     throw e
   })
-  const h: Host = { wss, token, sid, root: resolve(opts.root), realRoot, readOnly: opts.readOnly, peers: new Map(), name: who(opts.name), join: '', terms: new Map() }
+  const h: Host = { wss, token, sid, root: remote ? opts.root.replace(/\\+$/, '') : resolve(opts.root), realRoot, remote, readOnly: opts.readOnly, peers: new Map(), name: who(opts.name), join: '', terms: new Map() }
   host = h
   const port = (wss.address() as { port: number }).port
   wss.on('connection', (ws) => {

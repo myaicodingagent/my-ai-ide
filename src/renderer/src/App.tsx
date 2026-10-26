@@ -859,7 +859,7 @@ export function App(): JSX.Element {
   }, [])
   const liveShareStart = useCallback((): void => {
     const r = rootRef.current
-    if (!r || r.startsWith('\\\\')) return void window.alert('Open a folder on this PC first: that is the folder that is shared.')
+    if (!r || r.startsWith('\\\\liveshare.')) return void window.alert('Open a folder first: that is the folder that is shared.')
     setChoice({
       text: 'Who can join the session? Guests can open and edit the files of this folder, and nothing else: no commands, no other folders. (You can share a terminal later; guests only see it unless you let them type.) They need the session code.',
       kind: 'info',
