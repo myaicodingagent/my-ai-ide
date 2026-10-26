@@ -734,6 +734,8 @@ async function doStartHost(gen: number): Promise<Host | null> {
   const ready = new Promise<void>((r) => (readyResolve = r))
   const h: Host = { child, ready, runs }
   host = h
+  // A host that is stopped while something is still being sent to it (a restart that overtakes the start, an extension turned off at once) must not take the editor down with an unhandled error.
+  child.on('error', (e) => logLine(`The extension host: ${e.message}`))
   child.stdout?.on('data', (b: Buffer) => logLine(b.toString('utf-8').trimEnd()))
   child.stderr?.on('data', (b: Buffer) => logLine(b.toString('utf-8').trimEnd()))
   child.on('message', async (m: any) => {
@@ -786,6 +788,7 @@ async function doStartHost(gen: number): Promise<Host | null> {
   const restore = saved.filter((p) => exts.some((x) => x.id === p.extId))
   panelStore.clear()
   saved.filter((p) => !exts.some((x) => x.id === p.extId)).forEach((p, i) => panelStore.set('kept:' + i, p))
+  if (!child.connected || gen !== hostGen) return null // stopped in the meantime
   child.send({ type: 'init', exts, root: currentRoot, restore })
   return h
 }
