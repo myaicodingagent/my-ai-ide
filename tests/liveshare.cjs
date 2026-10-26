@@ -95,6 +95,13 @@ async function connect(port) {
     check('without node_modules and .git', await guest.ev(`!document.querySelector('.tree-row[data-tree-path$="node_modules"]') && !document.querySelector('.tree-row[data-tree-path$=".git"]')`))
     check('both sides show two people', await guest.waitFor(() => guest.ev(`/joined · 2/.test(document.querySelector('[data-sb="liveshare"]')?.textContent || '')`)) && await host.waitFor(() => host.ev(`/hosting · 2/.test(document.querySelector('[data-sb="liveshare"]')?.textContent || '')`)))
 
+    // ---- what a screen reader gets
+    check('a screen reader is told when somebody joins', /Reader|.+ joined the Live Share session/.test(await host.ev(`document.querySelector('[data-live-polite]')?.textContent || ''`)), await host.ev(`document.querySelector('[data-live-polite]')?.textContent`))
+    const sbName = (side) => side.ev(`document.querySelector('[data-sb="liveshare"]')?.getAttribute('aria-label') || ''`)
+    check('the status item has a name that says the role, the people and what pressing does (host)', /^Live Share: hosting, 2 people: .+Press to copy the session code$/.test(await sbName(host)), await sbName(host))
+    check('and for a guest, without the press hint', /^Live Share: joined, 2 people: /.test(await sbName(guest)) && !/Press/.test(await sbName(guest)), await sbName(guest))
+    check('its symbol is hidden from screen readers', await host.ev(`document.querySelector('[data-sb="liveshare"] [aria-hidden="true"]')?.textContent.includes('⇆')`))
+
     // ---- what a guest can reach
     const sid = JSON.parse(await guest.ev(`window.api.lsStatus().then((s) => JSON.stringify(s))`)).sid
     const unc = (rel) => String.fromCharCode(92, 92) + 'liveshare.' + sid + (rel ? String.fromCharCode(92) + rel : '')
@@ -156,6 +163,7 @@ async function connect(port) {
     await typeInTerm(host, 'echo BEFORE-' + 'JOIN')
     check('the guest gets a tab for the shared terminal', await guest.waitFor(() => guest.ev(`[...document.querySelectorAll('.term-tab-name')].some((t) => /\(shared\)/.test(t.textContent))`), 15000))
     check('it shows what the host\'s terminal showed, and what the host types after', await guest.waitFor(async () => /BEFORE-JOIN/.test(await termText(guest)), 15000), await termText(guest))
+    check('a terminal that a guest may only watch says so to a screen reader', /read only/.test(await guest.ev(`[...document.querySelectorAll('.term-view')].find((v) => v.style.display !== 'none')?.querySelector('.xterm-helper-textarea')?.getAttribute('aria-label') || ''`)))
     await typeInTerm(host, 'echo AFTER-' + 'SHARE')
     check('new output reaches the guest', await guest.waitFor(async () => /AFTER-SHARE/.test(await termText(guest)), 15000))
     await typeInTerm(guest, 'echo GUEST-' + 'TYPED')

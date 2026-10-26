@@ -2734,9 +2734,10 @@ export function App(): JSX.Element {
             className="sb-item sb-btn"
             data-sb="liveshare"
             title={(live.role === 'host' ? 'You are hosting a Live Share session. Click to copy the session code. ' : 'You joined a Live Share session. ') + live.peers.map((p) => p.name).join(', ')}
+            aria-label={`Live Share: ${live.role === 'host' ? 'hosting' : 'joined'}${live.readOnly ? ', read-only' : ''}, ${live.peers.length} ${live.peers.length === 1 ? 'person' : 'people'}: ${live.peers.map((p) => p.name).join(', ')}${live.role === 'host' ? '. Press to copy the session code' : ''}`}
             onClick={() => (live.role === 'host' ? void window.api.copyText(live.join).then(() => showToast('The session code is copied.')) : undefined)}
           >
-            ⇆ Live Share: {live.role === 'host' ? 'hosting' : 'joined'} · {live.peers.length}
+            <span aria-hidden="true">⇆ </span>Live Share: {live.role === 'host' ? 'hosting' : 'joined'} · {live.peers.length}
             {live.readOnly ? ' (read-only)' : ''}
           </button>
         )}

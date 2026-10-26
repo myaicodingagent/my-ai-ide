@@ -1,6 +1,7 @@
 import * as Y from 'yjs'
 import { useSyncExternalStore } from 'react'
 import { monaco } from './monaco-setup'
+import { announce } from './a11y'
 
 // Live Share, the editor's side (the transport and the file server are in src/main/liveshare.ts).
 //
@@ -339,7 +340,9 @@ async function onMessage(from: string, name: string | undefined, msg: Record<str
     if (!d) return // nobody here has this file open
     Y.applyUpdate(d.ydoc, fromB64(String(msg.update)), 'remote')
   } else if (msg.t === 'terms' && state.role === 'guest') {
-    emit({ terms: Array.isArray(msg.terms) ? (msg.terms as SharedTerm[]) : [] })
+    const terms = Array.isArray(msg.terms) ? (msg.terms as SharedTerm[]) : []
+    if (state.terms.length > terms.length) announce('The host stopped sharing a terminal')
+    emit({ terms })
   } else if (msg.t === 'term-open' && state.role === 'host') {
     const t = hostTerms.get(Number(msg.tid))
     if (t) send({ t: 'term-data', tid: t.info.id, data: t.buf, end: t.total, snap: true, to: from })
@@ -391,6 +394,12 @@ export function initLiveShare(): void {
   started = true
   window.api.onLsEvent((e) => {
     if (e.type === 'peers') {
+      // Who came and who went is only visible in the status bar and the cursors: say it.
+      const was = state.peers, now = e.peers as Peer[]
+      if (was.length) {
+        for (const p of now) if (p.id !== state.me && !was.some((w) => w.id === p.id)) announce(`${p.name} joined the Live Share session`)
+        for (const w of was) if (w.id !== state.me && !now.some((p) => p.id === w.id)) announce(`${w.name} left the Live Share session`)
+      }
       emit({ peers: e.peers as Peer[] })
       if (state.role === 'host' && hostTerms.size) send({ t: 'terms', terms: [...hostTerms.values()].map((t) => t.info) }) // for whoever just came in
     }

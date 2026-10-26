@@ -55,12 +55,12 @@ function Card({
   }
 
   return (
-    <div className={'bg-card bg-' + t.status} data-bg-card={t.id} data-bg-status={t.status}>
+    <div className={'bg-card bg-' + t.status} data-bg-card={t.id} data-bg-status={t.status} role="group" aria-label={`Background task: ${t.task.slice(0, 80)}, ${STATUS_LABEL[t.status]}`}>
       <div className="bg-head">
         <span className="bg-pill" data-bg-pill>
           {STATUS_LABEL[t.status]}
         </span>
-        {t.cloud && <span className="bg-pill" data-bg-cloud-pill title="Runs on the server of the project">☁ there</span>}
+        {t.cloud && <span className="bg-pill" data-bg-cloud-pill title="Runs on the server of the project" aria-label="Runs on the server of the project"><span aria-hidden="true">☁ </span>there</span>}
         <span className="bg-time">{elapsed(t)}</span>
       </div>
       <div className="bg-task" title={t.task}>
@@ -93,7 +93,19 @@ function Card({
             {t.files.length} changed file{t.files.length === 1 ? '' : 's'}
           </div>
           {t.files.map((f) => (
-            <div key={f.rel} className="git-row" data-bg-file={f.rel} onClick={() => void openFile(f)} title={f.orig ? `${f.orig} → ${f.rel}` : f.rel}>
+            <div
+              key={f.rel}
+              className="git-row"
+              data-bg-file={f.rel}
+              role="button"
+              tabIndex={0}
+              aria-label={`${f.rel}, ${LETTER_TITLE[f.status] ?? f.status}. Press Enter to see what changed`}
+              onClick={() => void openFile(f)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') (e.preventDefault(), void openFile(f))
+              }}
+              title={f.orig ? `${f.orig} → ${f.rel}` : f.rel}
+            >
               <span className="git-name">{f.rel}</span>
               <span className={`git-letter gs-${f.status}`} title={LETTER_TITLE[f.status] ?? f.status}>
                 {f.status}

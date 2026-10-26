@@ -112,6 +112,8 @@ function TerminalView({
     const fit = new FitAddon()
     term.loadAddon(fit)
     term.open(host)
+    // A terminal somebody else runs, that this person may only watch, must not be announced as one to type in.
+    if (shared) term.textarea?.setAttribute('aria-label', shared.write ? 'Shared terminal, you can type in it' : 'Shared terminal, read only')
 
     let id: number | null = null
     let disposed = false
